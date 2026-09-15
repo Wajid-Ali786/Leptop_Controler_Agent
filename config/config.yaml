@@ -11,6 +11,13 @@
 
 # --- Folder paths ---
 
+# --- Brain (Claude API) ---
+brain:
+  model: claude-opus-5       # Claude model ID used by app/brain/adapter.py
+  timeout_seconds: 30        # per-request timeout, so a network problem fails fast
+  max_retries: 2             # SDK retries for connection errors, 429 and 5xx
+  ping_max_tokens: 256       # output cap for the minimal health/test request
+
 # --- Cost controls (docs/build-plan Section 5.5) ---
 # Rate limit   -> AI requests per minute
 # Token limit  -> max data per single request

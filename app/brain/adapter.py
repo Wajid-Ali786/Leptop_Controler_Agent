@@ -1,7 +1,119 @@
 """
 The ONLY file in this project allowed to call the Claude API directly.
 Every other module asks brain.logic for a decision - never imports anthropic itself.
-Minimal adapter built in Phase 0 (docs/step4 Section 3; pattern in docs/step3 Section 2).
+(docs/step3 Section 2; CLAUDE.md rule 2)
 
-Skeleton placeholder (Step 3) - no implementation yet.
+Every request goes through send_message(), which routes through the cost-control
+hooks below - the single chokepoint for Claude API spend.
+
+Failures surface as ClaudeError subclasses with plain-English messages. The API key
+never appears in a message, and SDK exceptions are not chained onto ours because
+they carry the raw request (headers included).
 """
+import anthropic
+
+from app.brain.models import ClaudeReply
+from config.settings import get_setting
+
+PING_PROMPT = "Reply with the single word: OK"
+
+
+class ClaudeError(Exception):
+    """Base class for clean, user-facing Claude failures."""
+
+
+class ClaudeAuthError(ClaudeError):
+    """The API key was rejected or lacks permission."""
+
+
+class ClaudeUnavailableError(ClaudeError):
+    """Claude can't be reached right now (network, timeout, rate limit, server error)."""
+
+
+class ClaudeRequestError(ClaudeError):
+    """Claude rejected the request or returned something unusable."""
+
+
+def get_client(http_client=None) -> anthropic.Anthropic:
+    """Build a Claude client from settings. http_client is for tests/proxies only."""
+    return anthropic.Anthropic(
+        api_key=get_setting("ANTHROPIC_API_KEY"),
+        timeout=float(get_setting("brain.timeout_seconds")),
+        max_retries=int(get_setting("brain.max_retries")),
+        http_client=http_client,
+    )
+
+
+def send_message(prompt: str, max_tokens: int) -> ClaudeReply:
+    """Send one user message to Claude and return its reply. The only request path."""
+    model = get_setting("brain.model")
+    _check_cost_controls(model=model, prompt=prompt, max_tokens=max_tokens)
+    response = _call_api(get_client(), model=model, prompt=prompt, max_tokens=max_tokens)
+    reply = _to_reply(response)
+    _record_usage(reply)
+    return reply
+
+
+def ping() -> ClaudeReply:
+    """Minimal request for the Phase 0 health/test path."""
+    return send_message(PING_PROMPT, max_tokens=int(get_setting("brain.ping_max_tokens")))
+
+
+# --- Cost controls (docs/build-plan Section 5.5, CLAUDE.md rule 8) ---------------
+# TODO (Phase 0): rate limit, token limit, and money budget are NOT enforced yet.
+# Every request already passes through these two hooks, so enforcing them is a
+# change inside the hooks only. No feature may call Claude until all three are real.
+
+def _check_cost_controls(*, model: str, prompt: str, max_tokens: int) -> None:
+    """Before a request: raise to block it. TODO: rate limit, token limit, money budget."""
+
+
+def _record_usage(reply: ClaudeReply) -> None:
+    """After a request: record actual usage. TODO: feed the rate window and money budget."""
+
+
+# --- SDK boundary -------------------------------------------------------------------
+
+def _call_api(client: anthropic.Anthropic, *, model: str, prompt: str, max_tokens: int):
+    try:
+        return client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.AuthenticationError:
+        raise ClaudeAuthError("Claude rejected the API key (401). Check ANTHROPIC_API_KEY in .env.") from None
+    except anthropic.PermissionDeniedError:
+        raise ClaudeAuthError("The API key is not permitted to make this request (403).") from None
+    except anthropic.NotFoundError:
+        raise ClaudeRequestError(
+            f"Model '{model}' was not found (404). Check brain.model in config/config.yaml."
+        ) from None
+    except anthropic.RateLimitError:
+        raise ClaudeUnavailableError("Claude is rate-limiting requests right now (429). Try again shortly.") from None
+    except anthropic.BadRequestError as exc:
+        raise ClaudeRequestError(f"Claude rejected the request (400): {exc.message}") from None
+    except anthropic.APIStatusError as exc:
+        if exc.status_code >= 500:
+            raise ClaudeUnavailableError(f"Claude had a server error ({exc.status_code}). Try again later.") from None
+        raise ClaudeRequestError(f"Claude returned an unexpected error ({exc.status_code}).") from None
+    except anthropic.APITimeoutError:
+        raise ClaudeUnavailableError("Claude did not respond in time. Check your internet connection.") from None
+    except anthropic.APIConnectionError:
+        raise ClaudeUnavailableError("Can't reach Claude. Check your internet connection.") from None
+    except anthropic.APIError as exc:
+        raise ClaudeRequestError(f"Unexpected Claude API error ({type(exc).__name__}).") from None
+
+
+def _to_reply(response) -> ClaudeReply:
+    try:
+        text = "".join(block.text for block in response.content if block.type == "text")
+        return ClaudeReply(
+            text=text,
+            model=response.model,
+            stop_reason=response.stop_reason,
+            input_tokens=int(response.usage.input_tokens),
+            output_tokens=int(response.usage.output_tokens),
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ClaudeRequestError("Claude returned a response in an unexpected shape.") from None
