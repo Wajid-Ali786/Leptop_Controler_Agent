@@ -9,8 +9,11 @@ A blocked request raises CostLimitError and never reaches the API.
 
 Failures surface as ClaudeError subclasses with plain-English messages. The API key
 never appears in a message, and SDK exceptions are not chained onto ours because
-they carry the raw request (headers included).
+they carry the raw request (headers included). Logs record request metadata only -
+never the prompt or Claude's reply text.
 """
+import logging
+
 import anthropic
 
 from app.brain import cost_controls
@@ -18,6 +21,8 @@ from app.brain.models import ClaudeReply
 from config.settings import get_setting
 
 PING_PROMPT = "Reply with the single word: OK"
+
+log = logging.getLogger(__name__)
 
 
 class ClaudeError(Exception):
@@ -53,10 +58,22 @@ def send_message(prompt: str, max_tokens: int) -> ClaudeReply:
     """
     model = get_setting("brain.model")
     client = get_client()
-    request_id = cost_controls.authorize(model=model, prompt=prompt, max_tokens=max_tokens)
-    response = _call_api(client, model=model, prompt=prompt, max_tokens=max_tokens)
-    reply = _to_reply(response)
-    cost_controls.record_usage(request_id, reply)
+    try:
+        request_id = cost_controls.authorize(model=model, prompt=prompt, max_tokens=max_tokens)
+    except cost_controls.CostLimitError as exc:
+        log.warning("Claude request blocked by cost controls: %s", exc)
+        raise
+    log.info("Claude request #%d sent: model=%s max_tokens=%d", request_id, model, max_tokens)
+    try:
+        reply = _to_reply(_call_api(client, model=model, prompt=prompt, max_tokens=max_tokens))
+    except ClaudeError as exc:
+        log.warning("Claude request #%d failed (%s): %s", request_id, type(exc).__name__, exc)
+        raise
+    cost_usd = cost_controls.record_usage(request_id, reply)
+    log.info(
+        "Claude request #%d done: input_tokens=%d output_tokens=%d cost_usd=%.6f stop_reason=%s",
+        request_id, reply.input_tokens, reply.output_tokens, cost_usd, reply.stop_reason,
+    )
     return reply
 
 

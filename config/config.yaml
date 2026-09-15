@@ -10,6 +10,13 @@
 
 # --- Folder paths ---
 
+# --- Logging (app/logging_setup.py) ---
+logging:
+  file: logs/companion.log   # rotated copies: companion.1.log, companion.2.log, ... (git-ignored by logs/*.log)
+  level: INFO                # DEBUG, INFO, WARNING, ERROR or CRITICAL
+  max_bytes: 1000000         # rotate when the file reaches ~1 MB
+  backup_count: 5            # rotated files to keep
+
 # --- Brain (Claude API) ---
 brain:
   # MODEL SELECTION PENDING: claude-opus-5 is a placeholder until cost/performance
