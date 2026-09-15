@@ -1,15 +1,14 @@
 """
-Tests for app/brain/.
+Tests for app/brain/adapter.py (cost controls: tests/test_brain_cost_controls.py).
 
-The offline path runs the real anthropic SDK against a mock HTTP transport with a
-fake key - no internet, no real API key, no cost. One real-API test is skipped
-unless RUN_REAL_CLAUDE_TEST=1 is set.
+The offline path uses the fake_claude fixture (tests/conftest.py): the real anthropic
+SDK against a mock HTTP transport with a fake key - no internet, no real API key, no
+cost. One real-API test is skipped unless RUN_REAL_CLAUDE_TEST=1 is set.
 """
 import ast
 import json
 import os
 
-import anthropic
 import httpx2
 import pytest
 
@@ -18,58 +17,11 @@ from app.brain.adapter import ClaudeAuthError, ClaudeRequestError, ClaudeUnavail
 from app.brain.models import ClaudeReply
 from config import settings
 from config.settings import MissingSettingError, get_setting
-
-FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
-TEST_CONFIG = """
-brain:
-  model: test-model
-  timeout_seconds: 5
-  max_retries: 0
-  ping_max_tokens: 16
-"""
-OK_BODY = {
-    "id": "msg_test", "type": "message", "role": "assistant", "model": "test-model",
-    "content": [{"type": "text", "text": "OK"}],
-    "stop_reason": "end_turn", "stop_sequence": None,
-    "usage": {"input_tokens": 12, "output_tokens": 1},
-}
+from tests.conftest import FAKE_KEY
 
 
 def error_response(status: int, error_type: str) -> httpx2.Response:
     return httpx2.Response(status, json={"type": "error", "error": {"type": error_type, "message": "test error"}})
-
-
-class FakeClaude:
-    """Stands in for the Claude API: records requests, returns whatever `respond` builds."""
-
-    def __init__(self):
-        self.requests = []
-        self.respond = lambda request: httpx2.Response(200, json=OK_BODY)
-
-    def handle(self, request):
-        self.requests.append(request)
-        return self.respond(request)
-
-
-@pytest.fixture
-def fake_claude(tmp_path, monkeypatch):
-    """Temp config.yaml + .env, and a client whose HTTP goes to FakeClaude."""
-    config_path = tmp_path / "config.yaml"
-    env_path = tmp_path / ".env"
-    config_path.write_text(TEST_CONFIG, encoding="utf-8")
-    env_path.write_text(f"ANTHROPIC_API_KEY={FAKE_KEY}\n", encoding="utf-8")
-    monkeypatch.setattr(settings, "CONFIG_PATH", config_path)
-    monkeypatch.setattr(settings, "ENV_PATH", env_path)
-    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-        monkeypatch.delenv(var, raising=False)
-
-    fake = FakeClaude()
-    real_get_client = adapter.get_client
-    monkeypatch.setattr(adapter, "get_client", lambda: real_get_client(
-        http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(fake.handle))
-    ))
-    fake.config_path, fake.env_path = config_path, env_path
-    return fake
 
 
 # --- Mocked happy path ---
@@ -92,7 +44,7 @@ def test_request_is_built_from_settings(fake_claude):
 
 
 def test_model_name_comes_from_config(fake_claude):
-    fake_claude.config_path.write_text(TEST_CONFIG.replace("test-model", "other-model"), encoding="utf-8")
+    fake_claude.configure(model="other-model")
     adapter.ping()
     assert json.loads(fake_claude.requests[0].content)["model"] == "other-model"
 
@@ -150,33 +102,10 @@ def test_missing_api_key_fails_before_any_request(fake_claude):
 
 
 def test_missing_model_setting_fails_before_any_request(fake_claude):
-    fake_claude.config_path.write_text(TEST_CONFIG.replace("  model: test-model\n", ""), encoding="utf-8")
+    fake_claude.configure(model=None)
     with pytest.raises(MissingSettingError, match="brain.model"):
         adapter.ping()
     assert fake_claude.requests == []
-
-
-# --- Cost-control hooks: every request routes through them ---
-
-def test_cost_control_hook_can_block_a_request(fake_claude, monkeypatch):
-    seen = []
-
-    def block(**request):
-        seen.append(request)
-        raise RuntimeError("blocked by cost controls")
-
-    monkeypatch.setattr(adapter, "_check_cost_controls", block)
-    with pytest.raises(RuntimeError, match="blocked"):
-        adapter.ping()
-    assert fake_claude.requests == []  # blocked before anything was sent
-    assert seen == [{"model": "test-model", "prompt": adapter.PING_PROMPT, "max_tokens": 16}]
-
-
-def test_usage_is_recorded_after_each_reply(fake_claude, monkeypatch):
-    recorded = []
-    monkeypatch.setattr(adapter, "_record_usage", recorded.append)
-    reply = adapter.ping()
-    assert recorded == [reply]
 
 
 # --- Config + architecture rules ---

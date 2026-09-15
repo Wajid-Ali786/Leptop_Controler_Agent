@@ -3,8 +3,9 @@ The ONLY file in this project allowed to call the Claude API directly.
 Every other module asks brain.logic for a decision - never imports anthropic itself.
 (docs/step3 Section 2; CLAUDE.md rule 2)
 
-Every request goes through send_message(), which routes through the cost-control
-hooks below - the single chokepoint for Claude API spend.
+Every request goes through send_message(), which first passes the three cost
+controls in app/brain/cost_controls.py (rate limit, token limit, money budget).
+A blocked request raises CostLimitError and never reaches the API.
 
 Failures surface as ClaudeError subclasses with plain-English messages. The API key
 never appears in a message, and SDK exceptions are not chained onto ours because
@@ -12,6 +13,7 @@ they carry the raw request (headers included).
 """
 import anthropic
 
+from app.brain import cost_controls
 from app.brain.models import ClaudeReply
 from config.settings import get_setting
 
@@ -45,31 +47,22 @@ def get_client(http_client=None) -> anthropic.Anthropic:
 
 
 def send_message(prompt: str, max_tokens: int) -> ClaudeReply:
-    """Send one user message to Claude and return its reply. The only request path."""
+    """Send one user message to Claude and return its reply. The only request path.
+
+    Raises cost_controls.CostLimitError (request not sent) if a cost control blocks it.
+    """
     model = get_setting("brain.model")
-    _check_cost_controls(model=model, prompt=prompt, max_tokens=max_tokens)
-    response = _call_api(get_client(), model=model, prompt=prompt, max_tokens=max_tokens)
+    client = get_client()
+    request_id = cost_controls.authorize(model=model, prompt=prompt, max_tokens=max_tokens)
+    response = _call_api(client, model=model, prompt=prompt, max_tokens=max_tokens)
     reply = _to_reply(response)
-    _record_usage(reply)
+    cost_controls.record_usage(request_id, reply)
     return reply
 
 
 def ping() -> ClaudeReply:
     """Minimal request for the Phase 0 health/test path."""
     return send_message(PING_PROMPT, max_tokens=int(get_setting("brain.ping_max_tokens")))
-
-
-# --- Cost controls (docs/build-plan Section 5.5, CLAUDE.md rule 8) ---------------
-# TODO (Phase 0): rate limit, token limit, and money budget are NOT enforced yet.
-# Every request already passes through these two hooks, so enforcing them is a
-# change inside the hooks only. No feature may call Claude until all three are real.
-
-def _check_cost_controls(*, model: str, prompt: str, max_tokens: int) -> None:
-    """Before a request: raise to block it. TODO: rate limit, token limit, money budget."""
-
-
-def _record_usage(reply: ClaudeReply) -> None:
-    """After a request: record actual usage. TODO: feed the rate window and money budget."""
 
 
 # --- SDK boundary -------------------------------------------------------------------

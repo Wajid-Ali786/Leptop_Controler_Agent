@@ -2,8 +2,7 @@
 # Secrets (ANTHROPIC_API_KEY) live in .env, never here.
 # Read ONLY through config/settings.py -> get_setting(name) (docs/step3 Section 3).
 #
-# Skeleton placeholder (Step 3): section headings only. Values are chosen and
-# added in Phase 0 (docs/step4 Section 3).
+# Values are added as each Phase 0 feature needs them (docs/step4 Section 3).
 
 # --- Language preferences ---
 
@@ -13,12 +12,26 @@
 
 # --- Brain (Claude API) ---
 brain:
-  model: claude-opus-5       # Claude model ID used by app/brain/adapter.py
+  # MODEL SELECTION PENDING: claude-opus-5 is a placeholder until cost/performance
+  # is evaluated. Whatever model is set here must also have a price below.
+  model: claude-opus-5
   timeout_seconds: 30        # per-request timeout, so a network problem fails fast
   max_retries: 2             # SDK retries for connection errors, 429 and 5xx
   ping_max_tokens: 256       # output cap for the minimal health/test request
 
 # --- Cost controls (docs/build-plan Section 5.5) ---
-# Rate limit   -> AI requests per minute
-# Token limit  -> max data per single request
-# Money budget -> max API spend per day/month, hard-stop when reached
+# Enforced by app/brain/cost_controls.py before every Claude request.
+# Starting values - tune once real usage has been measured.
+cost:
+  rate_limit_per_minute: 30             # Rate limit: max Claude requests in any rolling 60 seconds
+  max_input_tokens_per_request: 20000   # Token limit: estimated input tokens per request
+  max_output_tokens_per_request: 4096   # Token limit: max_tokens a single request may ask for
+  daily_budget_usd: 1.00                # Money budget: hard stop per calendar day (local time)
+  monthly_budget_usd: 10.00             # Money budget: hard stop per calendar month
+  usage_db_path: data/claude_usage.db   # usage ledger - git-ignored by data/*.db
+  # USD per million tokens. Snapshot - verify at https://www.anthropic.com/pricing.
+  # A model with no entry here is blocked, because its cost can't be budgeted.
+  prices_usd_per_million_tokens:
+    claude-opus-5:    {input: 5.00, output: 25.00}
+    claude-sonnet-5:  {input: 2.00, output: 10.00}
+    claude-haiku-4-5: {input: 1.00, output: 5.00}
