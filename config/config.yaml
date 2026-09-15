@@ -1,0 +1,17 @@
+# AI Desktop Companion - non-secret settings (safe to commit).
+# Secrets (ANTHROPIC_API_KEY) live in .env, never here.
+# Read ONLY through config/settings.py -> get_setting(name) (docs/step3 Section 3).
+#
+# Skeleton placeholder (Step 3): section headings only. Values are chosen and
+# added in Phase 0 (docs/step4 Section 3).
+
+# --- Language preferences ---
+
+# --- Confirmation rules ---
+
+# --- Folder paths ---
+
+# --- Cost controls (docs/build-plan Section 5.5) ---
+# Rate limit   -> AI requests per minute
+# Token limit  -> max data per single request
+# Money budget -> max API spend per day/month, hard-stop when reached

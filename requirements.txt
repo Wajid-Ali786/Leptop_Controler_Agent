@@ -1,0 +1,10 @@
+anthropic
+faster-whisper
+pyautogui
+pywinauto
+playwright
+pystray
+edge-tts
+pyttsx3
+python-dotenv
+pytest
