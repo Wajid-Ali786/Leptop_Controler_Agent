@@ -6,7 +6,15 @@
 
 # --- Language preferences ---
 
-# --- Confirmation rules ---
+# --- Confirmation rules (app/safety/logic.py) ---
+# Minimal Phase 0 Permission & Safety gate. An action containing a risky keyword - as a
+# whole word or common verb form (delete/deletes/deleted/deleting) - is Medium risk and
+# needs confirmation. Any other word that merely contains a keyword (e.g. "resend") is
+# treated as risky too, unless listed in safe_words. Missing/invalid settings here make
+# EVERY action require confirmation (fail closed).
+safety:
+  risky_keywords: [delete, shutdown, "shut down", send]
+  safe_words: [sender, senders]   # unrelated words that happen to contain a keyword
 
 # --- Folder paths ---
 
