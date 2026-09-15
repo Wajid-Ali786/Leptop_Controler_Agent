@@ -7,4 +7,5 @@ pystray
 edge-tts
 pyttsx3
 python-dotenv
+pyyaml
 pytest
