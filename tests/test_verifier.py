@@ -44,7 +44,10 @@ def desktop(tmp_path, monkeypatch):
         for item in list(fake.pending):
             item["polls"] -= 1
             if item["polls"] <= 0:
-                fake.windows.append(item["window"])
+                if item.get("change"):
+                    item["change"]()
+                else:
+                    fake.windows.append(item["window"])
                 fake.pending.remove(item)
         for item in list(fake.closing):
             item["polls"] -= 1
@@ -166,6 +169,45 @@ def test_every_new_matching_window_is_reported_as_one_group(desktop):
     assert result.ok and result.window_handles == {20, 21}
 
 
+def test_cloaked_new_window_counts_only_once_it_is_on_screen(desktop):
+    """A Store app's frame exists (cloaked) before it is shown; its content window appears meanwhile."""
+    expectation = logic.expect_window("calculator")
+    before = logic.snapshot_windows(expectation)
+    desktop.windows.append(WindowInfo(20, "Calculator", "ApplicationFrameWindow", cloaked=True))
+    desktop.pending.append({"window": WindowInfo(21, "Calculator", "Windows.UI.Core.CoreWindow", cloaked=True),
+                            "polls": 2})  # content window: a separate, still cloaked, top-level window for now
+
+    def frame_shown():
+        desktop.windows[0] = WindowInfo(20, "Calculator", "ApplicationFrameWindow", cloaked=False)
+    desktop.pending.append({"window": None, "polls": 4, "change": frame_shown})
+    result = logic.wait_for_new_window(expectation, before)
+    assert result.ok and result.window_handle == 20
+    assert result.window_handles == {20, 21}  # the content window belongs to the app's group
+    assert desktop.polls >= 4
+
+
+def test_window_that_stays_cloaked_is_a_clear_retryable_failure(desktop):
+    desktop.windows.append(WindowInfo(20, "Calculator", "ApplicationFrameWindow", cloaked=True))
+    result = logic.wait_for_new_window(logic.expect_window("calculator"), frozenset())
+    assert not result.ok and result.retryable
+    assert result.message == "calculator was started, but its window didn't appear on screen within 0.3 seconds."
+
+
+def test_hosted_windows_are_titled_matching_windows_inside_the_given_windows(desktop, monkeypatch):
+    children = {20: [WindowInfo(21, "Calculator", "Windows.UI.Core.CoreWindow"), WindowInfo(22, "Help", "Popup")],
+                30: [WindowInfo(31, "Calculator", "Windows.UI.Core.CoreWindow")]}
+    monkeypatch.setattr(adapter, "list_child_windows", lambda handle: children.get(handle, []))
+    assert logic.hosted_windows(logic.expect_window("calculator"), frozenset({20, 99})) == {21}
+
+
+def test_hosted_windows_on_an_unobservable_desktop_raise(desktop, monkeypatch):
+    def unavailable(handle):
+        raise adapter.VerifierAdapterError("checking windows is only supported on Windows")
+    monkeypatch.setattr(adapter, "list_child_windows", unavailable)
+    with pytest.raises(logic.VerifierUnavailableError):
+        logic.hosted_windows(logic.expect_window("calculator"), frozenset({20}))
+
+
 # --- Verifying that windows closed ---
 
 def test_find_open_returns_only_the_given_windows_that_still_match(desktop):
@@ -249,4 +291,7 @@ def test_real_config_has_a_window_pattern_for_every_openable_app():
 def test_real_adapter_lists_windows_without_changing_anything():
     windows = adapter.list_windows()
     assert all(isinstance(w.handle, int) and w.handle > 0 and w.title for w in windows)
-    assert all(isinstance(w.class_name, str) and isinstance(w.enabled, bool) for w in windows)
+    assert all(isinstance(w.class_name, str) and isinstance(w.enabled, bool) and isinstance(w.cloaked, bool)
+               for w in windows)
+    for window in windows[:5]:
+        assert all(child.title for child in adapter.list_child_windows(window.handle))

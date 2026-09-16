@@ -8,6 +8,7 @@ desktop is faked. A fake close request does whatever the test says the app does 
 decide every action.
 """
 import ast
+import dataclasses
 import re
 import subprocess
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ CONFIG = (
     "    notepad: notepad.exe\n"
     "    calculator: calc.exe\n"
     "    paint: mspaint.exe\n"
+    "    weather: weather.exe\n"
     "  max_attempts: 3\n"
     "verifier:\n"
     "  window_timeout_seconds: 0.2\n"
@@ -41,6 +43,7 @@ CONFIG = (
     '    notepad: "Notepad$"\n'
     '    calculator: "^Calculator$"\n'
     '    paint: "Paint$"\n'
+    '    weather: "^Weather$"\n'
 )
 FRAME, CORE = "ApplicationFrameWindow", "Windows.UI.Core.CoreWindow"
 USERS_NOTEPAD = WindowInfo(1, "Claude Code Response.txt - Notepad", "Notepad")
@@ -51,20 +54,30 @@ def yes(*args):
 
 
 class FakeDesktop:
-    """Windows keyed by handle. A launch opens the app's window(s); a close request runs the app's
-    configured reaction. `after_polls` schedules a change a few desktop reads later."""
+    """Top-level windows keyed by handle, plus titled windows hosted inside them. A launch opens the
+    app's window(s); a close request runs the app's configured reaction. `after_polls` schedules a
+    change a few desktop reads later.
+
+    Store apps follow the sequence recorded on a real desktop (scripts/trace_app_windows.py): the frame
+    appears cloaked -> a same-titled content window appears as a separate top-level window -> the
+    frame is shown -> the content window moves inside the frame. On close, the content window moves
+    out as a top-level window again and is destroyed a moment after the frame."""
 
     def __init__(self, calls):
         self.calls = calls
         self.windows = {USERS_NOTEPAD.handle: USERS_NOTEPAD}  # the user's own, already open
+        self.hosted = {}      # frame handle -> content windows inside it
+        self.content_of = {}  # frame handle -> its content window while that is still top-level
         self.next_handle = 1000
         self.reaction = "close"  # close | dialog | ignore | gone | denied | blink
         self.scheduled = []
         self.error = None
+        self.polls = 0
 
     def list_windows(self):
         if self.error:
             raise self.error
+        self.polls += 1
         for item in list(self.scheduled):
             item[0] -= 1
             if item[0] <= 0:
@@ -72,25 +85,58 @@ class FakeDesktop:
                 item[1]()
         return list(self.windows.values())
 
+    def list_child_windows(self, handle):
+        return list(self.hosted.get(handle, []))
+
     def after_polls(self, polls, change):
         self.scheduled.append([polls, change])
 
-    def add(self, title, class_name=""):
+    def settle(self):
+        """Let every scheduled change happen, as if time passed."""
+        while self.scheduled:
+            self.list_windows()
+
+    def new_handle(self):
         self.next_handle += 1
-        self.windows[self.next_handle] = WindowInfo(self.next_handle, title, class_name)
         return self.next_handle
+
+    def add(self, title, class_name="", cloaked=False):
+        handle = self.new_handle()
+        self.windows[handle] = WindowInfo(handle, title, class_name, cloaked=cloaked)
+        return handle
+
+    def update(self, handle, **changes):
+        if handle in self.windows:
+            self.windows[handle] = dataclasses.replace(self.windows[handle], **changes)
 
     def launch(self, executable):
         self.calls.append(("launch", executable))
-        if executable == "calc.exe":  # a Store app: outer frame + inner content window, same title
-            self.add("Calculator", FRAME)
-            self.add("Calculator", CORE)
+        if executable == "calc.exe":
+            self.open_store_app("Calculator", content_before_frame_shows=True)
+        elif executable == "weather.exe":
+            self.open_store_app("Weather", content_before_frame_shows=False)
         elif executable == "mspaint.exe":  # two same-titled windows, neither a Store frame
             self.add("Untitled - Paint", "MSPaintApp")
             self.add("Untitled - Paint", "MSPaintView")
         else:
             self.add("Untitled - Notepad", "Notepad")
         return 4242
+
+    def open_store_app(self, title, content_before_frame_shows):
+        frame = self.add(title, FRAME, cloaked=True)
+        if content_before_frame_shows:  # as recorded for Calculator
+            self.after_polls(1, lambda: self.content_of.update({frame: self.add(title, CORE, cloaked=True)}))
+            self.after_polls(2, lambda: self.update(frame, cloaked=False))
+            self.after_polls(4, lambda: self.move_content_inside(frame))
+        else:  # content created only after the frame is on screen, straight inside it
+            self.after_polls(1, lambda: self.update(frame, cloaked=False))
+            self.after_polls(3, lambda: self.hosted.setdefault(frame, []).append(
+                WindowInfo(self.new_handle(), title, CORE)))
+
+    def move_content_inside(self, frame):
+        content = self.content_of.pop(frame, None)
+        if frame in self.windows and content in self.windows:
+            self.hosted.setdefault(frame, []).append(dataclasses.replace(self.windows.pop(content), cloaked=False))
 
     def request_close(self, handle):
         self.calls.append(("close", handle))
@@ -102,21 +148,28 @@ class FakeDesktop:
         if self.reaction == "close":
             self.close_family(window)
         elif self.reaction == "dialog":
-            self.windows[handle] = WindowInfo(handle, window.title, window.class_name, enabled=False)
+            self.update(handle, enabled=False)
         elif self.reaction == "blink":  # disabled for one read while shutting down, then gone
-            self.windows[handle] = WindowInfo(handle, window.title, window.class_name, enabled=False)
+            self.update(handle, enabled=False)
             self.after_polls(2, lambda: self.close_family(window))
 
     def close_family(self, window):
-        """Closing a Store frame closes its inner window too; any other window closes alone."""
-        doomed = [h for h, w in self.windows.items()
-                  if h == window.handle or (window.class_name == FRAME and w.class_name == CORE
-                                            and w.title == window.title)]
-        for handle in doomed:
-            del self.windows[handle]
+        """The window goes at once. A Store frame's content window becomes a separate top-level window
+        again (or already is one) and is destroyed two reads later."""
+        self.windows.pop(window.handle, None)
+        contents = [dataclasses.replace(c, cloaked=True) for c in self.hosted.pop(window.handle, [])]
+        top_level_content = self.content_of.pop(window.handle, None)
+        if top_level_content in self.windows:
+            contents.append(self.windows[top_level_content])
+        for content in contents:
+            self.windows[content.handle] = content
+            self.after_polls(2, lambda h=content.handle: self.windows.pop(h, None))
 
     def handles(self, title_part):
         return sorted(h for h, w in self.windows.items() if title_part in w.title)
+
+    def frame(self, title):
+        return next(h for h, w in self.windows.items() if w.class_name == FRAME and w.title == title)
 
 
 @pytest.fixture
@@ -139,6 +192,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, "launch_app", desktop.launch)
     monkeypatch.setattr(adapter, "request_close", desktop.request_close)
     monkeypatch.setattr(verifier_adapter, "list_windows", desktop.list_windows)
+    monkeypatch.setattr(verifier_adapter, "list_child_windows", desktop.list_child_windows)
     monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
     emergency_stop.reset("test-setup")
     yield SimpleNamespace(calls=calls, config_path=config_path, desktop=desktop)
@@ -342,28 +396,64 @@ def test_still_open_window_stays_the_assistants_to_close_later(world):
     assert close_app("notepad").outcome is Outcome.DONE
 
 
-# --- Calculator: one app, two same-titled windows ---
+# --- Store apps: a frame plus a same-titled content window (no app is special-cased by name) ---
 
-def test_calculator_closes_through_its_frame_window_and_both_windows_must_go(world):
+def test_ordinary_app_is_verified_on_the_first_look_with_no_extra_wait(world):
+    polls = world.desktop.polls
+    open_app("notepad")
+    assert world.desktop.polls - polls == 2  # one snapshot before launching, one look after
+
+
+def test_store_app_counts_as_opened_only_once_its_frame_is_on_screen(world):
     open_app("calculator")
-    frame = next(h for h, w in world.desktop.windows.items() if w.class_name == FRAME)
+    frame = world.desktop.frame("Calculator")
+    assert not world.desktop.windows[frame].cloaked
+    group = logic._session_windows["calculator"][-1]
+    assert group == set(world.desktop.handles("Calculator")) and len(group) == 2  # frame + content window
+
+
+def test_store_app_closes_through_its_frame_and_done_waits_for_the_content_window(world):
+    open_app("calculator")
+    world.desktop.settle()  # time passes: the content window has moved inside the frame
+    frame = world.desktop.frame("Calculator")
+    assert world.desktop.handles("Calculator") == [frame]
     result = close_app("calculator")
     assert result.ok and result.outcome is Outcome.DONE
     assert close_requests(world) == [("close", frame)]  # only the frame is asked
+    assert world.desktop.handles("Calculator") == []  # nothing of the app left when done was reported
+
+
+def test_store_app_closed_right_after_opening_still_waits_for_the_content_window(world):
+    open_app("calculator")  # the content window is still a separate top-level window
+    frame = world.desktop.frame("Calculator")
+    result = close_app("calculator")
+    assert result.ok and result.outcome is Outcome.DONE
+    assert close_requests(world) == [("close", frame)]
     assert world.desktop.handles("Calculator") == []
 
 
-def test_calculator_is_not_closed_while_its_inner_window_remains(world, monkeypatch):
-    open_app("calculator")
-    inner = next(h for h, w in world.desktop.windows.items() if w.class_name == CORE)
+def test_content_window_created_after_opening_is_waited_for_too(world):
+    open_app("weather")  # its content window appears only after the frame is on screen
+    assert len(logic._session_windows["weather"][-1]) == 1
+    world.desktop.settle()
+    result = close_app("weather")
+    assert result.ok and result.outcome is Outcome.DONE
+    assert world.desktop.handles("Weather") == []
 
-    def frame_only(handle):
+
+def test_store_app_is_not_done_while_its_content_window_stays_open(world, monkeypatch):
+    open_app("calculator")
+    world.desktop.settle()
+
+    def frame_closes_but_content_hangs(handle):
         world.calls.append(("close", handle))
-        del world.desktop.windows[handle]
-    monkeypatch.setattr(adapter, "request_close", frame_only)
+        world.desktop.windows.pop(handle)
+        for content in world.desktop.hosted.pop(handle, []):
+            world.desktop.windows[content.handle] = content
+    monkeypatch.setattr(adapter, "request_close", frame_closes_but_content_hangs)
     result = close_app("calculator")
     assert not result.ok and result.outcome is Outcome.STILL_OPEN
-    assert world.desktop.handles("Calculator") == [inner]
+    assert len(world.desktop.handles("Calculator")) == 1
 
 
 def test_window_group_without_a_frame_asks_every_window(world):
@@ -458,7 +548,7 @@ def test_desktop_unobservable_while_verifying_is_a_failure_not_success(world):
 @pytest.mark.parametrize("name, message", [
     ("", "Which app should I close?"),
     ("  ", "Which app should I close?"),
-    ("explorer", "I don't know an app called 'explorer'. Apps I can close: calculator, notepad, paint."),
+    ("explorer", "I don't know an app called 'explorer'. Apps I can close: calculator, notepad, paint, weather."),
 ])
 def test_missing_or_unknown_app_fails_cleanly(world, name, message):
     result = close_app(name)

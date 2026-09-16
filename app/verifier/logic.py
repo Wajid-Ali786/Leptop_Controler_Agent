@@ -9,12 +9,18 @@ so an existing Notepad window can't be mistaken for success.
 
 wait_for_new_window() polls until the window appears or verifier.window_timeout_seconds runs out,
 sleeping with the emergency stop's interruptible wait. It never reports success it didn't
-observe: if the desktop can't be checked, that is a failure. Every new matching window found is
-reported as one group - Calculator, a Store app, shows an outer frame window and an inner content
-window with the same title.
+observe: if the desktop can't be checked, that is a failure. A window only counts as appeared once
+it is actually on screen - not "cloaked". A Store app (e.g. Calculator) first creates its frame
+window cloaked, then a same-titled content window that is briefly a separate top-level window, and
+only then shows the frame. Every new matching window present at that moment, shown or cloaked, is
+reported as one group, so the content window belongs to the app's group. An ordinary app such as
+Notepad is on screen the moment its window exists, so this adds no wait.
 
 Closing is verified the other way round: wait_for_windows_to_close() succeeds only when every
-window in the group is gone. A window left disabled (a modal dialog such as "Save changes?" is
+window in the group is gone - including, via hosted_windows(), titled windows living inside the
+group's windows, because a Store app's content window moves out of its frame again while closing.
+Measured timings, the latency cost and the pre-launched-Calculator open decision: docs/step4
+Section 4, implementation notes. A window left disabled (a modal dialog such as "Save changes?" is
 waiting for the user) is reported as needing the user, not as a failure to retry. A handle that
 now belongs to a window whose title no longer matches counts as gone - Windows reuses handles.
 """
@@ -76,17 +82,21 @@ def wait_for_new_window(expectation: WindowExpectation, before: frozenset[int]) 
         except VerifierUnavailableError as exc:
             return VerificationResult(False, f"Couldn't check whether {name}'s window appeared ({exc}).")
         elapsed = _now() - start
-        if new:
-            log.info("Verifier: %s window appeared after %.2fs", name, elapsed)
+        shown = [w for w in new if not w.cloaked]
+        if shown:
+            log.info("Verifier: %s window appeared after %.2fs (%d window(s) in its group)", name, elapsed, len(new))
             return VerificationResult(True, f"{name}'s window appeared after {elapsed:.1f}s.",
-                                      elapsed_seconds=elapsed, window_handle=new[0].handle,
+                                      elapsed_seconds=elapsed, window_handle=shown[0].handle,
                                       window_handles=frozenset(w.handle for w in new))
         remaining = timeout - elapsed
         if remaining <= 0:
-            log.warning("Verifier: no new %s window within %gs", name, timeout)
-            return VerificationResult(
-                False, f"{name} was started, but no new window appeared within {timeout:g} seconds.",
-                retryable=True, elapsed_seconds=elapsed)
+            if new:
+                log.warning("Verifier: new %s window stayed off screen (cloaked) for %gs", name, timeout)
+                message = f"{name} was started, but its window didn't appear on screen within {timeout:g} seconds."
+            else:
+                log.warning("Verifier: no new %s window within %gs", name, timeout)
+                message = f"{name} was started, but no new window appeared within {timeout:g} seconds."
+            return VerificationResult(False, message, retryable=True, elapsed_seconds=elapsed)
         if emergency_stop.wait(min(expectation.poll_interval_seconds, remaining)):
             emergency_stop.check()
 
@@ -95,6 +105,16 @@ def find_open(expectation: WindowExpectation, handles: frozenset[int]) -> list[W
     """The windows among `handles` that are still open and still match the app's title pattern.
     Raises VerifierUnavailableError if the desktop can't be observed."""
     return [w for w in _list_windows() if w.handle in handles and expectation.pattern.search(w.title)]
+
+
+def hosted_windows(expectation: WindowExpectation, handles: frozenset[int]) -> frozenset[int]:
+    """Handles of titled windows matching the app's pattern that live inside the windows `handles`
+    (e.g. a Store app's content window inside its frame). Raises VerifierUnavailableError."""
+    try:
+        return frozenset(child.handle for handle in handles for child in adapter.list_child_windows(handle)
+                         if expectation.pattern.search(child.title))
+    except adapter.VerifierAdapterError as exc:
+        raise VerifierUnavailableError(str(exc)) from None
 
 
 def wait_for_windows_to_close(expectation: WindowExpectation, handles: frozenset[int]) -> VerificationResult:

@@ -5,7 +5,8 @@ practical). You speak or type a command; it understands, plans, checks safety, a
 verifies the result, and remembers what matters.
 
 **Status:** Phase 0 (Foundation) complete — tagged `v0.1`. Phase 1 (Basic Computer Control)
-has not started. See `docs/step4-production-development.md` Section 18.
+is in progress: opening and closing apps work. See `docs/step4-production-development.md`
+Section 4 (implementation notes) and Section 18.
 
 ## Setup (fresh clone)
 
@@ -51,6 +52,8 @@ pytest                                                  # whole suite, offline, 
 python scripts/phase0_checklist.py                      # Phase 0 pass/fail checklist
 python scripts/fresh_clone_check.py                     # verify a fresh clone installs and passes
 $env:RUN_REAL_CLAUDE_TEST='1'; pytest -m real_api       # opt-in real API tests (cost a few tokens)
+$env:RUN_REAL_DESKTOP_TEST='1'; pytest -m real_desktop -s  # opt-in: really opens/closes Notepad and Calculator
+python scripts/trace_app_windows.py notepad calculator  # diagnostic: an app's windows over time while opened/closed
 ```
 
 ## Architecture
@@ -86,7 +89,7 @@ docs/       project specification — the source of truth
 config/     config.yaml (non-secret settings) + settings.py (get_setting)
 data/       memory.db, claude_usage.db and local files (git-ignored)
 logs/       rotating log files (git-ignored)
-scripts/    repeatable checks (Phase 0 checklist, fresh-clone verification)
+scripts/    repeatable checks (Phase 0 checklist, fresh-clone verification) and dev diagnostics
 main.py     thin entry point
 ```
 

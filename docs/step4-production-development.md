@@ -80,6 +80,20 @@ These apply to every phase below, without exception:
 
 **Done when:** 10 different typed commands, covering every bullet above, run correctly back-to-back with no code changes between them, the emergency stop halts as quickly as technically possible on your machine and passes the emergency-stop test you define for it (measured, not assumed), and the Verifier correctly detects at least one deliberately-broken action (e.g. targeting a renamed button) instead of reporting false success.
 
+**Implementation notes — open/close apps (recorded 16 September 2026).** These record how Phase 1 behaves on a real Windows desktop and what was measured. They don't reopen any Step 1–3 decision.
+
+- **close_app closes only windows this session opened.** `open_app` remembers the windows it verified (in memory only, so nothing carries over a restart). `close_app` closes the most recently opened of those that is still open. A window the user opened themselves is never closed; the assistant says so and leaves it alone. Closing is always a polite request (`WM_CLOSE`, like clicking the window's X), never ending a process. Outcomes are distinct: `done`, `already_closed`, `needs_user` (e.g. a "Save changes?" dialog), `still_open`, `failed`. `needs_user` and `still_open` are never retryable, so the recovery loop can't retry into an app that is waiting for the user. Closing is Medium risk (`close`, like Roman Urdu `band`), so it is always confirmed.
+- **Store-app window groups (e.g. Calculator).** A Windows Store app has two windows with the same title: an outer frame (`ApplicationFrameWindow`, owned by `ApplicationFrameHost.exe`) and a content window (`Windows.UI.Core.CoreWindow`, owned by the app's own process). The observed sequence, the same in every run, was:
+  1. The frame is created *cloaked* (it exists but isn't drawn on screen).
+  2. 0.2–0.3 s later, the content window appears as a separate top-level window.
+  3. 0.5–0.65 s after the frame was created, the frame is shown.
+  4. 0.4–0.5 s after that, the content window moves inside the frame.
+  5. On close, the frame is cloaked and hidden, the content window becomes a separate top-level window again, and it is destroyed up to about 0.2 s after the frame is hidden.
+
+  So `open_app` only counts a window as appeared once it is **not cloaked**, and records every new matching window present at that moment as one group (frame + content window). `close_app` asks the frame to close, then reports `done` only when every window in the group, **and every matching window hosted inside it**, is gone. Nothing is special-cased by app name, so any Store app added to `executor.apps` gets the same handling. `scripts/trace_app_windows.py` is a development diagnostic that prints an app's windows over time; use it when a new app behaves unexpectedly.
+- **Measured latency cost.** Waiting for the window to be on screen adds **+0.3–0.6 s to `open_app` for Store apps**: Calculator went from 0.5–0.9 s to 1.1–1.4 s, now reported when the window is actually visible. **Notepad is unaffected** (0.2–0.3 s): an ordinary app's window is never cloaked, so it is verified on the first check after launch.
+- **Known open decision — Windows' invisible pre-launched Calculator.** Windows may start Calculator hidden at sign-in (observed: a cloaked frame plus `CalculatorApp.exe`, started about 90 s after boot). The Verifier counts cloaked windows as open, so with nothing on screen, "close calculator" currently answers that 2 calculator windows are open but weren't opened by the assistant, and leaves them alone. That is expected current behavior, not a bug. It is deliberately left unchanged because a window on another virtual desktop is also cloaked but is a real, open window; ignoring cloaked windows would misreport those. `open_app` never reused the pre-launched copy in testing; if Windows ever did reuse it, `open_app` would time out and offer a retry. Open for the project owner to decide.
+
 ---
 
 ## 5. Phase 2 — Voice

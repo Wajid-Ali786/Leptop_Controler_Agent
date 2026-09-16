@@ -26,6 +26,7 @@ is a polite request (like clicking the window's X), never ending a process, and 
 distinct (models.Outcome): a window already gone is ALREADY_CLOSED, one showing a dialog such as
 "Save changes?" is NEEDS_USER, and one that stays open is STILL_OPEN. Neither of the last two is
 ever retryable, so the recovery loop can't retry into an app that is waiting for the user.
+Measured real-desktop behavior and known open decisions: docs/step4 Section 4, implementation notes.
 """
 import logging
 import threading
@@ -44,8 +45,8 @@ log = logging.getLogger(__name__)
 
 OfferRetry = Callable[[ActionResult], bool]
 
-# The outer window of a Windows Store app such as Calculator, which also shows a same-titled inner
-# content window. Asking the frame to close closes the app, and the inner window goes with it.
+# The outer window of a Windows Store app such as Calculator, which also has a same-titled content
+# window. Asking the frame to close closes the app; the Verifier still waits for the content window.
 _FRAME_WINDOW_CLASS = "ApplicationFrameWindow"
 
 # Windows the assistant opened in this session: app name -> window groups, oldest first.
@@ -169,11 +170,17 @@ def _prepare_close_app(action: ExecutorAction):
         if not still_open:
             _forget(name, group)
             return _result(action, True, f"{name} is already closed.", outcome=Outcome.ALREADY_CLOSED)
+        try:
+            # Titled windows inside the group (a Store app's content window) must be gone too: they move
+            # out of the frame as a separate window while the app closes.
+            relevant = group | verifier.hosted_windows(expectation, frozenset(w.handle for w in still_open))
+        except verifier.VerifierUnavailableError as exc:
+            return _cant_check(action, name, exc)
         failure = _request_close(name, still_open)
         if failure:
             return _result(action, False, failure)
         try:
-            check = verifier.wait_for_windows_to_close(expectation, group)
+            check = verifier.wait_for_windows_to_close(expectation, relevant)
         except EmergencyStopError:
             log.warning("Emergency stop while verifying close_app '%s': the close request was already sent "
                         "and can't be taken back; stopped waiting to verify it", name)

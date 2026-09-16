@@ -12,6 +12,7 @@ class WindowInfo:
     title: str
     class_name: str = ""  # the Windows window class, e.g. "ApplicationFrameWindow"
     enabled: bool = True  # False while the window is blocked by a dialog it opened (e.g. "Save changes?")
+    cloaked: bool = False  # True while Windows keeps it off screen (a Store app starting, another virtual desktop)
 
 
 @dataclass(frozen=True)
