@@ -210,5 +210,58 @@ def test_allowed_actions_are_logged_without_their_text(safety_config, caplog):
 def test_real_config_has_valid_safety_rules():
     keywords, safe_words = logic._load_rules()
     assert {"delete", "shutdown", "shut down", "send"} <= set(keywords)
-    assert "sender" in safe_words
+    assert {"mita", "hata", "band", "bhej", "khatam", "saaf"} <= set(keywords)  # Roman Urdu stopgap
+    assert {"sender", "husband", "bandwidth", "khata"} <= safe_words
     assert isinstance(get_setting("safety.risky_keywords"), list)
+
+
+# --- Roman Urdu destructive verbs, with the REAL config.yaml (stopgap until Phase 3) ---
+
+@pytest.mark.parametrize("text, keyword", [
+    ("file mita do", "mita"),
+    ("saari photos mitao", "mitao"),
+    ("purani files mitado", "mitado"),
+    ("ye folder hata do", "hata"),
+    ("icon hatao", "hatao"),
+    ("laptop band karo", "band"),
+    ("Chrome band kar do", "band"),
+    ("Ali ko message bhej do", "bhej"),
+    ("report bhejo", "bhejo"),
+    ("email bhejdo", "bhejdo"),
+    ("session khatam karo", "khatam karo"),
+    ("sab kuch khatam kar do", "khatam kar do"),
+    ("process khatm karo", "khatm"),
+    ("cache saaf karo", "saaf karo"),
+    ("recycle bin saaf kar do", "saaf kar do"),
+    ("downloads folder saaf", "saaf"),
+])
+def test_roman_urdu_destructive_verbs_are_risky(text, keyword):
+    assessment = assess(Action(text))
+    assert assessment.level == RiskLevel.MEDIUM
+    assert f"risky keyword '{keyword}'" in assessment.rule  # a clear match, not merely ambiguous
+
+
+def test_unlisted_roman_urdu_form_is_still_risky():
+    assessment = assess(Action("sab kuch mitaiye"))  # polite form, not in the keyword list
+    assert assessment.level == RiskLevel.MEDIUM
+    assert "ambiguous" in assessment.rule
+
+
+@pytest.mark.parametrize("text", [
+    "call my husband",
+    "Ali ko file dikhao",
+    "notepad kholo",
+    "check the wifi bandwidth",
+    "broadband settings kholo",
+    "mera bank khata dikhao",
+    "open the safety settings",  # "saf" is deliberately NOT a keyword
+])
+def test_ordinary_roman_urdu_and_safe_words_stay_low_risk(text):
+    assert assess(Action(text)).level == RiskLevel.LOW
+
+
+def test_roman_urdu_verb_requires_confirmation_end_to_end():
+    with pytest.raises(ActionDeniedError, match="risky keyword 'bhej'"):
+        authorize(Action("Ali ko message bhej do"))  # no confirmation method: denied
+    decision = authorize(Action("Ali ko message bhej do"), ScriptedConfirm(answer=True))
+    assert decision.confirmed is True

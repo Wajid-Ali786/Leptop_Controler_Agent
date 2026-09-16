@@ -12,9 +12,28 @@
 # needs confirmation. Any other word that merely contains a keyword (e.g. "resend") is
 # treated as risky too, unless listed in safe_words. Missing/invalid settings here make
 # EVERY action require confirmation (fail closed).
+# The Roman Urdu verbs (mita = erase, hata = remove, band = shut/close, bhej = send,
+# khatam = finish/end, saaf = clean/wipe) and their common forms are a STOPGAP until Phase 3's
+# reasoning-aware classification. Phrases come before their single word so the rule names
+# the more specific match.
 safety:
-  risky_keywords: [delete, shutdown, "shut down", send]
-  safe_words: [sender, senders]   # unrelated words that happen to contain a keyword
+  risky_keywords: [
+    delete, shutdown, "shut down", send,
+    mita, mitao, mitana, mitado,
+    hata, hatao, hatana, hatado,
+    band,
+    bhej, bhejo, bhejna, bheja, bhejdo,
+    "khatam karo", "khatam kar do", "khatam kardo", khatam, khatm,
+    "saaf karo", "saaf kar do", "saaf kardo", saaf,
+  ]
+  # Unrelated words that merely CONTAIN a keyword. safe_words can't exempt a keyword itself or
+  # its verb forms (e.g. English "band", or "saaf"/"khatam" used as adjectives) - those stay
+  # risky until Phase 3.
+  safe_words: [
+    sender, senders,
+    husband, husbands, bandwidth, broadband, bandage, bandages, bandana, bandar,
+    khata,
+  ]
 
 # --- Folder paths ---
 
