@@ -3,11 +3,10 @@ Tests for app/brain/adapter.py (cost controls: tests/test_brain_cost_controls.py
 
 The offline path uses the fake_claude fixture (tests/conftest.py): the real anthropic
 SDK against a mock HTTP transport with a fake key - no internet, no real API key, no
-cost. One real-API test is skipped unless RUN_REAL_CLAUDE_TEST=1 is set.
+cost. One real-API test is marked real_api (skipped unless RUN_REAL_CLAUDE_TEST=1).
 """
 import ast
 import json
-import os
 
 import httpx2
 import pytest
@@ -140,10 +139,7 @@ def test_only_brain_adapter_imports_anthropic():
 
 # --- Optional real API call (skipped by default) ---
 
-@pytest.mark.skipif(
-    os.environ.get("RUN_REAL_CLAUDE_TEST") != "1",
-    reason="Real Claude API call - set RUN_REAL_CLAUDE_TEST=1 to run (uses the .env key, costs a few tokens)",
-)
+@pytest.mark.real_api
 def test_real_claude_ping():
     reply = adapter.ping()
     assert reply.input_tokens > 0

@@ -2,9 +2,8 @@
 Tests for app/health.py and the main.py startup health check.
 Offline only: every test points settings at temporary files; no API calls are made.
 The real Claude connection check is tested through fake_claude (tests/conftest.py),
-except one real-API test that is skipped unless RUN_REAL_CLAUDE_TEST=1.
+except one real-API test marked real_api (skipped unless RUN_REAL_CLAUDE_TEST=1).
 """
-import os
 import sqlite3
 
 import httpx2
@@ -203,10 +202,7 @@ def test_main_with_flag_exits_one_without_traceback_when_offline(fake_claude, ca
     assert "Traceback" not in captured.out + captured.err
 
 
-@pytest.mark.skipif(
-    os.environ.get("RUN_REAL_CLAUDE_TEST") != "1",
-    reason="Real Claude API call - set RUN_REAL_CLAUDE_TEST=1 to run (uses the .env key, costs a few tokens)",
-)
+@pytest.mark.real_api
 def test_real_claude_health_check():
     results = health.run_health_check(check_claude=True)
     assert all(r.ok for r in results), health.format_report(results)

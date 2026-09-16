@@ -1,14 +1,20 @@
 """
-Shared test fixtures (docs/step3 Section 5).
+Shared test fixtures and markers (docs/step3 Section 5).
 
-isolated_logging (autouse): relative log and ledger paths resolve under each test's own
-tmp_path, never the real logs/ or data/ folders, and logging handlers are removed after
-each test.
+real_api marker: the test makes real Claude API calls. It is skipped unless
+RUN_REAL_CLAUDE_TEST=1 is set, and it records its spend in the real
+data/claude_usage.db, so it counts toward the real budget and rate limit.
+Select these tests with:  pytest -m real_api
+
+isolated_logging (autouse): relative log paths resolve under each test's own tmp_path, and
+so do relative ledger paths - for every test EXCEPT real_api tests. Offline tests therefore
+never touch the real logs/ or data/ folders. Logging handlers are removed after each test.
 
 fake_claude: an offline Claude for tests/test_brain*.py - temp config.yaml, .env and
 usage ledger, a controllable clock, and a mock HTTP transport running the real
 anthropic SDK. No internet, no real API key, no cost.
 """
+import os
 from datetime import datetime
 
 import anthropic
@@ -19,6 +25,7 @@ from app import logging_setup
 from app.brain import adapter, cost_controls
 from config import settings
 
+REAL_API_OPT_IN = "RUN_REAL_CLAUDE_TEST"
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -29,11 +36,32 @@ OK_BODY = {
 }
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        f"real_api: makes real Claude API calls (costs a few tokens); skipped unless {REAL_API_OPT_IN}=1; "
+        "records spend in the real data/claude_usage.db",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """The single gate for real API tests: skip them unless explicitly opted in."""
+    if os.environ.get(REAL_API_OPT_IN) == "1":
+        return
+    skip = pytest.mark.skip(
+        reason=f"Real Claude API call - set {REAL_API_OPT_IN}=1 to run (uses the .env key, costs a few tokens)")
+    for item in items:
+        if item.get_closest_marker("real_api"):
+            item.add_marker(skip)
+
+
 @pytest.fixture(autouse=True)
-def isolated_logging(tmp_path, monkeypatch):
-    """Relative log/ledger paths resolve under tmp_path, so tests never touch real logs/ or data/."""
+def isolated_logging(request, tmp_path, monkeypatch):
+    """Relative log/ledger paths resolve under tmp_path, so offline tests never touch real logs/
+    or data/. real_api tests keep the real ledger, so their spend counts toward the real budget."""
     monkeypatch.setattr(logging_setup, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(cost_controls, "PROJECT_ROOT", tmp_path)
+    if request.node.get_closest_marker("real_api") is None:
+        monkeypatch.setattr(cost_controls, "PROJECT_ROOT", tmp_path)
     yield
     logging_setup.reset_logging()
 

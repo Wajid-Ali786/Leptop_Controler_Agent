@@ -36,7 +36,8 @@ brain:
 
 # --- Cost controls (docs/build-plan Section 5.5) ---
 # Enforced by app/brain/cost_controls.py before every Claude request.
-# LIMITS STATUS: PENDING your confirmation - starting values, not yet tuned against real usage.
+# LIMITS STATUS: VERIFIED - confirmed by the project owner on 2026-09-16
+# (30 requests/min, 20000 input and 4096 output tokens per request, $1/day, $10/month).
 cost:
   rate_limit_per_minute: 30             # Rate limit: max Claude requests in any rolling 60 seconds
   max_input_tokens_per_request: 20000   # Token limit: estimated input tokens per request

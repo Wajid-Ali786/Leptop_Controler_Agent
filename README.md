@@ -4,8 +4,8 @@ A personal Windows desktop AI assistant (Windows 11 primary, Windows 10 22H2 whe
 practical). You speak or type a command; it understands, plans, checks safety, acts,
 verifies the result, and remembers what matters.
 
-**Status:** Phase 0 (Foundation) — foundation code complete, close-out in progress.
-See `docs/step4-production-development.md` Section 18 and "Phase 0 checklist" below.
+**Status:** Phase 0 (Foundation) complete — tagged `v0.1`. Phase 1 (Basic Computer Control)
+has not started. See `docs/step4-production-development.md` Section 18.
 
 ## Setup (fresh clone)
 
@@ -50,7 +50,7 @@ python main.py --check-claude  # also makes one real, minimal Claude request (co
 pytest                                                  # whole suite, offline, no API calls
 python scripts/phase0_checklist.py                      # Phase 0 pass/fail checklist
 python scripts/fresh_clone_check.py                     # verify a fresh clone installs and passes
-$env:RUN_REAL_CLAUDE_TEST='1'; pytest -k real           # opt-in real API tests (cost a few tokens)
+$env:RUN_REAL_CLAUDE_TEST='1'; pytest -m real_api       # opt-in real API tests (cost a few tokens)
 ```
 
 ## Architecture

@@ -361,8 +361,9 @@ This loop applies to every single bullet point in every phase above — not once
 ## 18. Current Phase Tracker
 
 ```
-Current phase: 0 — Foundation
-Last updated: 14 September 2026
+Phase 0 — Foundation: COMPLETE (Done-when checklist passed; tagged v0.1)
+Current phase: 1 — Basic Computer Control (not started)
+Last updated: 16 September 2026
 ```
 
 Update this block — and the matching "Current phase" line in `CLAUDE.md` (Step 3, Section 4) — every time a phase's Done-when checklist is actually confirmed passing, not when it merely feels finished. This is the single source of truth both you and every future Claude Code session should check before starting new work.

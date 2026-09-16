@@ -5,7 +5,7 @@ Phase 0 pass/fail checklist (docs/step4 Sections 3 and 15) - explicit and repeat
     python scripts/phase0_checklist.py --fast           # skip the targeted re-runs of subsets
     python scripts/phase0_checklist.py --with-real-api  # ALSO the real-key checks (costs a few tokens)
 
-Prints PASS/FAIL for every automated check, then PENDING for the items only a human can
+Prints PASS/FAIL for every automated check, then MANUAL for the items only a human can
 close (a real API key, Wi-Fi switched off, confirming prices/limits, committing). Exits 0
 only when every automated check passed. Makes no Claude API calls unless --with-real-api.
 """
@@ -40,7 +40,7 @@ PENDING = [
     ("Health check with an INVALID key reports a clear, specific failure",
      "put a deliberately wrong key in .env, then: python main.py --check-claude"),
     ("Opt-in real API tests pass",
-     "set RUN_REAL_CLAUDE_TEST=1, then: pytest -k real"),
+     "set RUN_REAL_CLAUDE_TEST=1, then: pytest -m real_api"),
     ("Mocked/local tests pass with NO internet at all",
      "turn Wi-Fi off, then: pytest -q"),
     ("A fresh clone installs and passes",
@@ -101,7 +101,7 @@ def check_network_isolated_tests():
     env = dict(os.environ, HTTP_PROXY=BLACKHOLE, HTTPS_PROXY=BLACKHOLE, ALL_PROXY=BLACKHOLE, NO_PROXY="")
     code, summary = pytest(CLAUDE_TESTS, env=env)
     record("Mocked Claude path works with outbound HTTP blackholed", code == 0,
-           f"{summary} (a real Wi-Fi-off run is still PENDING below)")
+           f"{summary} (a real Wi-Fi-off run is a MANUAL item below)")
 
 
 def check_startup():
@@ -129,7 +129,7 @@ def check_real_api():
     last_line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "no output"
     record("Health check with the real key in .env", proc.returncode == 0,
            f"exit code {proc.returncode}; {last_line}")
-    code, summary = pytest(["-k", "real"], env=dict(os.environ, RUN_REAL_CLAUDE_TEST="1"))
+    code, summary = pytest(["-m", "real_api"], env=dict(os.environ, RUN_REAL_CLAUDE_TEST="1"))
     record("Opt-in real API tests", code == 0, summary)
 
 
@@ -152,14 +152,14 @@ def main(argv=None):
     if args.with_real_api:
         check_real_api()
 
-    print("\nPENDING - these need you, not the script:")
+    print("\nMANUAL - confirmed by a human, not by this script:")
     for name, how in PENDING:
-        print(f"[PENDING] {name}\n        {how}")
+        print(f"[MANUAL] {name}\n        {how}")
 
     failed = [name for name, ok in results if not ok]
     print("\n" + "=" * 70)
     print(f"{len(results) - len(failed)}/{len(results)} automated checks passed; "
-          f"{len(PENDING)} item(s) pending a human.")
+          f"{len(PENDING)} manual item(s) listed above.")
     if failed:
         print("FAILED: " + "; ".join(failed))
     print("Phase 0 automated checks: " + ("PASS" if not failed else "FAIL"))

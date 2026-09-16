@@ -40,5 +40,6 @@ A personal, Windows desktop AI assistant. Full context: /docs/build-plan.md,
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 0 — Foundation. Code complete; close-out in progress - run scripts/phase0_checklist.py.
-Phase 0 is NOT signed off until the real-key and no-internet checks it lists as PENDING pass.
+Current phase: 1 — Basic Computer Control. NOT STARTED - begin only when explicitly approved.
+Phase 0 — Foundation: COMPLETE (Done-when checklist passed 2026-09-16; tagged v0.1).
+Model selection is still PENDING - deferred to Phase 3 (see brain.model in config/config.yaml).

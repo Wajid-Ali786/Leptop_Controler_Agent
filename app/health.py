@@ -109,7 +109,7 @@ def check_model_price() -> CheckResult:
     return CheckResult(
         name, True,
         f"{model}: ${input_price:g} per million input tokens, ${output_price:g} per million output tokens "
-        f"(price snapshot - verify at anthropic.com/pricing).",
+        f"(price snapshot - verify at claude.com/pricing).",
     )
 
 
