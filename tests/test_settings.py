@@ -113,30 +113,48 @@ def test_loading_env_file_does_not_leak_into_os_environ(sources):
 
 # --- Rule: only config/settings.py reads config.yaml / .env ---
 
-def _project_python_files():
+SETTINGS_LIBRARIES = ("yaml", "dotenv")
+
+
+def _application_python_files():
+    """Application code, which must take every setting from get_setting()."""
     root = settings.PROJECT_ROOT
-    files = list((root / "app").rglob("*.py")) + list((root / "config").rglob("*.py"))
-    files += list((root / "scripts").rglob("*.py")) + [root / "main.py"]
+    files = list((root / "app").rglob("*.py")) + list((root / "config").rglob("*.py")) + [root / "main.py"]
     return [f for f in files if f != Path(settings.__file__).resolve()]
 
 
-def test_no_other_module_reads_settings_sources_directly():
+def _settings_source_reads(path, *, include_environment: bool):
+    """Names in `path` that read a settings source directly."""
     offenders = []
-    for path in _project_python_files():
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                names = [node.module or ""]
-            elif isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
-                names = [f"os.{node.attr}"]
-            else:
-                continue
-            for name in names:
-                if name.split(".")[0] in ("yaml", "dotenv") or name.startswith("os."):
-                    offenders.append(f"{path.relative_to(settings.PROJECT_ROOT)}: {name}")
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or ""]
+        elif isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
+            names = [f"os.{node.attr}"]
+        else:
+            continue
+        offenders += [n for n in names if n.split(".")[0] in SETTINGS_LIBRARIES
+                      or (include_environment and n.startswith("os."))]
+    return offenders
+
+
+def test_application_code_never_reads_settings_sources_directly():
+    offenders = [f"{path.relative_to(settings.PROJECT_ROOT)}: {name}"
+                 for path in _application_python_files()
+                 for name in _settings_source_reads(path, include_environment=True)]
     assert offenders == [], f"Only config/settings.py may read config.yaml/.env: {offenders}"
+
+
+def test_dev_scripts_never_read_settings_sources_directly():
+    """scripts/ may set environment variables for the subprocesses it launches, but must not
+    read config.yaml or .env itself - settings still come from get_setting()."""
+    scripts = (settings.PROJECT_ROOT / "scripts").rglob("*.py")
+    offenders = [f"{path.relative_to(settings.PROJECT_ROOT)}: {name}"
+                 for path in scripts
+                 for name in _settings_source_reads(path, include_environment=False)]
+    assert offenders == [], f"scripts/ must not read config.yaml/.env directly: {offenders}"
 
 
 def test_config_never_imports_from_app():

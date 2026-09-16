@@ -36,7 +36,7 @@ brain:
 
 # --- Cost controls (docs/build-plan Section 5.5) ---
 # Enforced by app/brain/cost_controls.py before every Claude request.
-# Starting values - tune once real usage has been measured.
+# LIMITS STATUS: PENDING your confirmation - starting values, not yet tuned against real usage.
 cost:
   rate_limit_per_minute: 30             # Rate limit: max Claude requests in any rolling 60 seconds
   max_input_tokens_per_request: 20000   # Token limit: estimated input tokens per request
@@ -44,7 +44,8 @@ cost:
   daily_budget_usd: 1.00                # Money budget: hard stop per calendar day (local time)
   monthly_budget_usd: 10.00             # Money budget: hard stop per calendar month
   usage_db_path: data/claude_usage.db   # usage ledger - git-ignored by data/*.db
-  # USD per million tokens. Snapshot - verify at https://www.anthropic.com/pricing.
+  # USD per million tokens. PRICES STATUS: VERIFIED against https://claude.com/pricing on 2026-09-16
+  # (Opus 5 $5/$25, Sonnet 5 $2/$10, Haiku 4.5 $1/$5 per million tokens). Re-check when models change.
   # A model with no entry here is blocked, because its cost can't be budgeted.
   prices_usd_per_million_tokens:
     claude-opus-5:    {input: 5.00, output: 25.00}

@@ -40,4 +40,5 @@ A personal, Windows desktop AI assistant. Full context: /docs/build-plan.md,
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 0 — Foundation (Step 3 skeleton created; Phase 0 work not yet started)
+Current phase: 0 — Foundation. Code complete; close-out in progress - run scripts/phase0_checklist.py.
+Phase 0 is NOT signed off until the real-key and no-internet checks it lists as PENDING pass.

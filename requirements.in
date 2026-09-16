@@ -1,0 +1,18 @@
+# The dependencies this project intentionally chose (docs/step2 Section 3, docs/step3 Section 6).
+# requirements.txt is the full pinned set generated from an installed, tested environment:
+#     pip install -r requirements.in
+#     pip freeze > requirements.txt
+# Edit this file when a dependency is actually added or removed, then regenerate requirements.txt.
+
+anthropic          # Claude API SDK (app/brain/adapter.py only)
+httpx2             # anthropic's HTTP layer; tests drive it directly (mock transport)
+faster-whisper     # local, offline speech-to-text (Phase 2)
+pyautogui          # universal mouse/keyboard fallback (Phase 1)
+pywinauto          # native Windows app control via UI Automation (Phase 1)
+playwright         # browser automation via DOM (Phase 5)
+pystray            # system tray icon (Phase 9)
+edge-tts           # online text-to-speech (Phase 2)
+pyttsx3            # offline TTS fallback (Phase 2)
+python-dotenv      # reads .env (config/settings.py only)
+pyyaml             # reads config.yaml (config/settings.py only)
+pytest             # test runner
