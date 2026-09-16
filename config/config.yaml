@@ -44,6 +44,14 @@ logging:
   max_bytes: 1000000         # rotate when the file reaches ~1 MB
   backup_count: 5            # rotated files to keep
 
+# --- Executor (app/executor/) ---
+executor:
+  # Apps the assistant may open: name -> Windows executable. Anything not listed is refused,
+  # never guessed (Phase 4 memory adds user aliases). Every open still passes the safety gate.
+  apps:
+    notepad: notepad.exe
+    calculator: calc.exe
+
 # --- Brain (Claude API) ---
 brain:
   # MODEL SELECTION PENDING: claude-opus-5 is a placeholder until cost/performance

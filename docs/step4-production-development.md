@@ -362,7 +362,7 @@ This loop applies to every single bullet point in every phase above — not once
 
 ```
 Phase 0 — Foundation: COMPLETE (Done-when checklist passed; tagged v0.1)
-Current phase: 1 — Basic Computer Control (not started)
+Current phase: 1 — Basic Computer Control (in progress)
 Last updated: 16 September 2026
 ```
 

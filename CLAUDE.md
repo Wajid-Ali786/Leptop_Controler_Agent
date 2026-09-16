@@ -40,6 +40,6 @@ A personal, Windows desktop AI assistant. Full context: /docs/build-plan.md,
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 1 — Basic Computer Control. NOT STARTED - begin only when explicitly approved.
+Current phase: 1 — Basic Computer Control. IN PROGRESS (started 2026-09-16) - one task at a time.
 Phase 0 — Foundation: COMPLETE (Done-when checklist passed 2026-09-16; tagged v0.1).
 Model selection is still PENDING - deferred to Phase 3 (see brain.model in config/config.yaml).
