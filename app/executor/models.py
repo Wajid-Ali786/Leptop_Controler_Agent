@@ -22,4 +22,5 @@ class ExecutorAction:
 class ActionResult:
     action: ExecutorAction
     ok: bool
-    message: str  # plain English, safe to show the user
+    message: str             # plain English, safe to show the user
+    retryable: bool = False  # would trying again plausibly help? (Action -> Result -> Recovery)

@@ -26,6 +26,7 @@ from app.brain import adapter, cost_controls
 from config import settings
 
 REAL_API_OPT_IN = "RUN_REAL_CLAUDE_TEST"
+REAL_DESKTOP_OPT_IN = "RUN_REAL_DESKTOP_TEST"
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -42,17 +43,30 @@ def pytest_configure(config):
         f"real_api: makes real Claude API calls (costs a few tokens); skipped unless {REAL_API_OPT_IN}=1; "
         "records spend in the real data/claude_usage.db",
     )
+    config.addinivalue_line(
+        "markers",
+        f"real_desktop: opens real windows on this computer and closes only the ones it opened; "
+        f"skipped unless {REAL_DESKTOP_OPT_IN}=1",
+    )
+
+
+OPT_IN_GATES = {
+    "real_api": (REAL_API_OPT_IN,
+                 f"Real Claude API call - set {REAL_API_OPT_IN}=1 to run (uses the .env key, costs a few tokens)"),
+    "real_desktop": (REAL_DESKTOP_OPT_IN,
+                     f"Opens real windows - set {REAL_DESKTOP_OPT_IN}=1 to run (closes only what it opened)"),
+}
 
 
 def pytest_collection_modifyitems(config, items):
-    """The single gate for real API tests: skip them unless explicitly opted in."""
-    if os.environ.get(REAL_API_OPT_IN) == "1":
-        return
-    skip = pytest.mark.skip(
-        reason=f"Real Claude API call - set {REAL_API_OPT_IN}=1 to run (uses the .env key, costs a few tokens)")
-    for item in items:
-        if item.get_closest_marker("real_api"):
-            item.add_marker(skip)
+    """The single gate for opt-in tests: skip them unless explicitly opted in."""
+    for marker, (variable, reason) in OPT_IN_GATES.items():
+        if os.environ.get(variable) == "1":
+            continue
+        skip = pytest.mark.skip(reason=reason)
+        for item in items:
+            if item.get_closest_marker(marker):
+                item.add_marker(skip)
 
 
 @pytest.fixture(autouse=True)

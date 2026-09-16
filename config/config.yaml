@@ -51,6 +51,19 @@ executor:
   apps:
     notepad: notepad.exe
     calculator: calc.exe
+  # Action -> Result -> Recovery: attempts per action, including the first. A failed, retryable
+  # attempt is offered to the user for retry - never silently continued.
+  max_attempts: 3
+
+# --- Verifier (app/verifier/) ---
+verifier:
+  window_timeout_seconds: 15    # how long a newly opened app gets to show its window
+  poll_interval_seconds: 0.25   # how often to look (the emergency stop interrupts the wait)
+  # Title of each app's window (case-insensitive regular expression). Opening an app only counts
+  # as done when a NEW window matching it appears; windows already open never count.
+  app_windows:
+    notepad: "Notepad$"
+    calculator: "^Calculator$"
 
 # --- Brain (Claude API) ---
 brain:

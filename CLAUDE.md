@@ -12,8 +12,13 @@ A personal, Windows desktop AI assistant. Full context: /docs/build-plan.md,
    allowed to import an external library (anthropic, faster_whisper, pyautogui,
    pywinauto, playwright). logic.py never imports these directly.
 3. Every setting lives in config/config.yaml or .env — never hardcoded in code.
-4. Every module change stays inside its own app/<module>/ folder unless the task
-   explicitly requires wiring two modules together in main.py.
+4. Every module change stays inside its own app/<module>/ folder, and modules are normally
+   wired together in main.py. Sanctioned exception: a module's logic may call another
+   module's logic directly where routing the call through main.py would create a way to
+   bypass safety or verification. Example: app/executor/logic.py calls app/safety
+   (authorize before every action) and app/verifier/logic.py (verify after every action),
+   so no code path can act unauthorized or unverified. The emergency stop
+   (app/executor/emergency_stop.py) is likewise callable from any module by design.
 
 ## Safety rules — apply from the first line of code, not "later"
 5. Every action the Executor takes must pass through app/safety/ first. No exceptions,
@@ -35,6 +40,14 @@ A personal, Windows desktop AI assistant. Full context: /docs/build-plan.md,
 12. Not an unrestricted autonomous agent, not multi-user, not a SaaS product, not a
     remote-computer controller, not guaranteed-compatible with every third-party app.
     If a request drifts toward one of these, flag it before building.
+
+## Amendments
+- 2026-09-16 — Rule 4: sanctioned cross-module logic calls where routing through main.py
+  would create a way to bypass safety or verification (app/executor/logic.py → app/safety
+  and app/verifier/logic.py).
+- 2026-09-16 — Module shape (docs/step3 Section 2): a module folder may hold focused extra
+  files beyond adapter.py / logic.py / models.py when a concern doesn't fit them
+  (app/brain/cost_controls.py, app/executor/emergency_stop.py). Rule 2 still applies.
 
 ## Current phase
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active

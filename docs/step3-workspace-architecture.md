@@ -58,6 +58,8 @@ app/<module>/
 └── models.py          → any data shapes this module defines (e.g. a "Plan" or "MemoryEntry")
 ```
 
+**Amendment (16 September 2026) — focused extra files.** A module folder may also hold a focused extra file when a concern doesn't fit `adapter.py`, `logic.py` or `models.py` — for example `app/brain/cost_controls.py` (rate/token/budget enforcement and the usage ledger) and `app/executor/emergency_stop.py` (the process-wide stop flag). Extra files follow the same rules: third-party libraries are still imported only in `adapter.py`. App-wide concerns that belong to no single component live directly in `app/` (`app/health.py`, `app/logging_setup.py`). A module's logic may also call another module's logic where routing the call through `main.py` would create a way to bypass safety or verification (e.g. the Executor calling the safety gate and the Verifier) — see `CLAUDE.md` rule 4.
+
 This is the adapter pattern from the Build Plan's foundation section (Section 5.5), made concrete as real files rather than a principle. Example — `app/brain/adapter.py` is the *only* place `import anthropic` is allowed to appear anywhere in the project. If the AI provider ever changes, that's a one-file change, not a project-wide search-and-replace.
 
 **Skeleton example (`app/brain/adapter.py`):**

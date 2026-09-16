@@ -1,10 +1,11 @@
 """
-Tests for app/executor/logic.py and adapter.py - Phase 1, task 1: the action pipeline with
-open_app (emergency stop -> validate -> safety gate -> stop check -> adapter).
+Tests for app/executor/logic.py and adapter.py - the action pipeline with open_app
+(emergency stop -> validate -> safety gate -> stop check -> adapter -> Verifier) and the
+Action -> Result -> Recovery loop.
 
-No real application is ever started: the adapter's launch is replaced by a recorder. The REAL
-safety gate (with a temp config) decides every action - nothing bypasses it.
-(The Phase 0 emergency-stop tests live in tests/test_executor.py.)
+No real application or window is ever touched: launches are recorded and the desktop is faked
+(a launch "opens" a fake window). The REAL safety gate and the REAL Verifier logic decide every
+action - nothing bypasses them. (The Phase 0 emergency-stop tests live in tests/test_executor.py.)
 """
 import ast
 import re
@@ -15,10 +16,13 @@ import pytest
 
 from app.executor import adapter, emergency_stop, logic
 from app.executor.emergency_stop import EmergencyStopError
-from app.executor.logic import execute
+from app.executor.logic import execute, execute_with_recovery
 from app.executor.models import OPEN_APP, ExecutorAction
 from app.safety import logic as safety_logic
 from app.safety.logic import ActionDeniedError
+from app.verifier import adapter as verifier_adapter
+from app.verifier import logic as verifier_logic
+from app.verifier.models import WindowInfo
 from config import settings
 
 CONFIG = (
@@ -30,20 +34,35 @@ CONFIG = (
     "    notepad: notepad.exe\n"
     "    calculator: calc.exe\n"
     "    deleter: deleter.exe\n"  # a name the safety gate treats as risky
+    "  max_attempts: 3\n"
+    "verifier:\n"
+    "  window_timeout_seconds: 0.2\n"
+    "  poll_interval_seconds: 0.01\n"
+    "  app_windows:\n"
+    '    notepad: "Notepad$"\n'
+    '    calculator: "^Calculator$"\n'
+    '    deleter: "^Deleter$"\n'
 )
+WINDOW_TITLES = {"notepad.exe": "Untitled - Notepad", "calc.exe": "Calculator", "deleter.exe": "Deleter"}
 
 
 def always(answer):
-    return lambda action, assessment: answer
+    return lambda *args: answer
 
 
 @pytest.fixture
 def world(tmp_path, monkeypatch):
-    """Temp config; the real safety gate wrapped in a recorder; launches recorded, never run."""
+    """Temp config; the real safety gate wrapped in a recorder; launches recorded, never run;
+    a fake desktop where a launch opens a window unless `window_appears(launch_number)` says no."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text(CONFIG, encoding="utf-8")
     monkeypatch.setattr(settings, "CONFIG_PATH", config_path)
     calls = []
+    desktop = SimpleNamespace(
+        windows=[WindowInfo(1, "Claude Code Response.txt - Notepad")],  # the user's own, already open
+        launches=0,
+        window_appears=lambda launch_number: True,
+    )
     real_authorize = safety_logic.authorize
 
     def recording_authorize(action, confirm=None):
@@ -52,12 +71,20 @@ def world(tmp_path, monkeypatch):
 
     def recording_launch(executable):
         calls.append(("launch", executable))
+        desktop.launches += 1
+        if desktop.window_appears(desktop.launches):
+            desktop.windows.append(WindowInfo(1000 + desktop.launches, WINDOW_TITLES[executable]))
         return 4242
+
+    def forbidden_popen(*args, **kwargs):
+        raise AssertionError("a real process must not be started in this test")
 
     monkeypatch.setattr(logic, "authorize", recording_authorize)
     monkeypatch.setattr(adapter, "launch_app", recording_launch)
+    monkeypatch.setattr(verifier_adapter, "list_windows", lambda: list(desktop.windows))
+    monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
     emergency_stop.reset("test-setup")
-    yield SimpleNamespace(calls=calls, config_path=config_path)
+    yield SimpleNamespace(calls=calls, config_path=config_path, desktop=desktop)
     emergency_stop.reset("test-teardown")
 
 
@@ -65,12 +92,16 @@ def open_app(name):
     return ExecutorAction(OPEN_APP, name)
 
 
-# --- Happy path ---
+def launches(world):
+    return [call for call in world.calls if call[0] == "launch"]
 
-def test_open_known_app_passes_safety_then_launches(world):
+
+# --- Happy path: safety, launch, then the Verifier confirms the window ---
+
+def test_open_known_app_passes_safety_launches_and_is_verified(world):
     result = execute(open_app("notepad"))
-    assert result.ok
-    assert result.message == "Started notepad (notepad.exe, process 4242)."
+    assert result.ok and not result.retryable
+    assert re.fullmatch(r"Opened notepad; its window appeared after \d+\.\ds\.", result.message)
     assert world.calls == [("safety", "open app notepad"), ("launch", "notepad.exe")]
 
 
@@ -111,7 +142,14 @@ def test_invalid_executor_config_fails_cleanly(world, bad_apps):
     assert world.calls == []
 
 
-# --- App unavailable / permission denied: clear failure, no crash, no hang ---
+def test_app_that_cannot_be_verified_is_not_opened(world):
+    world.config_path.write_text(CONFIG.replace('    calculator: "^Calculator$"\n', ""), encoding="utf-8")
+    result = execute(open_app("calculator"))
+    assert not result.ok and "No window title pattern for 'calculator'" in result.message
+    assert world.calls == []
+
+
+# --- App unavailable / permission denied: clear failure, no crash, no hang, no retry ---
 
 @pytest.mark.parametrize("error", [
     adapter.AppNotFoundError("'notepad.exe' isn't installed or can't be found on this computer."),
@@ -123,8 +161,34 @@ def test_launch_failure_is_reported_cleanly(world, monkeypatch, error):
         raise error
     monkeypatch.setattr(adapter, "launch_app", failing_launch)
     result = execute(open_app("notepad"))
-    assert not result.ok and result.message == str(error)
+    assert not result.ok and not result.retryable and result.message == str(error)
     assert world.calls == [("safety", "open app notepad"), ("launch", "notepad.exe")]
+
+
+# --- Verifier: success only when a NEW window is observed ---
+
+def test_window_that_never_appears_is_a_retryable_failure_not_false_success(world):
+    world.desktop.window_appears = lambda n: False
+    result = execute(open_app("notepad"))
+    assert not result.ok and result.retryable
+    assert result.message == "notepad was started, but no new window appeared within 0.2 seconds."
+    assert world.calls == [("safety", "open app notepad"), ("launch", "notepad.exe")]
+
+
+def test_already_open_notepad_window_is_not_mistaken_for_success(world):
+    world.desktop.windows.append(WindowInfo(2, "Untitled - Notepad"))  # open before the action
+    world.desktop.window_appears = lambda n: False
+    assert not execute(open_app("notepad")).ok
+
+
+def test_unobservable_desktop_means_nothing_is_launched(world, monkeypatch):
+    def unavailable():
+        raise verifier_adapter.VerifierAdapterError("checking windows is only supported on Windows")
+    monkeypatch.setattr(verifier_adapter, "list_windows", unavailable)
+    result = execute(open_app("notepad"))
+    assert not result.ok and not result.retryable
+    assert result.message.startswith("Didn't open notepad: I can't check whether its window appears")
+    assert launches(world) == []
 
 
 # --- Safety gate: every action, no bypass ---
@@ -138,7 +202,7 @@ def test_risky_action_without_confirmation_is_denied_and_nothing_launches(world)
 def test_risky_action_declined_by_the_user_launches_nothing(world):
     with pytest.raises(ActionDeniedError, match="did not confirm"):
         execute(open_app("deleter"), confirm=always(False))
-    assert ("launch", "deleter.exe") not in world.calls
+    assert launches(world) == []
 
 
 def test_risky_action_confirmed_by_the_user_launches(world):
@@ -162,6 +226,90 @@ def test_stop_during_confirmation_prevents_the_action(world):
     with pytest.raises(EmergencyStopError):
         execute(open_app("deleter"), confirm=confirm_then_stop)
     assert world.calls == [("safety", "open app deleter")]
+
+
+# --- Action -> Result -> Recovery ---
+
+def test_failed_attempt_is_offered_for_retry_and_the_retry_succeeds(world):
+    world.desktop.window_appears = lambda n: n >= 2
+    offers = []
+    result = execute_with_recovery(open_app("notepad"), offer_retry=lambda r: offers.append(r) or True)
+    assert result.ok
+    assert len(offers) == 1 and offers[0].retryable and "no new window appeared" in offers[0].message
+    assert world.calls == [("safety", "open app notepad"), ("launch", "notepad.exe")] * 2
+
+
+def test_without_a_retry_prompt_nothing_is_retried_silently(world):
+    world.desktop.window_appears = lambda n: False
+    result = execute_with_recovery(open_app("notepad"))
+    assert not result.ok and result.message.endswith("Not retried.")
+    assert len(launches(world)) == 1
+
+
+@pytest.mark.parametrize("answer", [False, "yes", 1, None])
+def test_retry_happens_only_on_an_explicit_yes(world, answer):
+    world.desktop.window_appears = lambda n: False
+    result = execute_with_recovery(open_app("notepad"), offer_retry=always(answer))
+    assert not result.ok and result.message.endswith("Not retried.")
+    assert len(launches(world)) == 1
+
+
+def test_retries_stop_at_max_attempts(world):
+    world.desktop.window_appears = lambda n: False
+    offers = []
+    result = execute_with_recovery(open_app("notepad"), offer_retry=lambda r: offers.append(r) or True)
+    assert not result.ok and not result.retryable
+    assert result.message.endswith("Gave up after 3 attempts.")
+    assert len(launches(world)) == 3 and len(offers) == 2
+
+
+def test_broken_retry_prompt_does_not_crash_or_retry(world):
+    world.desktop.window_appears = lambda n: False
+
+    def broken(result):
+        raise RuntimeError("prompt window closed")
+    result = execute_with_recovery(open_app("notepad"), offer_retry=broken)
+    assert not result.ok and result.message.endswith("Not retried.")
+    assert len(launches(world)) == 1
+
+
+def test_non_retryable_failure_is_never_offered(world, monkeypatch):
+    def not_installed(executable):
+        world.calls.append(("launch", executable))
+        raise adapter.AppNotFoundError("'notepad.exe' isn't installed or can't be found on this computer.")
+    monkeypatch.setattr(adapter, "launch_app", not_installed)
+    offers = []
+    result = execute_with_recovery(open_app("notepad"), offer_retry=lambda r: offers.append(r) or True)
+    assert not result.ok and offers == [] and len(launches(world)) == 1
+
+
+def test_every_retry_passes_the_safety_gate_again(world):
+    world.desktop.window_appears = lambda n: n >= 2
+    confirmations = []
+    result = execute_with_recovery(open_app("deleter"),
+                                   confirm=lambda action, assessment: confirmations.append(action) or True,
+                                   offer_retry=always(True))
+    assert result.ok
+    assert len(confirmations) == 2  # the risky action was confirmed again before the retry
+
+
+def test_emergency_stop_during_the_retry_prompt_blocks_the_retry(world):
+    world.desktop.window_appears = lambda n: False
+
+    def stop_then_accept(result):
+        emergency_stop.trigger("hotkey")
+        return True
+    with pytest.raises(EmergencyStopError):
+        execute_with_recovery(open_app("notepad"), offer_retry=stop_then_accept)
+    assert len(launches(world)) == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "two", "true"])
+def test_invalid_max_attempts_fails_cleanly(world, value):
+    world.config_path.write_text(CONFIG.replace("max_attempts: 3", f"max_attempts: {value}"), encoding="utf-8")
+    result = execute_with_recovery(open_app("notepad"))
+    assert not result.ok and "executor.max_attempts" in result.message
+    assert world.calls == []
 
 
 # --- Adapter (no process is ever started) ---
@@ -211,8 +359,10 @@ def test_adapter_turns_launch_errors_into_clear_messages(monkeypatch, error, mes
 
 # --- Real config + architecture rules ---
 
-def test_real_config_lists_openable_apps():
+def test_real_config_lists_openable_apps_and_retry_limit():
     assert logic._configured_apps()["notepad"] == "notepad.exe"
+    assert logic._max_attempts() >= 1
+    assert verifier_logic.expect_window("notepad").timeout_seconds > 0
 
 
 def _imports(path):
@@ -229,17 +379,21 @@ def _python_files():
             *(root / "scripts").rglob("*.py"), root / "main.py"]
 
 
-def test_only_executor_logic_uses_the_executor_adapter():
-    """Every real action must pass the safety gate in logic.execute(); nothing may call the adapter directly."""
+@pytest.mark.parametrize("package, allowed", [
+    ("app.executor", "app/executor/logic.py"),
+    ("app.verifier", "app/verifier/logic.py"),
+])
+def test_only_each_modules_logic_uses_its_adapter(package, allowed):
+    """Every real action must pass the safety gate in executor.execute(), and desktop reads go
+    through verifier logic; nothing may call either adapter directly."""
     root = settings.PROJECT_ROOT
-    allowed = root / "app" / "executor" / "logic.py"
     offenders = [
         f"{path.relative_to(root)}: {module} {name}".strip()
-        for path in _python_files() if path != allowed
+        for path in _python_files() if path != root / allowed
         for module, name in _imports(path)
-        if module == "app.executor.adapter" or (module == "app.executor" and name == "adapter")
+        if module == f"{package}.adapter" or (module == package and name == "adapter")
     ]
-    assert offenders == [], f"Only app/executor/logic.py may use the executor adapter: {offenders}"
+    assert offenders == [], f"Only {allowed} may use {package}.adapter: {offenders}"
 
 
 def test_only_executor_adapter_controls_the_computer():
@@ -253,3 +407,12 @@ def test_only_executor_adapter_controls_the_computer():
         if module.split(".")[0] in controllers
     ]
     assert offenders == [], f"Only app/executor/adapter.py may control the computer: {offenders}"
+
+
+def test_only_verifier_adapter_reads_the_desktop_through_ctypes():
+    root = settings.PROJECT_ROOT
+    allowed = root / "app" / "verifier" / "adapter.py"
+    offenders = [f"{path.relative_to(root)}: {module}"
+                 for path in (root / "app").rglob("*.py") if path != allowed
+                 for module, _ in _imports(path) if module.split(".")[0] == "ctypes"]
+    assert offenders == [], f"Only app/verifier/adapter.py may use ctypes: {offenders}"
