@@ -1,5 +1,5 @@
 """
-Tests for config/health.py and the main.py startup health check.
+Tests for app/health.py and the main.py startup health check.
 Offline only: every test points settings at temporary files; no API calls are made.
 The real Claude connection check is tested through fake_claude (tests/conftest.py),
 except one real-API test that is skipped unless RUN_REAL_CLAUDE_TEST=1.
@@ -11,7 +11,8 @@ import httpx2
 import pytest
 
 import main
-from config import health, settings
+from app import health
+from config import settings
 from tests.conftest import OK_BODY
 
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
@@ -114,7 +115,7 @@ def no_network(request):
 
 def test_claude_check_is_not_run_by_default(fake_claude):
     results = health.run_health_check()
-    assert [r.name for r in results] == ["API key"]
+    assert health.CLAUDE_CHECK_NAME not in [r.name for r in results]
     assert fake_claude.requests == []
 
 

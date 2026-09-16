@@ -173,7 +173,7 @@ def test_main_logs_startup_health_results_and_exit(fake_claude):
     assert main.main([]) == 0
     text = fake_claude.log_path.read_text(encoding="utf-8")
     assert "main: Startup (check_claude=False)" in text
-    assert "config.health: Health check API key: OK" in text
+    assert "app.health: Health check API key: OK" in text
     assert "main: Exit code 0" in text
 
 

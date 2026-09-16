@@ -10,6 +10,7 @@ by every module. Modules just do:  log = logging.getLogger(__name__)
   Claude's replies.
 - Fail-soft: if the log file can't be set up, logging falls back to the console and
   the app keeps running - deliberately the opposite of cost_controls' fail-closed rule.
+  logging_status() lets the health check tell the user when that happened.
 """
 import logging
 import re
@@ -25,7 +26,7 @@ REDACTED = "[REDACTED]"
 _API_KEY_PATTERN = re.compile(r"sk-ant-[A-Za-z0-9_\-]+")
 _MIN_SECRET_LENGTH = 8  # shorter "secrets" would redact ordinary words
 
-_state = {"handlers": [], "previous_level": None}
+_state = {"handlers": [], "previous_level": None, "status": None}
 log = logging.getLogger(__name__)
 
 
@@ -78,8 +79,17 @@ def setup_logging() -> Path | None:
     root.addHandler(handler)
     _state["handlers"].append(handler)
     if problem:
+        _state["status"] = (False, f"File logging unavailable ({problem}); logging to the console only, "
+                                   f"so nothing is being saved to logs/.")
         log.warning("File logging unavailable (%s); logging to the console instead.", problem)
+    else:
+        _state["status"] = (True, f"Writing to {log_path}.")
     return log_path
+
+
+def logging_status() -> tuple[bool, str] | None:
+    """(ok, message) describing the logging setup_logging() installed, or None if it hasn't run."""
+    return _state["status"]
 
 
 def reset_logging() -> None:
@@ -89,6 +99,7 @@ def reset_logging() -> None:
         root.removeHandler(handler)
         handler.close()
     _state["handlers"].clear()
+    _state["status"] = None
     if _state["previous_level"] is not None:
         root.setLevel(_state["previous_level"])
         _state["previous_level"] = None

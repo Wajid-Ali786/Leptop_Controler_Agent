@@ -9,13 +9,21 @@ sent (and not retried):
   3. Money budget - spend today / this month plus this request's worst-case cost
 
 Each authorized request is written to a SQLite usage ledger under data/
-(git-ignored), so the rate window and budgets survive restarts. record_usage()
-writes back the actual token counts from Claude's reply and prices them. If the
-ledger can't be used, requests are blocked (fail closed) - spend is never untracked.
+(git-ignored), so the rate window and budgets survive restarts. The row starts out
+holding the request's worst-case cost - the same figure the budget check used - as a
+reservation:
+  - record_usage() replaces it with the actual cost from Claude's reply;
+  - release_reservation() zeroes it when the request certainly wasn't billed;
+  - if the process dies in between, the worst case stays counted (fail closed).
+If the ledger can't be used, requests are blocked (fail closed) - spend is never untracked.
+
+check_limits(), model_prices() and check_ledger() let the offline health check validate
+the same settings and ledger without sending or recording anything.
 
 All limits and prices come from config/config.yaml via get_setting().
 """
 import math
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -30,6 +38,14 @@ RATE_WINDOW_SECONDS = 60
 # token) and roughly matches Urdu/Hindi script (~2 UTF-8 bytes per character).
 BYTES_PER_TOKEN_ESTIMATE = 2
 
+LIMIT_SETTINGS = (
+    "cost.rate_limit_per_minute",
+    "cost.max_input_tokens_per_request",
+    "cost.max_output_tokens_per_request",
+    "cost.daily_budget_usd",
+    "cost.monthly_budget_usd",
+)
+
 _now = time.time  # replaced in tests to control the clock
 
 _SCHEMA = """
@@ -39,9 +55,9 @@ CREATE TABLE IF NOT EXISTS claude_requests (
     model TEXT NOT NULL,
     max_tokens INTEGER NOT NULL,
     estimated_input_tokens INTEGER NOT NULL,
-    input_tokens INTEGER,                   -- actual, from Claude's reply (NULL if it failed)
+    input_tokens INTEGER,                   -- actual, from Claude's reply (NULL until recorded)
     output_tokens INTEGER,
-    cost_usd REAL NOT NULL DEFAULT 0
+    cost_usd REAL NOT NULL DEFAULT 0        -- worst-case reservation until recorded; 0 if released
 )
 """
 
@@ -67,7 +83,8 @@ def estimate_input_tokens(prompt: str) -> int:
 
 
 def authorize(*, model: str, prompt: str, max_tokens: int) -> int:
-    """Run all three controls; record the request and return its id, or raise CostLimitError."""
+    """Run all three controls; record the request with its worst-case cost reserved and
+    return its id, or raise CostLimitError."""
     estimated_input = estimate_input_tokens(prompt)
     _check_token_limit(estimated_input, max_tokens)
     worst_case_usd = _cost(model, estimated_input, max_tokens)
@@ -76,15 +93,15 @@ def authorize(*, model: str, prompt: str, max_tokens: int) -> int:
         _check_rate_limit(conn, now)
         _check_budgets(conn, now, worst_case_usd)
         cursor = conn.execute(
-            "INSERT INTO claude_requests (sent_at, model, max_tokens, estimated_input_tokens) "
-            "VALUES (?, ?, ?, ?)",
-            (now, model, max_tokens, estimated_input),
+            "INSERT INTO claude_requests (sent_at, model, max_tokens, estimated_input_tokens, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now, model, max_tokens, estimated_input, worst_case_usd),  # the budget check's own figure
         )
         return cursor.lastrowid
 
 
 def record_usage(request_id: int, reply: ClaudeReply) -> float:
-    """Write Claude's actual token usage for an authorized request; return its cost in USD."""
+    """Replace the request's reservation with its actual cost; return that cost in USD."""
     with _ledger() as conn:
         row = conn.execute("SELECT model FROM claude_requests WHERE id = ?", (request_id,)).fetchone()
         if row is None:
@@ -95,6 +112,62 @@ def record_usage(request_id: int, reply: ClaudeReply) -> float:
             (reply.input_tokens, reply.output_tokens, cost_usd, request_id),
         )
     return cost_usd
+
+
+def release_reservation(request_id: int) -> None:
+    """Zero the reservation of a request that certainly wasn't billed. The row stays (it still
+    counts toward the rate limit), and a cost already recorded by record_usage() is never touched."""
+    with _ledger() as conn:
+        conn.execute(
+            "UPDATE claude_requests SET cost_usd = 0 WHERE id = ? AND input_tokens IS NULL",
+            (request_id,),
+        )
+
+
+# --- Read-only checks for the offline health check ---------------------------------------
+
+def check_limits() -> dict:
+    """Validate the rate/token/budget settings exactly as authorize() will; return them by name."""
+    return {name: _positive_number(name) for name in LIMIT_SETTINGS}
+
+
+def model_prices(model: str) -> tuple[float, float]:
+    """(input, output) USD per million tokens for `model`; CostLimitError if it has no valid price."""
+    return _prices_for(model)
+
+
+def check_ledger() -> str:
+    """Confirm the usage ledger is usable, without creating, modifying, or leaving behind
+    anything. Returns a short status; raises CostLimitError describing any problem."""
+    path = _ledger_path()
+    if not path.exists():
+        nearest = next(p for p in path.parents if p.exists())
+        if not nearest.is_dir() or not os.access(nearest, os.W_OK):
+            raise CostLimitError(f"Usage ledger location {path} can't be created ({nearest} is not a "
+                                 f"writable folder), so spend can't be tracked.")
+        return f"No ledger yet at {path}; it will be created on the first Claude request."
+    if not path.is_file():
+        raise CostLimitError(f"Usage ledger {path} is not a file, so spend can't be tracked.")
+    if not os.access(path, os.W_OK):
+        raise CostLimitError(f"Usage ledger {path} is read-only, so spend can't be recorded.")
+    if path.with_name(path.name + "-journal").exists():
+        # Opening it would have to roll the transaction back (a write), so leave that to authorize().
+        return (f"{path} has an interrupted transaction (e.g. from a crash); it will be rolled back "
+                f"automatically on the next Claude request.")
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            integrity = conn.execute("PRAGMA quick_check").fetchone()[0]
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claude_requests'").fetchone()
+            count = conn.execute("SELECT COUNT(*) FROM claude_requests").fetchone()[0] if has_table else 0
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise _ledger_error(path, exc) from None
+    if integrity != "ok":
+        raise CostLimitError(f"Usage ledger {path} failed its integrity check, so spend can't be trusted.")
+    return f"{path} is readable ({count} request(s) recorded)."
 
 
 # --- The three controls ---------------------------------------------------------------
@@ -130,6 +203,7 @@ def _check_rate_limit(conn: sqlite3.Connection, now: float) -> None:
 
 
 def _check_budgets(conn: sqlite3.Connection, now: float, worst_case_usd: float) -> None:
+    """Spend includes reservations of requests still in flight or interrupted by a crash."""
     today = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
     periods = (
         ("Daily", "today", today, "cost.daily_budget_usd"),

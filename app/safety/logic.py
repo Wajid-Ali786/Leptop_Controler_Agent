@@ -96,6 +96,13 @@ def assess(action: Action) -> RiskAssessment:
     return RiskAssessment(RiskLevel.LOW, "no risky keywords found")
 
 
+def configured_keywords() -> list[str]:
+    """The risky keywords in effect, or SettingsError if the safety configuration is invalid
+    (in which case assess() treats every action as risky). Used by the offline health check."""
+    keywords, _ = _load_rules()
+    return keywords
+
+
 # --- Helpers ----------------------------------------------------------------------------
 
 def _risky(rule: str) -> RiskAssessment:

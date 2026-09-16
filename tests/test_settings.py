@@ -137,3 +137,19 @@ def test_no_other_module_reads_settings_sources_directly():
                 if name.split(".")[0] in ("yaml", "dotenv") or name.startswith("os."):
                     offenders.append(f"{path.relative_to(settings.PROJECT_ROOT)}: {name}")
     assert offenders == [], f"Only config/settings.py may read config.yaml/.env: {offenders}"
+
+
+def test_config_never_imports_from_app():
+    """config/ is the bottom layer: app/ modules import from it, never the other way round."""
+    root = settings.PROJECT_ROOT
+    offenders = []
+    for path in (root / "config").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                names = [node.module or ""]
+            else:
+                continue
+            offenders += [f"{path.relative_to(root)}: {n}" for n in names if n.split(".")[0] == "app"]
+    assert offenders == [], f"config/ must not import from app/: {offenders}"

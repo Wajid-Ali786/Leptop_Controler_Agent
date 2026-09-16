@@ -18,11 +18,14 @@ import sys
 
 import pytest
 
+from app.brain.cost_controls import estimate_input_tokens
 from config import settings
 from tests.conftest import FAKE_KEY, config_text
 from tests.recovery_child import CRASH_EXIT
 
 REQUEST_COST = (1000 * 5.0 + 100 * 25.0) / 1_000_000  # recovery_child.USAGE at test-model prices
+# Worst case reserved for the request that crashed mid-usage (prompt "sent", max_tokens=100).
+RESERVED_COST = (estimate_input_tokens("sent") * 5.0 + 100 * 25.0) / 1_000_000
 LOG_LINE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} [A-Z]+ +[\w.]+: .*$")
 NUMBERED = re.compile(r"app\.recovery: line (\d{5})$")
 
@@ -102,11 +105,10 @@ def test_ledger_survives_crash_mid_usage_transaction(app_dir):
     assert integrity == "ok"
     assert not (app_dir / "claude_usage.db-journal").exists()
     # Request 3 was authorized (committed) and "sent", but the crash hit while recording its
-    # usage: the UPDATE rolled back as a whole - no half-written row (tokens without cost).
-    # Nothing is lost or double-counted: 4 rows, spend = the three recorded requests.
-    # KNOWN LIMITATION (reported, not fixed here): request 3's real cost is unrecorded.
-    assert rows == [completed(1), completed(2), (3, None, None, 0.0), completed(4)]
-    assert sum(r[3] for r in rows) == pytest.approx(3 * REQUEST_COST)
+    # usage: the UPDATE rolled back as a whole - no half-written row. Its worst-case
+    # reservation from authorize() stays counted (fail closed), nothing is lost or double-counted.
+    assert rows == [completed(1), completed(2), (3, None, None, pytest.approx(RESERVED_COST)), completed(4)]
+    assert sum(r[3] for r in rows) == pytest.approx(3 * REQUEST_COST + RESERVED_COST)
     assert snapshot_config(app_dir) == config_before
 
 
@@ -145,12 +147,22 @@ def test_logs_survive_crash_mid_rotation(app_dir, mode, files_after_crash):
     assert names == files_after_crash  # proof: died mid-rotation
     before = numbered(lines)
     assert before and before == list(range(len(before)))  # every line written so far, no gaps/dups
+    assert snapshot_config(app_dir) == config_before
+
+    # The restart logs well over 400 bytes (startup + every health check), so it rotates
+    # again - starting from the half-rotated state. With only 2 backups that rotation would
+    # (correctly) delete the pre-crash files inspected below, so keep more backups.
+    config_path.write_text(config_path.read_text(encoding="utf-8").replace(
+        "backup_count: 2", "backup_count: 10"), encoding="utf-8")
+    config_before = snapshot_config(app_dir)
 
     restart(app_dir)
 
     names, lines = read_logs(app_dir)
     assert "companion.log" in names
+    assert len(names) > len(files_after_crash)  # the restart rotated again, from the half-rotated state
     assert numbered(lines) == before  # nothing lost or duplicated by the restart
+    assert any(line.endswith("main: Startup (check_claude=False)") for line in lines)
     active = (app_dir / "logs" / "companion.log").read_text(encoding="utf-8")
-    assert "main: Startup" in active and "app.recovery: after restart" in active
+    assert active.rstrip().endswith("app.recovery: after restart")  # newest line in the active file
     assert snapshot_config(app_dir) == config_before

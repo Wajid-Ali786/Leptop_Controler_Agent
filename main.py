@@ -13,7 +13,7 @@ import logging
 import sys
 
 from app.logging_setup import setup_logging
-from config.health import format_report, run_health_check
+from app.health import format_report, run_health_check
 
 log = logging.getLogger("main")
 

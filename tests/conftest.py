@@ -1,8 +1,9 @@
 """
 Shared test fixtures (docs/step3 Section 5).
 
-isolated_logging (autouse): every test's log output goes to its own tmp_path/logs/,
-never the real logs/ folder, and logging handlers are removed after each test.
+isolated_logging (autouse): relative log and ledger paths resolve under each test's own
+tmp_path, never the real logs/ or data/ folders, and logging handlers are removed after
+each test.
 
 fake_claude: an offline Claude for tests/test_brain*.py - temp config.yaml, .env and
 usage ledger, a controllable clock, and a mock HTTP transport running the real
@@ -30,15 +31,16 @@ OK_BODY = {
 
 @pytest.fixture(autouse=True)
 def isolated_logging(tmp_path, monkeypatch):
-    """Relative log paths resolve under tmp_path, so tests never write to the real logs/."""
+    """Relative log/ledger paths resolve under tmp_path, so tests never touch real logs/ or data/."""
     monkeypatch.setattr(logging_setup, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(cost_controls, "PROJECT_ROOT", tmp_path)
     yield
     logging_setup.reset_logging()
 
 
 def config_text(ledger_path, *, model="test-model", rate_limit=5, max_input_tokens=1000,
                 max_output_tokens=100, daily_usd=1.0, monthly_usd=5.0) -> str:
-    """Test config.yaml. model=None omits brain.model."""
+    """Test config.yaml. model=None omits brain.model. The cost section comes last."""
     model_line = f"  model: {model}\n" if model else ""
     return (
         "logging:\n"
@@ -51,6 +53,9 @@ def config_text(ledger_path, *, model="test-model", rate_limit=5, max_input_toke
         "  timeout_seconds: 5\n"
         "  max_retries: 0\n"
         "  ping_max_tokens: 16\n"
+        "safety:\n"
+        '  risky_keywords: [delete, shutdown, "shut down", send]\n'
+        "  safe_words: [sender, senders]\n"
         "cost:\n"
         f"  rate_limit_per_minute: {rate_limit}\n"
         f"  max_input_tokens_per_request: {max_input_tokens}\n"
