@@ -10,6 +10,8 @@ class WindowInfo:
     """A visible top-level window on the desktop."""
     handle: int
     title: str
+    class_name: str = ""  # the Windows window class, e.g. "ApplicationFrameWindow"
+    enabled: bool = True  # False while the window is blocked by a dialog it opened (e.g. "Save changes?")
 
 
 @dataclass(frozen=True)
@@ -28,3 +30,5 @@ class VerificationResult:
     retryable: bool = False               # would trying the action again plausibly help?
     elapsed_seconds: float | None = None
     window_handle: int | None = None
+    window_handles: frozenset[int] = frozenset()  # every new matching window (Calculator shows two)
+    needs_user: bool = False              # a close is blocked by a dialog waiting for the user

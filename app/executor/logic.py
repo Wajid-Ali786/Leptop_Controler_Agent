@@ -18,21 +18,39 @@ execute_with_recovery() adds the Action -> Result -> Recovery loop (docs/build-p
 a retryable failure is OFFERED for retry - never silently continued - and every retry runs the
 whole pipeline again, safety gate and verification included.
 
-Phase 1 is built one action at a time; open_app is the first.
+Phase 1 is built one action at a time: open_app, then close_app.
+
+close_app closes ONLY windows the assistant opened in this session. open_app remembers them in
+memory, so nothing carries over a restart, and windows the user opened are never touched. Closing
+is a polite request (like clicking the window's X), never ending a process, and outcomes stay
+distinct (models.Outcome): a window already gone is ALREADY_CLOSED, one showing a dialog such as
+"Save changes?" is NEEDS_USER, and one that stays open is STILL_OPEN. Neither of the last two is
+ever retryable, so the recovery loop can't retry into an app that is waiting for the user.
 """
 import logging
+import threading
 from typing import Callable
 
 from app.executor import adapter, emergency_stop
-from app.executor.models import OPEN_APP, ActionResult, ExecutorAction
+from app.executor.emergency_stop import EmergencyStopError
+from app.executor.models import CLOSE_APP, OPEN_APP, ActionResult, ExecutorAction, Outcome
 from app.safety.logic import Confirm, authorize
 from app.safety.models import Action
 from app.verifier import logic as verifier
+from app.verifier.models import WindowExpectation, WindowInfo
 from config.settings import SettingsError, get_setting
 
 log = logging.getLogger(__name__)
 
 OfferRetry = Callable[[ActionResult], bool]
+
+# The outer window of a Windows Store app such as Calculator, which also shows a same-titled inner
+# content window. Asking the frame to close closes the app, and the inner window goes with it.
+_FRAME_WINDOW_CLASS = "ApplicationFrameWindow"
+
+# Windows the assistant opened in this session: app name -> window groups, oldest first.
+_session_windows: dict[str, list[frozenset[int]]] = {}
+_session_lock = threading.Lock()
 
 
 def execute(action: ExecutorAction, confirm: Confirm | None = None) -> ActionResult:
@@ -104,6 +122,7 @@ def _prepare_open_app(action: ExecutorAction):
         check = verifier.wait_for_new_window(expectation, before)
         if not check.ok:
             return _result(action, False, check.message, retryable=check.retryable)
+        _remember_opened(name, check.window_handles)
         return _result(action, True, f"Opened {name}; its window appeared after {check.elapsed_seconds:.1f}s.")
 
     return run
@@ -118,9 +137,125 @@ def _configured_apps() -> dict[str, str]:
     return {k.strip().lower(): v.strip() for k, v in apps.items()}
 
 
+# --- close_app --------------------------------------------------------------------------
+
+def _prepare_close_app(action: ExecutorAction):
+    name = action.target.strip().lower()
+    if not name:
+        return _result(action, False, "Which app should I close?")
+    try:
+        apps = _configured_apps()
+    except SettingsError as exc:
+        return _result(action, False, str(exc))
+    if name not in apps:
+        return _result(action, False, f"I don't know an app called '{action.target.strip()}'. "
+                                      f"Apps I can close: {', '.join(sorted(apps))}.")
+    try:
+        expectation = verifier.expect_window(name)
+    except SettingsError as exc:
+        return _result(action, False, str(exc))
+    try:
+        group = _open_session_group(name, expectation)
+        if group is None:
+            return _nothing_of_mine_to_close(action, name, expectation)
+    except verifier.VerifierUnavailableError as exc:
+        return _cant_check(action, name, exc)
+
+    def run() -> ActionResult:
+        try:
+            still_open = verifier.find_open(expectation, group)  # it may have closed during confirmation
+        except verifier.VerifierUnavailableError as exc:
+            return _cant_check(action, name, exc)
+        if not still_open:
+            _forget(name, group)
+            return _result(action, True, f"{name} is already closed.", outcome=Outcome.ALREADY_CLOSED)
+        failure = _request_close(name, still_open)
+        if failure:
+            return _result(action, False, failure)
+        try:
+            check = verifier.wait_for_windows_to_close(expectation, group)
+        except EmergencyStopError:
+            log.warning("Emergency stop while verifying close_app '%s': the close request was already sent "
+                        "and can't be taken back; stopped waiting to verify it", name)
+            raise
+        if check.ok:
+            _forget(name, group)
+            return _result(action, True, f"Closed {name} after {check.elapsed_seconds:.1f}s.")
+        if check.needs_user:
+            return _result(action, False, check.message, outcome=Outcome.NEEDS_USER)
+        if check.elapsed_seconds is None:  # the desktop couldn't be observed, so nothing is known
+            return _result(action, False, check.message)
+        return _result(action, False, check.message, outcome=Outcome.STILL_OPEN)
+
+    return run
+
+
+def _request_close(name: str, windows: list[WindowInfo]) -> str | None:
+    """Ask the app's window group to close: the frame window if there is one, otherwise every window.
+    Returns a failure message, or None once requested."""
+    frames = [w for w in windows if w.class_name == _FRAME_WINDOW_CLASS]
+    targets = frames or windows
+    for window in targets:
+        try:
+            adapter.request_close(window.handle)
+        except adapter.WindowGoneError:
+            continue  # already closing - the Verifier decides the outcome
+        except adapter.WindowCloseError as exc:
+            return f"I couldn't ask {name} to close: {exc}."
+    log.info("Executor: close requested for %d %s window(s)", len(targets), name)
+    return None
+
+
+def _nothing_of_mine_to_close(action: ExecutorAction, name: str, expectation: WindowExpectation) -> ActionResult:
+    """No window opened in this session is still open. Close nothing; say whether other windows are."""
+    others = len(verifier.snapshot_windows(expectation))
+    if not others:
+        return _result(action, True, f"{name} is already closed.", outcome=Outcome.ALREADY_CLOSED)
+    them = "them" if others != 1 else "it"
+    return _result(action, False,
+                   f"I only close windows I opened in this session. {others} {name} "
+                   f"{'windows are' if others != 1 else 'window is'} open, but I didn't open {them}, "
+                   f"so I left {them} alone.")
+
+
+def _cant_check(action: ExecutorAction, name: str, exc: Exception) -> ActionResult:
+    return _result(action, False, f"Didn't close {name}: I can't check its windows ({exc}).")
+
+
+def _remember_opened(name: str, handles: frozenset[int]) -> None:
+    if handles:
+        with _session_lock:
+            _session_windows.setdefault(name, []).append(frozenset(handles))
+
+
+def _forget(name: str, group: frozenset[int]) -> None:
+    with _session_lock:
+        groups = _session_windows.get(name, [])
+        if group in groups:
+            groups.remove(group)
+
+
+def _open_session_group(name: str, expectation: WindowExpectation) -> frozenset[int] | None:
+    """The most recently opened window group of `name` from this session that is still open, or None.
+    Groups whose windows are all gone are forgotten. Raises VerifierUnavailableError."""
+    with _session_lock:
+        groups = list(_session_windows.get(name, []))
+    for group in reversed(groups):
+        if verifier.find_open(expectation, group):
+            return group
+        _forget(name, group)
+    return None
+
+
+def forget_session_windows() -> None:
+    """Forget every window opened in this session, so close_app will close none of them."""
+    with _session_lock:
+        _session_windows.clear()
+
+
 # --- Helpers ----------------------------------------------------------------------------
 
-_PREPARERS = {OPEN_APP: _prepare_open_app}
+_PREPARERS = {OPEN_APP: _prepare_open_app, CLOSE_APP: _prepare_close_app}
 
 
 def _max_attempts() -> int:
@@ -140,7 +275,9 @@ def _retry_accepted(result: ActionResult, offer_retry: OfferRetry | None) -> boo
         return False
 
 
-def _result(action: ExecutorAction, ok: bool, message: str, retryable: bool = False) -> ActionResult:
-    log.log(logging.INFO if ok else logging.WARNING,
-            "Executor %s '%s': %s - %s", action.kind, action.target.strip(), "OK" if ok else "FAILED", message)
-    return ActionResult(action, ok, message, retryable)
+def _result(action: ExecutorAction, ok: bool, message: str, retryable: bool = False,
+            outcome: Outcome | None = None) -> ActionResult:
+    result = ActionResult(action, ok, message, retryable, outcome)
+    log.log(logging.INFO if ok else logging.WARNING, "Executor %s '%s': %s (%s) - %s",
+            action.kind, action.target.strip(), "OK" if ok else "FAILED", result.outcome.value, message)
+    return result

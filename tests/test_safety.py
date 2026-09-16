@@ -71,7 +71,7 @@ def test_risky_keywords_are_medium_risk(safety_config, text, keyword):
     "show the sender of the last email",
     "list all senders",
     "scroll down",
-    "close the window",
+    "maximize the window",  # closing is risky in the real config - see the close tests below
 ])
 def test_ordinary_actions_are_low_risk(safety_config, text):
     assert assess(Action(text)).level == RiskLevel.LOW
@@ -209,7 +209,7 @@ def test_allowed_actions_are_logged_without_their_text(safety_config, caplog):
 
 def test_real_config_has_valid_safety_rules():
     keywords, safe_words = logic._load_rules()
-    assert {"delete", "shutdown", "shut down", "send"} <= set(keywords)
+    assert {"delete", "shutdown", "shut down", "send", "close"} <= set(keywords)
     assert {"mita", "hata", "band", "bhej", "khatam", "saaf"} <= set(keywords)  # Roman Urdu stopgap
     assert {"sender", "husband", "bandwidth", "khata"} <= safe_words
     assert isinstance(get_setting("safety.risky_keywords"), list)
@@ -265,3 +265,40 @@ def test_roman_urdu_verb_requires_confirmation_end_to_end():
         authorize(Action("Ali ko message bhej do"))  # no confirmation method: denied
     decision = authorize(Action("Ali ko message bhej do"), ScriptedConfirm(answer=True))
     assert decision.confirmed is True
+
+
+# --- Closing, with the REAL config.yaml: Medium risk in English and Roman Urdu alike ---
+
+@pytest.mark.parametrize("text, keyword", [
+    ("close app notepad", "close"),       # exactly what the Executor's close_app asks the gate
+    ("Close the calculator", "close"),
+    ("closes all windows", "close"),
+    ("the app closed", "close"),
+    ("closing notepad now", "close"),
+    ("notepad band karo", "band"),
+])
+def test_closing_is_medium_risk_in_both_languages(text, keyword):
+    assessment = assess(Action(text))
+    assert assessment.level == RiskLevel.MEDIUM
+    assert f"risky keyword '{keyword}'" in assessment.rule
+
+
+@pytest.mark.parametrize("text", [
+    "open the closet photos",
+    "disclose nothing",
+    "show the enclosed file",
+    "read the disclosure",
+])
+def test_words_that_merely_contain_close_stay_low_risk(text):
+    assert assess(Action(text)).level == RiskLevel.LOW
+
+
+def test_close_as_an_adjective_is_still_treated_as_risky():
+    assessment = assess(Action("move closer"))  # stopgap until Phase 3, like English "band"
+    assert assessment.level == RiskLevel.MEDIUM and "ambiguous" in assessment.rule
+
+
+def test_close_app_requires_confirmation_end_to_end():
+    with pytest.raises(ActionDeniedError, match="risky keyword 'close'"):
+        authorize(Action("close app notepad"))
+    assert authorize(Action("close app notepad"), ScriptedConfirm(answer=True)).confirmed is True

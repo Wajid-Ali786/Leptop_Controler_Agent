@@ -35,7 +35,7 @@ def desktop(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(CONFIG, encoding="utf-8")
     monkeypatch.setattr(settings, "CONFIG_PATH", config_path)
-    fake = SimpleNamespace(windows=[], pending=[], polls=0, config_path=config_path, error=None)
+    fake = SimpleNamespace(windows=[], pending=[], closing=[], polls=0, config_path=config_path, error=None)
 
     def list_windows():
         if fake.error:
@@ -46,6 +46,11 @@ def desktop(tmp_path, monkeypatch):
             if item["polls"] <= 0:
                 fake.windows.append(item["window"])
                 fake.pending.remove(item)
+        for item in list(fake.closing):
+            item["polls"] -= 1
+            if item["polls"] <= 0:
+                fake.windows = [w for w in fake.windows if w.handle != item["handle"]]
+                fake.closing.remove(item)
         return list(fake.windows)
 
     monkeypatch.setattr(adapter, "list_windows", list_windows)
@@ -56,6 +61,11 @@ def desktop(tmp_path, monkeypatch):
 
 def open_later(fake, handle, title, polls):
     fake.pending.append({"window": WindowInfo(handle, title), "polls": polls})
+
+
+def close_later(fake, handle, polls):
+    """Remove window `handle` after `polls` more desktop reads."""
+    fake.closing.append({"handle": handle, "polls": polls})
 
 
 # --- Expectation from config ---
@@ -87,7 +97,7 @@ def test_new_matching_window_is_success(desktop):
     before = logic.snapshot_windows(expectation)
     desktop.windows.append(WindowInfo(42, "Untitled - Notepad"))
     result = logic.wait_for_new_window(expectation, before)
-    assert result.ok and result.window_handle == 42
+    assert result.ok and result.window_handle == 42 and result.window_handles == {42}
     assert result.message.startswith("notepad's window appeared after")
 
 
@@ -145,6 +155,88 @@ def test_emergency_stop_interrupts_the_wait(desktop):
     assert time.monotonic() - started < 2  # woke on the stop, not after the 5 s poll or 30 s timeout
 
 
+def test_every_new_matching_window_is_reported_as_one_group(desktop):
+    """Calculator shows an outer frame and an inner content window with the same title."""
+    desktop.windows.append(WindowInfo(1, "Calculator", "ApplicationFrameWindow"))  # already open
+    expectation = logic.expect_window("calculator")
+    before = logic.snapshot_windows(expectation)
+    desktop.windows += [WindowInfo(20, "Calculator", "ApplicationFrameWindow"),
+                        WindowInfo(21, "Calculator", "Windows.UI.Core.CoreWindow")]
+    result = logic.wait_for_new_window(expectation, before)
+    assert result.ok and result.window_handles == {20, 21}
+
+
+# --- Verifying that windows closed ---
+
+def test_find_open_returns_only_the_given_windows_that_still_match(desktop):
+    desktop.windows += [WindowInfo(1, "mine - Notepad"), WindowInfo(2, "users - Notepad"),
+                        WindowInfo(3, "Bank - Excel")]  # 3 was a Notepad handle, now reused
+    expectation = logic.expect_window("notepad")
+    assert [w.handle for w in logic.find_open(expectation, frozenset({1, 3, 99}))] == [1]
+
+
+def test_windows_that_close_are_success(desktop):
+    desktop.windows += [WindowInfo(20, "Calculator"), WindowInfo(21, "Calculator")]
+    close_later(desktop, 20, polls=2)
+    close_later(desktop, 21, polls=4)
+    expectation = logic.expect_window("calculator")
+    result = logic.wait_for_windows_to_close(expectation, frozenset({20, 21}))
+    assert result.ok and result.message.startswith("calculator's window closed after")
+    assert desktop.polls >= 4  # not done until EVERY window in the group was gone
+
+
+def test_reused_handle_counts_as_closed(desktop):
+    desktop.windows.append(WindowInfo(7, "Inbox - Outlook"))  # handle 7 used to be our Notepad
+    result = logic.wait_for_windows_to_close(logic.expect_window("notepad"), frozenset({7}))
+    assert result.ok
+
+
+def test_window_that_stays_open_is_reported_after_the_timeout(desktop):
+    desktop.windows.append(WindowInfo(7, "Untitled - Notepad"))
+    started = time.monotonic()
+    result = logic.wait_for_windows_to_close(logic.expect_window("notepad"), frozenset({7}))
+    assert not result.ok and not result.retryable and not result.needs_user
+    assert result.message == ("Asked notepad to close, but it's still open after 0.3 seconds. "
+                              "It may be waiting for you.")
+    assert 0.25 <= time.monotonic() - started < 2
+
+
+def test_window_blocked_by_a_dialog_needs_the_user(desktop):
+    desktop.config_path.write_text(CONFIG.replace("window_timeout_seconds: 0.3", "window_timeout_seconds: 30"),
+                                   encoding="utf-8")
+    desktop.windows.append(WindowInfo(7, "*Untitled - Notepad", "Notepad", enabled=False))
+    started = time.monotonic()
+    result = logic.wait_for_windows_to_close(logic.expect_window("notepad"), frozenset({7}))
+    assert not result.ok and result.needs_user and not result.retryable
+    assert "probably asking whether to save your changes" in result.message
+    assert time.monotonic() - started < 2  # reported promptly, not after the 30 s timeout
+
+
+def test_window_disabled_for_a_single_read_is_not_reported_as_needing_the_user(desktop):
+    desktop.windows.append(WindowInfo(7, "Untitled - Notepad", "Notepad", enabled=False))
+    close_later(desktop, 7, polls=2)  # disabled on the first read, gone on the second
+    assert logic.wait_for_windows_to_close(logic.expect_window("notepad"), frozenset({7})).ok
+
+
+def test_unobservable_desktop_while_closing_is_a_failure(desktop):
+    desktop.error = adapter.VerifierAdapterError("desktop locked")
+    result = logic.wait_for_windows_to_close(logic.expect_window("notepad"), frozenset({7}))
+    assert not result.ok and not result.retryable and not result.needs_user
+    assert result.message == "Asked notepad to close, but couldn't check whether it closed (desktop locked)."
+
+
+def test_emergency_stop_interrupts_the_close_wait(desktop):
+    desktop.config_path.write_text(CONFIG.replace("window_timeout_seconds: 0.3", "window_timeout_seconds: 30")
+                                   .replace("poll_interval_seconds: 0.01", "poll_interval_seconds: 5"),
+                                   encoding="utf-8")
+    desktop.windows.append(WindowInfo(7, "Untitled - Notepad"))
+    threading.Timer(0.1, emergency_stop.trigger, args=("hotkey",)).start()
+    started = time.monotonic()
+    with pytest.raises(EmergencyStopError):
+        logic.wait_for_windows_to_close(logic.expect_window("notepad"), frozenset({7}))
+    assert time.monotonic() - started < 2
+
+
 # --- Real config + the real adapter (read-only) ---
 
 def test_real_config_has_a_window_pattern_for_every_openable_app():
@@ -157,3 +249,4 @@ def test_real_config_has_a_window_pattern_for_every_openable_app():
 def test_real_adapter_lists_windows_without_changing_anything():
     windows = adapter.list_windows()
     assert all(isinstance(w.handle, int) and w.handle > 0 and w.title for w in windows)
+    assert all(isinstance(w.class_name, str) and isinstance(w.enabled, bool) for w in windows)

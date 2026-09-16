@@ -9,8 +9,8 @@
 # --- Confirmation rules (app/safety/logic.py) ---
 # Minimal Phase 0 Permission & Safety gate. An action containing a risky keyword - as a
 # whole word or common verb form (delete/deletes/deleted/deleting) - is Medium risk and
-# needs confirmation. Any other word that merely contains a keyword (e.g. "resend") is
-# treated as risky too, unless listed in safe_words. Missing/invalid settings here make
+# needs confirmation ("close" too, because closing can lose unsaved work). Any other word that
+# merely contains a keyword (e.g. "resend") is treated as risky too, unless listed in safe_words. Missing/invalid settings here make
 # EVERY action require confirmation (fail closed).
 # The Roman Urdu verbs (mita = erase, hata = remove, band = shut/close, bhej = send,
 # khatam = finish/end, saaf = clean/wipe) and their common forms are a STOPGAP until Phase 3's
@@ -19,6 +19,7 @@
 safety:
   risky_keywords: [
     delete, shutdown, "shut down", send,
+    close,
     mita, mitao, mitana, mitado,
     hata, hatao, hatana, hatado,
     band,
@@ -28,9 +29,10 @@ safety:
   ]
   # Unrelated words that merely CONTAIN a keyword. safe_words can't exempt a keyword itself or
   # its verb forms (e.g. English "band", or "saaf"/"khatam" used as adjectives) - those stay
-  # risky until Phase 3.
+  # risky until Phase 3. Likewise "close" as an adjective ("close by", "closer") stays risky.
   safe_words: [
     sender, senders,
+    closet, closets, disclose, discloses, disclosed, disclosure, enclose, encloses, enclosed, enclosure,
     husband, husbands, bandwidth, broadband, bandage, bandages, bandana, bandar,
     khata,
   ]
@@ -57,10 +59,11 @@ executor:
 
 # --- Verifier (app/verifier/) ---
 verifier:
-  window_timeout_seconds: 15    # how long a newly opened app gets to show its window
+  window_timeout_seconds: 15    # how long a newly opened app gets to show its window, or a closed one to go
   poll_interval_seconds: 0.25   # how often to look (the emergency stop interrupts the wait)
   # Title of each app's window (case-insensitive regular expression). Opening an app only counts
-  # as done when a NEW window matching it appears; windows already open never count.
+  # as done when a NEW window matching it appears; windows already open never count. Closing an app
+  # only closes windows the assistant opened in this session, and counts as done when they're gone.
   app_windows:
     notepad: "Notepad$"
     calculator: "^Calculator$"

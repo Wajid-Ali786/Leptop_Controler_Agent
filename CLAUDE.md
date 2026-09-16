@@ -20,6 +20,12 @@ A personal, Windows desktop AI assistant. Full context: /docs/build-plan.md,
    so no code path can act unauthorized or unverified. The emergency stop
    (app/executor/emergency_stop.py) is likewise callable from any module by design.
 
+Git operations belong to the project owner (permanent; not numbered, so existing rule
+references stay valid): never run git commit, git push, git tag, or any other command that
+modifies Git history or the remote (e.g. amend, rebase, reset, merge, cherry-pick, revert,
+branch/tag deletion). The owner does all of these. Read-only commands (git status, git diff,
+git log, git show) are fine. Stage files (git add) only when the owner explicitly asks.
+
 ## Safety rules — apply from the first line of code, not "later"
 5. Every action the Executor takes must pass through app/safety/ first. No exceptions,
    even during early testing.

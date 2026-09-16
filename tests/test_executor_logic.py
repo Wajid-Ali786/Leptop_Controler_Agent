@@ -409,10 +409,11 @@ def test_only_executor_adapter_controls_the_computer():
     assert offenders == [], f"Only app/executor/adapter.py may control the computer: {offenders}"
 
 
-def test_only_verifier_adapter_reads_the_desktop_through_ctypes():
+def test_only_the_two_adapters_use_the_windows_api_through_ctypes():
+    """The Verifier adapter reads the desktop; the Executor adapter sends close requests."""
     root = settings.PROJECT_ROOT
-    allowed = root / "app" / "verifier" / "adapter.py"
+    allowed = {root / "app" / "verifier" / "adapter.py", root / "app" / "executor" / "adapter.py"}
     offenders = [f"{path.relative_to(root)}: {module}"
-                 for path in (root / "app").rglob("*.py") if path != allowed
+                 for path in (root / "app").rglob("*.py") if path not in allowed
                  for module, _ in _imports(path) if module.split(".")[0] == "ctypes"]
-    assert offenders == [], f"Only app/verifier/adapter.py may use ctypes: {offenders}"
+    assert offenders == [], f"Only the verifier and executor adapters may use ctypes: {offenders}"

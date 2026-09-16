@@ -8,7 +8,8 @@ Select these tests with:  pytest -m real_api
 
 isolated_logging (autouse): relative log paths resolve under each test's own tmp_path, and
 so do relative ledger paths - for every test EXCEPT real_api tests. Offline tests therefore
-never touch the real logs/ or data/ folders. Logging handlers are removed after each test.
+never touch the real logs/ or data/ folders. Logging handlers are removed after each test, and
+the Executor forgets the windows it opened, so no test's windows leak into another's close_app.
 
 fake_claude: an offline Claude for tests/test_brain*.py - temp config.yaml, .env and
 usage ledger, a controllable clock, and a mock HTTP transport running the real
@@ -23,6 +24,7 @@ import pytest
 
 from app import logging_setup
 from app.brain import adapter, cost_controls
+from app.executor import logic as executor_logic
 from config import settings
 
 REAL_API_OPT_IN = "RUN_REAL_CLAUDE_TEST"
@@ -76,7 +78,9 @@ def isolated_logging(request, tmp_path, monkeypatch):
     monkeypatch.setattr(logging_setup, "PROJECT_ROOT", tmp_path)
     if request.node.get_closest_marker("real_api") is None:
         monkeypatch.setattr(cost_controls, "PROJECT_ROOT", tmp_path)
+    executor_logic.forget_session_windows()
     yield
+    executor_logic.forget_session_windows()
     logging_setup.reset_logging()
 
 
