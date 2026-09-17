@@ -26,7 +26,9 @@ Levels (the safety gate asks for confirmation at MEDIUM and above):
          Alt+F4  closes the active window (some apps don't ask to save); only allowed on a window the
                  assistant opened in this session, and never with the desktop or taskbar active,
                  where it opens the Shut Down dialog
-F5 is deferred to the Refresh task. Ctrl+Alt+Delete and Win+L are reserved and never sent.
+F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R are refused here: refreshing goes only through the Refresh
+action, which first identifies the app (F5 debugs in code editors, Ctrl+R replies in Outlook). Ctrl+Alt+Delete
+and Win+L are reserved and never sent.
 """
 from dataclasses import dataclass
 
@@ -103,7 +105,9 @@ _RESERVED = {
     "Win+L": ("Win+L is a reserved Windows shortcut. This assistant will not send it: it's intentionally "
               "unsupported in Phase 1 because it locks the Windows session."),
 }
-_DEFERRED = {"F5": "F5 isn't supported as a shortcut; refreshing arrives with the Refresh feature."}
+_REFRESH_MESSAGE = ("{name} isn't available as a shortcut. Use the Refresh action instead: it checks which app is "
+                    "active first, because these keys do different things in different apps.")
+_DEFERRED = {name: _REFRESH_MESSAGE.format(name=name) for name in ("F5", "Ctrl+R", "Ctrl+F5", "Shift+F5", "Ctrl+Shift+R")}
 
 
 def parse(text: str) -> Shortcut | ShortcutRefusal:

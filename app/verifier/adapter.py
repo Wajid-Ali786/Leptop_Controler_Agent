@@ -4,8 +4,8 @@ desktop - which visible top-level windows exist, their titles and window classes
 enabled or cloaked, which titled windows are hosted inside another window, where each monitor is,
 which window is at a screen point, where the mouse pointer is, which window and control have
 keyboard focus, the text and selection of a control, which modifier keys are held down, two facts
-about the clipboard, the chain of controls under a screen point, and a standard scroll bar's
-position - and never changes anything. Reading a control's text asks the app for a
+about the clipboard, the chain of controls under a screen point, a standard scroll bar's
+position, and which program (executable file name) owns a window - and never changes anything. Reading a control's text asks the app for a
 copy (WM_GETTEXT, with a timeout so a hung app can't block); the text is returned to the caller
 only, never logged.
 
@@ -38,6 +38,7 @@ _GA_PARENT = 1
 _SB_VERT = 1
 _SIF_RANGE_PAGE_POS = 0x0001 | 0x0002 | 0x0004
 _MAX_CONTROL_DEPTH = 16  # a deterministic bound on how far up the parent chain is walked
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _MODIFIER_KEYS = {"Shift": (0x10,), "Ctrl": (0x11,), "Alt": (0x12,), "Win": (0x5B, 0x5C)}  # Win: left, right
 _CLIPBOARD_KINDS = [("text", (1, 7, 13)), ("image", (2, 8, 17)), ("files", (15,))]  # CF_* format numbers
 
@@ -213,6 +214,26 @@ def vertical_scroll(handle: int) -> ScrollState | None:
     return ScrollState(position=info.nPos, minimum=info.nMin, maximum=info.nMax, page=info.nPage)
 
 
+def process_image_name(handle: int) -> str | None:
+    """The file name of the program that owns window `handle`, lower-case (e.g. "chrome.exe"), or None
+    if it can't be read."""
+    api = _api()
+    pid = ctypes.c_ulong(0)
+    api.user32.GetWindowThreadProcessId(handle, ctypes.addressof(pid))
+    if not pid.value:
+        return None
+    process = api.kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not process:
+        return None
+    try:
+        buffer, size = ctypes.create_unicode_buffer(32768), ctypes.c_ulong(32768)
+        if not api.kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
+            return None
+        return buffer.value.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+    finally:
+        api.kernel32.CloseHandle(process)
+
+
 def cursor_position() -> tuple[int, int]:
     """Where the mouse pointer is, in screen pixels."""
     api = _api()
@@ -249,6 +270,14 @@ class _Api:
         self.ScrollInfo = ScrollInfo
         self.user32 = user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.dwmapi = dwmapi = ctypes.WinDLL("dwmapi")
+        self.kernel32 = kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                        ctypes.POINTER(ctypes.c_ulong)]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
         self.enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         self.monitor_enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
                                                     ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)

@@ -156,7 +156,7 @@ These apply to every phase below, without exception:
   | Ctrl+V | HIGH | pastes clipboard content the assistant can't see; pasted lines can run in a terminal, pasted files are copied in File Explorer |
   | Alt+F4 | HIGH | closes the active window (some apps don't ask to save); only on a window the assistant opened in this session, never with the desktop or taskbar active (that opens the Shut Down dialog) |
 
-  **Not supported:** F5 (deferred to the Refresh task); every other combination ("isn't a supported shortcut yet"); **Ctrl+Alt+Delete** and **Win+L**, which are reserved Windows shortcuts this assistant will not send or test. Win+L is intentionally unsupported in Phase 1 because it locks the Windows session.
+  **Not supported:** **F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R** (refused with a message pointing to the Refresh action, which is the only way to send a refresh key — see the Refresh notes); every other combination ("isn't a supported shortcut yet"); **Ctrl+Alt+Delete** and **Win+L**, which are reserved Windows shortcuts this assistant will not send or test. Win+L is intentionally unsupported in Phase 1 because it locks the Windows session.
 - **Prompts** (MEDIUM and HIGH; on screen only, never logged) name the shortcut, the window title and field, and what it does. Examples: `press Ctrl+Z in window "Untitled - Notepad" (field: Edit) - undoes the last change; some apps can't redo it`, `press Ctrl+V in window "…" (field: Edit) - pastes the clipboard (it holds: text). I can't see what's on it; pasting into a terminal or chat can run or send it`, `press Alt+F4 on window "Untitled - Notepad" - closes it; unsaved work may be lost if the app doesn't ask`. LOW shortcuts run without a prompt and the gate sees only `press Ctrl+A`, never a title.
 - **Validation (before anything is asked or sent).** The shortcut must be supported. Shortcuts that act on a window need an active window. No Ctrl, Alt, Shift or Win may be held down on the keyboard (checked again right before sending). Ctrl+V needs something on the clipboard. Alt+F4 needs the active window to belong to this session. After confirmation, if the active window, its title or its field changed, nothing is pressed.
 - **Sending.** The whole shortcut is **one `SendInput` call** (virtual keys plus scan codes): modifiers down, key down, key up, modifiers up in reverse. It is sent immediately after the last emergency-stop check, so a stop can never leave keys down. If Windows accepts **0 events** the result is `failed`. If it accepts **some but not all**, every key and modifier involved is released at once (an unassigned key is tapped first when Alt or Win is involved, so a lone release opens no menu) and the result is `unverified`. If it accepts all, the shortcut's own check runs. In every case the modifiers must then read as released; if not they are released again, and if still down the message says to press and release them.
@@ -228,7 +228,45 @@ These apply to every phase below, without exception:
   - A spin box's paired text field isn't one of its parents, so only the arrows themselves are recognised.
   - Apps without standard scroll bars can only ever give `unverified`.
   - Because the pointer is never moved, the user must place it over the window to scroll.
+- **Open decision for Phase 3 (Planner): a safety cap looks the same as an interruption.** When an unclassified `down 10` is deliberately capped to 3 notches, the result carries `progress=(3, 10)`, meaning "3 sent of 10 requested because of a safety cap". A `partial` result stopped mid-action carries the same kind of pair (e.g. `(3, 5)`). A Planner reading `progress` alone can't tell "safety cap, working as intended" from "interrupted, needs attention", and those call for opposite responses. The outcome differs today (`unverified` versus `partial`), but that's an indirect signal. When the Planner is built, add a separate field (e.g. a reason the action sent less than requested: safety cap versus interruption) rather than overloading `progress`. Scroll behavior is deliberately unchanged for now.
 - **Open decision for Phase 8.** Browsers and Electron apps can't be classified, so nearly every real-world scroll will ask for confirmation. If that becomes tiring in daily use, revisit — most likely by remembering the approval per window for the session, rather than by lowering the risk level.
+
+**Implementation notes — refresh (recorded 17 September 2026).** Kept in Phase 1 deliberately narrow. Refresh needs to know *which application* the active window belongs to, and that is readable from standard Windows APIs (the owning executable and the top-level window class). Scroll's classification problem was about content *inside* a window, which isn't readable.
+
+- **Action.** `ExecutorAction(REFRESH)` refreshes the **active window**. It takes no target; any target text is refused ("Refresh doesn't take a target; it refreshes the active window.").
+- **Supported apps** — a code table (not a setting), matching BOTH the executable file name and the top-level window class:
+
+  | App | Executable | Window class | Level | Why |
+  |---|---|---|---|---|
+  | Chrome | `chrome.exe` | `Chrome_WidgetWin_1` | MEDIUM | reloading can lose unsaved form input or page state |
+  | Edge | `msedge.exe` | `Chrome_WidgetWin_1` | MEDIUM | same |
+  | Firefox | `firefox.exe` | `MozillaWindowClass` | MEDIUM | same |
+  | File Explorer folder window | `explorer.exe` | `CabinetWClass` | LOW | re-reads the folder listing; changes no data |
+  | File Explorer with a focused `Edit` control | `explorer.exe` | `CabinetWClass` | MEDIUM | a rename or typed address may be committed or discarded |
+
+  **Everything else is refused before the safety gate**, with no prompt: "I can refresh only Chrome, Edge, Firefox and File Explorer windows in Phase 1, so I didn't press anything." That includes Electron apps sharing Chrome's window class (VS Code, where F5 starts debugging; Slack), WPF apps, the desktop and taskbar, and unreadable executables. Browser risk is MEDIUM always in Phase 1; there is no attempt to lower it from page contents.
+- **Prompts** (on screen only): `refresh window "…" (Chrome) - reloads the page; anything typed into it that isn't saved may be lost`, and for File Explorer while editing: `refresh window "…" (File Explorer) - a text box is being edited (renaming a file or typing an address); pressing F5 now may commit or discard it`. A File Explorer folder view refreshes with no prompt.
+- **Checks.** An active window must exist and match the table. No Ctrl, Alt, Shift or Win may be held (Ctrl+F5 or Shift+F5 would hard-reload). After confirmation and **immediately before sending**, the active window is re-read and must have the same window handle, executable, top-level class and focused control. The title is deliberately not part of this, because browser titles change by themselves. Then the emergency stop is checked last.
+- **Mechanism.** F5, sent only through Refresh, reusing the keyboard-shortcut `SendInput` batch. 0 events accepted → `failed`. Partly accepted → F5 released at once → `unverified`. All accepted → **`unverified`**: "Pressed F5 to refresh Chrome. I can't confirm the refresh happened." A refresh is **never `done`** in Phase 1, because nothing reliable proves it happened (a fast reload can finish before anything could observe it, and a page can intercept F5). Refusals and a changed target are `failed`. **Never retryable.** Logs name the app kind, level, rule and outcome, never window titles.
+- **One path only.** F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R are refused by the Keyboard Shortcuts action with a message pointing to Refresh. No generic shortcut can send a refresh key without Refresh's app identification.
+- **Tested.** 58 offline tests in `tests/test_executor_refresh.py` cover:
+  - every supported app and its level, with `unverified` outcomes
+  - 10 refused combinations before the safety gate: `code.exe`, `slack.exe` and `claude.exe` with `Chrome_WidgetWin_1`; Chrome's executable with the wrong class; Firefox's executable with Chrome's class; the desktop; the taskbar; Notepad; a WPF app; and an unreadable executable
+  - exact prompts; decline and no confirmation method
+  - a target refused; no active window; held modifiers before and after approval; unreadable desktop
+  - window, executable, class, focused-control or no-window changes after approval, and a title change alone NOT blocking
+  - emergency stop before, during confirmation and right before sending
+  - 0 and partly accepted input; never `done`; never retried
+  - the refresh keys refused as shortcuts
+  - titles never leaking, plus a planted leak the check must catch
+  - a read-only real executable lookup
+
+  Removing the class check, browser MEDIUM, Explorer-editing MEDIUM, the pre-send re-check, the title-free identity, or the Ctrl+R shortcut refusal makes tests fail. Opt-in real-desktop test (17 September 2026): the test created a temporary folder and opened it in a new File Explorer window (focused control `DirectUIHWND`). Refresh ran with **no prompt** → `unverified`, 0.25 s. In `finally`, it closed only that window (1 closed; a File Explorer window that was already open stayed open) and deleted only its folder. No real browser test is run: it would open the user's real profile.
+- **Limitations.**
+  - A web page can intercept or ignore F5, so a browser refresh may not happen even though F5 was sent; this is why it's `unverified`.
+  - A program renamed to one of these executable names would be treated as that app.
+  - Installed web apps (PWAs) running under `chrome.exe` or `msedge.exe` count as browsers.
+- **What would make refresh verifiable (Phase 5).** UI Automation access to an app's own controls (e.g. a browser's Reload/Stop button state), recognition of in-page contexts that capture F5 (web IDEs), and detection of unsaved form input, so a browser refresh could be `done` and possibly lower risk.
 
 ---
 

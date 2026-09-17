@@ -199,7 +199,16 @@ def test_names_are_normalized(text, name):
     ("ctrl+a+b", "'ctrl+a+b' needs exactly one key besides Ctrl, Alt, Shift or Win."),
     ("shift+ctrl+z", "Ctrl+Shift+Z isn't a supported shortcut yet. Supported: Ctrl+A, Win+D, Ctrl+C, Ctrl+S, "
                      "Ctrl+Z, Ctrl+X, Alt+Tab, Ctrl+V, Alt+F4."),
-    ("f5", "F5 isn't supported as a shortcut; refreshing arrives with the Refresh feature."),
+    ("f5", "F5 isn't available as a shortcut. Use the Refresh action instead: it checks which app is active first, "
+           "because these keys do different things in different apps."),
+    ("ctrl+r", "Ctrl+R isn't available as a shortcut. Use the Refresh action instead: it checks which app is active "
+               "first, because these keys do different things in different apps."),
+    ("control+f5", "Ctrl+F5 isn't available as a shortcut. Use the Refresh action instead: it checks which app is "
+                   "active first, because these keys do different things in different apps."),
+    ("f5+shift", "Shift+F5 isn't available as a shortcut. Use the Refresh action instead: it checks which app is "
+                 "active first, because these keys do different things in different apps."),
+    ("shift+ctrl+r", "Ctrl+Shift+R isn't available as a shortcut. Use the Refresh action instead: it checks which app "
+                     "is active first, because these keys do different things in different apps."),
     ("ctrl+alt+del", "Ctrl+Alt+Delete is a reserved Windows shortcut. This assistant will not send it."),
     ("delete+alt+control", "Ctrl+Alt+Delete is a reserved Windows shortcut. This assistant will not send it."),
     ("win+l", "Win+L is a reserved Windows shortcut. This assistant will not send it: it's intentionally "

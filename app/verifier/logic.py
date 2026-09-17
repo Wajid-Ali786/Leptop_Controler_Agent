@@ -340,6 +340,16 @@ def scroll_state(handle: int) -> ScrollState | None:
         return None
 
 
+def process_name(window_handle: int | None) -> str | None:
+    """The lower-case executable file name owning a window (e.g. "chrome.exe"), or None if unknown."""
+    if not window_handle:
+        return None
+    try:
+        return adapter.process_image_name(window_handle)
+    except adapter.VerifierAdapterError:
+        return None
+
+
 def _normalise(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 

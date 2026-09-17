@@ -36,6 +36,11 @@ The scroll test records where your mouse pointer is, opens its own Notepad, fill
 lines and moves the pointer over it (both as test code), scrolls down and up (LOW - no prompts), puts
 that Notepad at the top (test code) and checks "up 1" reports "already at the top", checks refusals,
 and ALWAYS - even if an assertion fails - puts your pointer back and closes only its own Notepad.
+
+The refresh test creates a temporary folder and opens it in a NEW File Explorer window (both as test
+code), refreshes it (File Explorer folder view: LOW - it must not ask; result unverified), and ALWAYS
+closes only that Explorer window and deletes only that temporary folder. There is no browser test: it
+would open your real browser profile.
 """
 import ctypes
 import time
@@ -44,7 +49,8 @@ import pytest
 
 from app.executor import emergency_stop
 from app.executor.logic import execute_with_recovery
-from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, SCROLL, SHORTCUT, TYPE_TEXT, ExecutorAction, Outcome
+from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, ExecutorAction,
+                                 Outcome)
 from app.safety.models import RiskLevel
 from app.verifier import adapter as verifier_adapter
 from app.verifier import logic as verifier
@@ -450,3 +456,70 @@ def test_scroll_in_a_notepad_the_test_opened():
     assert closed is not None and closed.outcome is Outcome.DONE, closed and closed.message
     assert leftovers == [], f"cleanup had to close: {[_describe(w) for w in leftovers]}"
     assert before <= verifier.snapshot_windows(expectation), "a window that was already open was closed"
+
+
+def _explorer_windows_for(folder_name, exclude):
+    return [w for w in verifier_adapter.list_windows()
+            if w.class_name == "CabinetWClass" and w.handle not in exclude and folder_name in w.title]
+
+
+def _wait_for(check, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        value = check()
+        if value:
+            return value
+        time.sleep(0.2)
+    return check()
+
+
+@pytest.mark.real_desktop
+def test_refresh_a_file_explorer_window_the_test_opened():
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    emergency_stop.reset("real-desktop-test")
+    folder = Path(tempfile.mkdtemp(prefix="companion-refresh-test-"))  # created by the test
+    existing = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "CabinetWClass"}
+    print(f"\nrefresh: temporary folder {folder.name}; {len(existing)} File Explorer window(s) already open")
+    closed_handles, folder_removed = [], False
+    try:
+        subprocess.Popen(["explorer.exe", str(folder)])  # test setup: a NEW Explorer window on the test's folder
+        windows = _wait_for(lambda: _explorer_windows_for(folder.name, existing), 15)
+        assert windows, "the test's File Explorer window didn't appear"
+        window = windows[0]
+        active = _wait_for(lambda: verifier_adapter.active_target().window
+                           and verifier_adapter.active_target().window.handle == window.handle, 5)
+        target = verifier_adapter.active_target()
+        print(f"refresh: test window {window.handle:#x}; active: {_describe(target.window) if target.window else None}, "
+              f"field class {target.control_class!r}")
+        assert active, "the test's File Explorer window isn't the active window - not refreshing"
+
+        prompts = []
+        started = time.monotonic()
+        result = execute_with_recovery(ExecutorAction(REFRESH),
+                                       confirm=lambda action, assessment: prompts.append(action.description) or False)
+        print(f"refresh: {result.outcome.value}: {result.message} ({time.monotonic() - started:.2f}s, prompts {prompts})")
+        assert prompts == [], "a File Explorer folder view must refresh without asking"
+        assert result.ok and result.outcome is Outcome.UNVERIFIED and not result.verified, result.message
+        assert result.message == "Pressed F5 to refresh File Explorer. I can't confirm the refresh happened."
+    finally:
+        # Close ONLY the Explorer window(s) showing the test's folder that weren't open before, then delete ONLY the
+        # test's folder.
+        for w in _explorer_windows_for(folder.name, existing):
+            ctypes.windll.user32.PostMessageW(ctypes.c_void_p(w.handle), WM_CLOSE, 0, 0)
+            closed_handles.append(w.handle)
+        _wait_for(lambda: not _explorer_windows_for(folder.name, existing), CLEANUP_SECONDS)
+        print(f"refresh: closed {len(closed_handles)} test Explorer window(s)")
+        try:
+            shutil.rmtree(folder)
+            folder_removed = True
+        except OSError as exc:
+            print(f"refresh: couldn't delete the temporary folder yet: {exc!r}")
+    assert _explorer_windows_for(folder.name, existing) == [], "the test's Explorer window is still open"
+    assert len(closed_handles) == 1, f"expected to close exactly the test's window, closed {len(closed_handles)}"
+    assert folder_removed and not folder.exists()
+    still_open = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "CabinetWClass"}
+    assert existing <= still_open, "a File Explorer window that was already open was closed"

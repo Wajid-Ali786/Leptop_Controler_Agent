@@ -18,7 +18,8 @@ execute_with_recovery() adds the Action -> Result -> Recovery loop (docs/build-p
 a retryable failure is OFFERED for retry - never silently continued - and every retry runs the
 whole pipeline again, safety gate and verification included.
 
-Phase 1 is built one action at a time: open_app, close_app, click, type_text, shortcut, then scroll.
+Phase 1 is built one action at a time: open_app, close_app, click, type_text, shortcut, scroll, then
+refresh.
 
 close_app closes ONLY windows the assistant opened in this session. open_app remembers them in
 memory, so nothing carries over a restart, and windows the user opened are never touched. Closing
@@ -93,6 +94,20 @@ scroll sends vertical mouse-wheel notches ("up N" / "down N") to the ACTIVE wind
     UNVERIFIED (unreadable, already at the end, didn't move); FAILED if nothing scrolled; PARTIAL if it
     stopped part-way; an emergency stop part-way raises ActionInterruptedError. Never retryable.
 
+refresh presses F5 in the ACTIVE window, but only after positively identifying the app by its executable
+AND top-level window class: Chrome, Edge, Firefox or a File Explorer folder window. Everything else is
+refused before the safety gate (Electron apps share Chrome's window class, and F5 debugs there).
+  - risk: browsers MEDIUM (a reload can lose unsaved input); File Explorer LOW, or MEDIUM while a text
+    box has focus (a rename or typed address)
+  - no modifier may be held (Ctrl+F5 / Shift+F5 would hard-reload)
+  - after confirmation and immediately before sending: the same window handle, executable, window class
+    and focused control (not the title - browser titles change by themselves); then the emergency stop
+  - F5 is one SendInput batch (the shortcut machinery): 0 accepted -> FAILED; part -> released,
+    UNVERIFIED; all -> UNVERIFIED. A refresh is never DONE in Phase 1: nothing reliable proves it happened
+  - never retryable; logs name the app, never the window title
+F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R are refused as keyboard shortcuts, so this is the only way to
+send a refresh key.
+
 Measured real-desktop behavior and known open decisions: docs/step4 Section 4, implementation notes.
 """
 import logging
@@ -104,7 +119,7 @@ from typing import Callable
 
 from app.executor import adapter, emergency_stop, shortcuts
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError, TypingInterruptedError
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, SCROLL, SHORTCUT, TYPE_TEXT, ActionResult,
+from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, ActionResult,
                                  ExecutorAction, Outcome)
 from app.safety.logic import Confirm, authorize
 from app.safety.models import Action, RiskLevel
@@ -972,10 +987,93 @@ def _stop_scrolling(action: ExecutorAction, sent: int, total: int):
                                  f"{_notches(sent)} of {total}.", result)
 
 
+# --- refresh ----------------------------------------------------------------------------
+
+# The only windows Refresh supports in Phase 1: (executable, top-level window class) -> (app name, kind).
+# Code, not configuration. Everything else - including Electron apps that share Chrome's window class,
+# where F5 means "start debugging" - is refused before the safety gate.
+_REFRESH_TARGETS = {
+    ("chrome.exe", "Chrome_WidgetWin_1"): ("Chrome", "browser"),
+    ("msedge.exe", "Chrome_WidgetWin_1"): ("Edge", "browser"),
+    ("firefox.exe", "MozillaWindowClass"): ("Firefox", "browser"),
+    ("explorer.exe", "CabinetWClass"): ("File Explorer", "explorer"),
+}
+_BROWSER_REFRESH_REASON = "refreshing a browser page can lose unsaved input or page state"
+_EDITING_REFRESH_REASON = "refreshing File Explorer while a text box is being edited"
+
+
+def _prepare_refresh(action: ExecutorAction):
+    if isinstance(action.target, str) and action.target.strip():
+        return _result(action, False, "Refresh doesn't take a target; it refreshes the active window.")
+    try:
+        approved = verifier.active_target()
+        held = verifier.modifiers_held()
+    except verifier.VerifierUnavailableError as exc:
+        return _result(action, False, f"Didn't refresh: I can't check the keyboard or the active window ({exc}).")
+    if approved.window is None:
+        return _result(action, False, "Didn't refresh: there's no active window.")
+    executable = verifier.process_name(approved.window.handle)
+    app = _REFRESH_TARGETS.get((executable, approved.window.class_name))
+    if app is None:
+        return _result(action, False, "I can refresh only Chrome, Edge, Firefox and File Explorer windows in Phase 1, "
+                                      "so I didn't press anything.")
+    if held:
+        return _result(action, False, _refresh_held_message(held))
+    app_name, kind = app
+    title = f'window "{approved.window.title}"' if approved.window.title else "a window with no readable title"
+    if kind == "browser":
+        safety_action = Action(f"refresh {title} ({app_name}) - reloads the page; anything typed into it that isn't "
+                               f"saved may be lost", minimum_level=RiskLevel.MEDIUM, minimum_reason=_BROWSER_REFRESH_REASON)
+    elif approved.control_class.lower().startswith("edit"):
+        safety_action = Action(f"refresh {title} (File Explorer) - a text box is being edited (renaming a file or "
+                               f"typing an address); pressing F5 now may commit or discard it",
+                               minimum_level=RiskLevel.MEDIUM, minimum_reason=_EDITING_REFRESH_REASON)
+    else:  # a File Explorer folder view: re-reads the listing, changes no data
+        safety_action = Action("refresh File Explorer")
+    identity = (approved.window.handle, executable, approved.window.class_name, approved.control_handle)
+
+    def run() -> ActionResult:
+        # Re-read immediately before sending. The title is deliberately not part of the identity: browser
+        # titles change on their own; the same window, program, class and focused control must remain.
+        try:
+            now = verifier.active_target()
+            held_now = verifier.modifiers_held()
+        except verifier.VerifierUnavailableError as exc:
+            return _result(action, False, f"Didn't refresh: I can't check the keyboard or the active window ({exc}).")
+        now_identity = None if now.window is None else (
+            now.window.handle, verifier.process_name(now.window.handle), now.window.class_name, now.control_handle)
+        if now_identity != identity:
+            return _result(action, False, "The active window changed after you approved, so I didn't refresh.")
+        if held_now:
+            return _result(action, False, _refresh_held_message(held_now))
+        emergency_stop.check()  # last checkpoint before F5 is sent
+        try:
+            accepted, expected = adapter.send_shortcut((), "F5")
+        except adapter.ExecutorAdapterError as exc:
+            return _result(action, False, f"I couldn't refresh {app_name}: {exc}.")
+        if accepted == 0:
+            return _result(action, False, "Windows didn't accept the keyboard input for F5, so nothing was refreshed.")
+        if accepted < expected:
+            adapter.release_keys((), "F5")  # defensive: release the key at once
+            return _result(action, True, "Windows accepted only part of the keyboard input for F5, so I released it. "
+                                         "The refresh may or may not have happened.", outcome=Outcome.UNVERIFIED)
+        return _result(action, True, f"Pressed F5 to refresh {app_name}. I can't confirm the refresh happened.",
+                       outcome=Outcome.UNVERIFIED)
+
+    return _Prepared(run, safety_action)
+
+
+def _refresh_held_message(held: list[str]) -> str:
+    keys = " and ".join(held)
+    return (f"Didn't refresh: {keys} {'is' if len(held) == 1 else 'are'} held down on the keyboard, which would change "
+            f"what F5 does (e.g. a hard reload). Let go and try again.")
+
+
 # --- Helpers ----------------------------------------------------------------------------
 
 _PREPARERS = {OPEN_APP: _prepare_open_app, CLOSE_APP: _prepare_close_app, CLICK: _prepare_click,
-              TYPE_TEXT: _prepare_type_text, SHORTCUT: _prepare_shortcut, SCROLL: _prepare_scroll}
+              TYPE_TEXT: _prepare_type_text, SHORTCUT: _prepare_shortcut, SCROLL: _prepare_scroll,
+              REFRESH: _prepare_refresh}
 
 
 def _max_attempts() -> int:
