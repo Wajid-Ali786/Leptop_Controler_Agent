@@ -26,8 +26,8 @@ class Action:
     minimum_reason: str = ""
 
     def __repr__(self) -> str:
-        # The description is what the user is asked to approve (it can preview typed text), so it is
-        # shown on screen only - diagnostics describe it by length.
+        # The description is what the user is asked to approve (e.g. a window title), so it is shown on
+        # screen only - diagnostics describe it by length.
         length = len(self.description) if isinstance(self.description, str) else 0
         return (f"Action(description=<{length} characters>, minimum_level={self.minimum_level!r}, "
                 f"minimum_reason={self.minimum_reason!r})")

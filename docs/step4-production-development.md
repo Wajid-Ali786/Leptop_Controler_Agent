@@ -111,9 +111,8 @@ These apply to every phase below, without exception:
 - **Safety.** Typing is **always at least Medium risk**, and **any line break makes it HIGH**, because each one is a real Enter key press, which can submit a form, send a message or run a command. Both are code constants, not settings. The confirmation shows:
   - the character count, the window title and the field type
   - `AND PRESS ENTER n TIME(S) - Enter can submit a form, send a message or run a command`, plus `(ends with Enter: it will submit as soon as typing finishes)` when it does
-  - a preview of **at most the first 40 characters**, with `⏎` for each Enter and `…` when longer
 
-  Example: `type 49 characters into window "Untitled - Notepad" (field: Edit) AND PRESS ENTER 1 TIME - Enter can submit a form, send a message or run a command: "Hello from the AI Desktop Companion test…"`. The logged safety rule is the typing/Enter rule, never words from the text. If the active window, its title or the focused field changed after approval, nothing is typed.
+  It shows **none of the text itself**, for maximum privacy in Phase 1 (changed on 17 September 2026 from an earlier 40-character preview). The prompt is built without access to the text, so two texts of the same length and Enter count produce the identical prompt. Example: `type 49 characters into window "Untitled - Notepad" (field: Edit) AND PRESS ENTER 1 TIME - Enter can submit a form, send a message or run a command`. The logged safety rule is the typing/Enter rule, never words from the text. If the active window, its title or the focused field changed after approval, nothing is typed.
 - **Adapter.** Windows `SendInput` with Unicode characters (ctypes), one character per call. Each call carries the key-down and key-up together (both halves of an emoji go in one call), so a stop never leaves a key held down. A line break is a real Enter key press. The pause between characters is `executor.typing_interval_seconds` (0.01 s) and is interruptible.
 - **Outcomes.**
   - `done` (verified): only when the focused field's text, read before and after (`WM_GETTEXT`, line endings normalised, waiting up to `verifier.text_settle_seconds` = 1 s), contains the exact typed text **one more time than before**.
@@ -122,23 +121,114 @@ These apply to every phase below, without exception:
   - **`partial`** (`ok=False`, `verified=False`, `progress=(sent, total)`): typing stopped part-way because the active window/field changed or Windows refused input. The message says how many characters were typed and that they may already be in the window.
   - An **emergency stop after something was typed** raises `TypingInterruptedError` (a kind of `EmergencyStopError`), carrying that `partial` result. A stop before the first character is the plain `EmergencyStopError`.
   - **Nothing about typing is ever retryable**, including `failed`, `partial` and `unverified`: a retry could type the text twice.
-- **Text never persisted or logged.** The text appears only transiently in memory (to type and check it) and, at most its first 40 characters, in the on-screen prompt, which is never logged. Logs, result messages, `repr()` of actions, results and safety objects, error messages and safety rules describe it only by its length. The field's text read back for checking is compared in memory and discarded. There is no password or secret detection in Phase 1.
-- **Tested.** 69 offline tests in `tests/test_executor_type_text.py` cover:
-  - validation, prompt wording and truncation, HIGH risk for Enter
+- **Text never shown, persisted or logged.** The text exists only transiently in memory, to validate it, type it (`SendInput`) and check it was typed. The confirmation prompt, logs, result messages, `repr()` of actions, results and safety objects, error messages and safety rules describe it only by its length. The field's text read back for checking is compared in memory and discarded. There is no password or secret detection in Phase 1.
+- **Tested.** 72 offline tests in `tests/test_executor_type_text.py` cover:
+  - validation, prompt wording (identical prompts for different texts of the same length and Enter count), HIGH risk for Enter
   - the window, field or title changing after approval, and a title changing *during* typing (Notepad's "*") not stopping it
   - `partial` from a focus change and from refused input, with correct progress
   - emergency stop before, during confirmation, before the first character, part-way, during the pause between characters, and during the read-back check
   - `done` versus `unverified` read-back cases, and never retried
   - the result rules, the adapter's `SendInput` events, and a rule that only the Executor adapter sends input
-  - a unique secret-like string not appearing in logs, `repr()`, results, errors or safety diagnostics in 8 scenarios
+  - a unique secret-like string not appearing in the confirmation prompt, logs, `repr()`, results, errors or safety actions, assessments and rules in 8 scenarios (the test also checks the secret really was typed and read back), plus 3 planted leaks (in the prompt, in logs and `repr()`, in a result message) that the check must catch, so it can't pass trivially
 
-  Removing the per-character focus check, the HIGH risk for Enter, or the length-only logging makes tests fail. Opt-in real-desktop test (17 September 2026): the test opened Notepad (`Edit` field active) and typed `Hello from the AI Desktop Companion test⏎line two`. The prompt read exactly as in the example above (HIGH). Result: `done`, verified, `progress=(49, 49)`, 1.06 s including confirmation and the check. The test then emptied that Notepad as test code and closed it with `close_app` (`done`; no save dialog appeared); cleanup had to close 0 windows.
+  Removing the per-character focus check, the HIGH risk for Enter, or the length-only logging makes tests fail. Opt-in real-desktop test (17 September 2026, re-run after removing the preview): the test opened Notepad (`Edit` field active) and typed "Hello from the AI Desktop Companion test", a line break, then "line two". The prompt read exactly as in the example above (HIGH), with none of the text. Result: `done`, verified, `progress=(49, 49)`, 1.05 s including confirmation and the check. The test then emptied that Notepad as test code and closed it with `close_app` (`done`; no save dialog appeared); cleanup had to close 0 windows.
 - **Limitations.**
   - If the user types at the same time, the characters interleave; only a change of active window or field is detected.
   - Windows may silently drop input to an app running as administrator; the read-back then gives `unverified`, never `done`.
   - A future command window (Phase 2/9) will itself be the active window, so it must hand focus back before typing; until then the "window changed after approval" check stops typing safely.
   - Some apps (e.g. browsers) have no readable fields for this check, so typing into them is always `unverified`.
-- **Open decision for Phase 3.** When the Brain generates the text from a spoken command, rather than the user typing it, the 40-character preview limit and whether to mask suspected secrets in the prompt need revisiting.
+- **Open decision for Phase 3.** With no preview at all, approving text the Brain generates from a spoken command, rather than text the user typed, means approving it blind. Revisit this before the Brain generates text to type, together with whether to mask suspected secrets.
+
+**Implementation notes — keyboard shortcuts (recorded 17 September 2026).**
+
+- **Action.** `ExecutorAction(SHORTCUT, "ctrl+c")` presses one shortcut from a **fixed allow-list** in `app/executor/shortcuts.py`. Key names are joined with `+`; case, spaces and modifier order don't matter; aliases `control`, `windows`, `escape`, `del` are accepted. Each shortcut has one normalized name (e.g. `Ctrl+C`), used in prompts and logs. The risk levels are code, not settings.
+- **Risk levels** (the gate asks for confirmation at MEDIUM and above):
+
+  | Shortcut | Level | Why |
+  |---|---|---|
+  | Ctrl+A | LOW | only changes the selection; changing the selected content is itself confirmed |
+  | Win+D | LOW | shows the desktop; changes no data and pressing it again brings the windows back |
+  | Ctrl+C | MEDIUM | replaces the clipboard, and in a terminal or console stops the running program; Phase 1 can't reliably recognise every terminal, so it is always confirmed (no terminal detection) |
+  | Ctrl+S | MEDIUM | saving can overwrite an existing file, and the document may hold changes by the user or another program, not only the assistant |
+  | Ctrl+Z | MEDIUM | undoes the most recent change, which may be the user's own; some apps can't redo |
+  | Ctrl+X | MEDIUM | removes the selection from the document and replaces the clipboard |
+  | Alt+Tab | MEDIUM | changes no data, but the window it switches to can't be known in advance, and following actions land there |
+  | Ctrl+V | HIGH | pastes clipboard content the assistant can't see; pasted lines can run in a terminal, pasted files are copied in File Explorer |
+  | Alt+F4 | HIGH | closes the active window (some apps don't ask to save); only on a window the assistant opened in this session, never with the desktop or taskbar active (that opens the Shut Down dialog) |
+
+  **Not supported:** F5 (deferred to the Refresh task); every other combination ("isn't a supported shortcut yet"); **Ctrl+Alt+Delete** and **Win+L**, which are reserved Windows shortcuts this assistant will not send or test. Win+L is intentionally unsupported in Phase 1 because it locks the Windows session.
+- **Prompts** (MEDIUM and HIGH; on screen only, never logged) name the shortcut, the window title and field, and what it does. Examples: `press Ctrl+Z in window "Untitled - Notepad" (field: Edit) - undoes the last change; some apps can't redo it`, `press Ctrl+V in window "…" (field: Edit) - pastes the clipboard (it holds: text). I can't see what's on it; pasting into a terminal or chat can run or send it`, `press Alt+F4 on window "Untitled - Notepad" - closes it; unsaved work may be lost if the app doesn't ask`. LOW shortcuts run without a prompt and the gate sees only `press Ctrl+A`, never a title.
+- **Validation (before anything is asked or sent).** The shortcut must be supported. Shortcuts that act on a window need an active window. No Ctrl, Alt, Shift or Win may be held down on the keyboard (checked again right before sending). Ctrl+V needs something on the clipboard. Alt+F4 needs the active window to belong to this session. After confirmation, if the active window, its title or its field changed, nothing is pressed.
+- **Sending.** The whole shortcut is **one `SendInput` call** (virtual keys plus scan codes): modifiers down, key down, key up, modifiers up in reverse. It is sent immediately after the last emergency-stop check, so a stop can never leave keys down. If Windows accepts **0 events** the result is `failed`. If it accepts **some but not all**, every key and modifier involved is released at once (an unassigned key is tapped first when Alt or Win is involved, so a lone release opens no menu) and the result is `unverified`. If it accepts all, the shortcut's own check runs. In every case the modifiers must then read as released; if not they are released again, and if still down the message says to press and release them.
+- **Outcomes: `done` only on evidence.**
+  - Ctrl+C: the clipboard's change counter moved.
+  - Ctrl+X: the counter moved and the field's text got shorter.
+  - Ctrl+A: a standard edit field reports all its text selected.
+  - Alt+Tab: a different window is active; if visibly not, `failed`.
+  - Win+D: the desktop is active.
+  - Alt+F4: close_app's window-group check (`done`, `needs_user`, `still_open`).
+  - Ctrl+Z, Ctrl+S, Ctrl+V: always `unverified`, and anything that can't be confirmed is `unverified`.
+  - **Never retryable.** An emergency stop while checking the effect raises `EmergencyStopError`; the keys were already sent and released.
+- **Clipboard.** Its **contents are never read** — nothing opens the clipboard or fetches its data (a rule test enforces it). Only its change counter and which kinds of data it holds (text, image, files) are read. The kinds appear only in the Ctrl+V prompt; nothing clipboard-related is logged.
+- **Tested.** 99 offline tests in `tests/test_executor_shortcut.py` cover:
+  - parsing, aliases, refusals and reserved shortcuts; the full risk table; Ctrl+C MEDIUM in every window
+  - LOW running without a prompt but through the gate; exact MEDIUM/HIGH prompts; decline and no confirmation method
+  - no active window, held modifiers (before and after approval), empty clipboard, target changed after approval
+  - Alt+F4 session-only, desktop refusal, `done` / `needs_user` / `still_open`
+  - 0 and partly accepted input with the defensive release; modifiers still down released again, or an honest note
+  - emergency stop before, during confirmation, right before sending, and while checking
+  - every verification case; never retried
+  - titles and clipboard kinds never reaching logs, results or errors, plus a planted leak the check must catch
+  - the adapter's single batch, extended Win key, scan codes and release sequence
+  - the clipboard-contents rule
+
+  Breaking Ctrl+V's HIGH level, the partial-input release, the held-modifier check, the Alt+F4 session restriction, or keeping titles out of results makes tests fail.
+
+  Opt-in real-desktop test (17 September 2026): in a Notepad the test opened, it typed "abc". **Ctrl+A** ran with no prompt → `done` (everything selected), 0.20 s. **Ctrl+Z** prompted at MEDIUM → `unverified`. **Alt+F4** prompted at HIGH on that session window → `done`. Cleanup had to close 0 windows, no modifier read as held afterwards, and the clipboard's change counter was unchanged. The clipboard test (Ctrl+C, then Ctrl+V into its own Notepad) exists behind a second opt-in, `RUN_REAL_CLIPBOARD_TEST=1`, because it replaces the clipboard's contents; it has **not** been run.
+- **Limitations.**
+  - A held modifier can't be told apart from one stuck after sending, so the "may still be held down" note can also appear while the user is holding a key.
+  - Ctrl+A is verifiable only in standard edit fields.
+  - Alt+Tab and Win+D are tested offline only, because on a real desktop they would move or hide the user's windows.
+  - Windows may silently drop input to an app running as administrator; the check then gives `unverified` or `failed`, never a false `done`.
+- **Open decision for Phase 3.** Confirming every Ctrl+C will likely feel heavy in daily use. Revisit lowering Ctrl+C to LOW in contexts known to be safe, once the assistant can reliably tell terminals and consoles apart.
+
+**Implementation notes — scroll (recorded 17 September 2026).**
+
+- **Action and input.** `ExecutorAction(SCROLL, "down 3")`. The format is `up N` or `down N`: an explicit direction word (signs like `+3` or `-3` are refused, because Windows' wheel sign is the opposite of what many people expect) and N **wheel notches**, from 1 to `executor.max_scroll_notches` (20). A missing count is refused, not guessed. **Vertical only:** `left`/`right` are refused ("Horizontal scrolling isn't supported yet").
+- **What a notch is (and isn't).** One notch is one wheel click (a wheel delta of 120). **It does not guarantee a number of lines or pixels:** Windows defaults to 3 lines per notch, users can change that (even to a whole screen), and every app decides for itself (browsers scroll by pixels, smoothly; some apps zoom or switch items). "down 3" means three wheel clicks. **Recorded for Phase 3:** when the Brain says "scroll down a bit" or "a page", it must map that to notches, or to a different mechanism such as Page Down.
+- **Target.** The wheel goes to the window under the pointer or to the focused window, depending on a Windows setting. So scrolling is only allowed when the **window under the mouse pointer is the active window**, so both settings deliver it to the same window. The assistant **never moves the pointer** for a scroll; if the pointer is elsewhere, it asks the user to move it. The scroll lands in the pane under the pointer.
+- **Risk.**
+  - **LOW, no prompt, only where a standard scroll area is positively identified:** a readable standard vertical scroll bar on the control under the pointer or one of its parents. Scrolling there changes no data and is undone by scrolling back.
+  - **MEDIUM over standard controls whose value the wheel changes:** drop-down lists (`ComboBox`, `ComboBoxEx32`), sliders (`msctls_trackbar32`), spin boxes (`msctls_updown32`) and date pickers (`SysDateTimePick32`). These are found on the control under the pointer **or any of its parents** (at most 16 steps), so e.g. the Edit inside a drop-down list still counts. Prompt (on screen only): `scroll down 2 notches over a drop-down list in window "…" - scrolling over it changes its value`.
+  - **MEDIUM, and capped, for surfaces that can't be classified** (changed on 17 September 2026 from LOW with the cap alone). This covers browser and custom web content, WPF, Store/UWP-style content, Electron and custom-drawn surfaces, and any target where no standard vertical scroll bar can be found on the control under the pointer or its parents. The user is always asked, **and** at most `executor.max_unclassified_notches` (3) notches are sent per command; the cap is an extra bound, not a substitute for confirmation. Prompt (on screen only), e.g. for "down 10": `scroll down 3 notches in window "…" - I couldn't confidently identify this window's scroll area, so for safety I'll send at most 3 notches (you asked for 10)`. The result says so again, and is normally `unverified`, since there's no readable scroll position. A value-changing control is still named when one is found. **Revisit classification in Phase 5**, when screen understanding can recognise these surfaces.
+  - Held Ctrl/Alt/Shift/Win is refused (Ctrl+wheel zooms), before scrolling and before every notch.
+- **Sending and emergency stop.** One notch per `SendInput` call, at the pointer's position, with `executor.scroll_interval_seconds` (0.05 s, interruptible) between notches. **Before every notch** the active window, the control under the pointer and held modifiers are checked, then the emergency stop immediately before sending. A stop before the first notch raises `EmergencyStopError`; a stop after at least one raises `ActionInterruptedError` carrying a `partial` result. (`ActionInterruptedError` was added as the general form of this error; `TypingInterruptedError` now inherits from it, with no change in typing behavior.)
+- **Outcomes.**
+  - `done` only when a standard scroll bar's position (read before and, for up to `verifier.scroll_settle_seconds` = 1 s, after) **moved in the requested direction**.
+  - `unverified`: no readable standard scroll bar; already at the top/bottom ("…already at the top, so nothing moved"); didn't move, or moved the other way; unreadable afterwards.
+  - `failed`: nothing scrolled (refused input or a change before the first notch).
+  - `partial` with `progress=(sent, total)`: the pointer moved off what it was over, the active window changed, a modifier was pressed, or Windows refused input part-way.
+  - **Never retryable.** Logs contain the direction, count, level, rule and outcome, never window titles or control class names.
+- **Tested.** 66 offline tests in `tests/test_executor_scroll.py` cover:
+  - input refusals; LOW with no prompt only where a standard scroll bar is identified (the gate sees no title)
+  - MEDIUM for each value-changing control, including an Edit inside a drop-down list and one nested in a group, and decline
+  - unclassified surfaces: MEDIUM with the exact prompt; the safety gate receives MEDIUM with the unclassified rule; declining or having no confirmation method sends 0 notches; approving "down 10" sends at most 3; the result's cap message; within the cap it still asks
+  - no active window, pointer not over the active window, held modifiers, unreadable desktop
+  - `partial` for each per-notch change, and `failed` before the first notch
+  - emergency stop before, before the first notch, part-way, during the pause and during the check
+  - every verification case; never retried
+  - titles and classes never leaking, plus a planted leak the check must catch
+  - the adapter's wheel events
+
+  Removing the cap, the parent walk, the stop check before each notch, the pointer-over-active-window rule, MEDIUM for value-changing controls, or MEDIUM for unclassified surfaces (6 tests fail) makes tests fail.
+
+  Opt-in real-desktop test (17 September 2026, re-run after the change to MEDIUM for unclassified surfaces): it recorded the pointer position, opened its own Notepad, filled it with 200 lines and put the pointer over it (test code). Notepad has a standard scroll bar, so it stays LOW. **down 5** → `done` with no prompt; **up 5** → `done`. It then put the Notepad explicitly at the top (test code); **up 1** → `unverified`, "already at the top". **down 999** and **left 3** were refused. In cleanup (which runs even if an assertion fails) it restored the pointer to its original position, emptied and closed only its own Notepad (`done`), and had to close 0 windows.
+- **Limitations.**
+  - Value-changing controls inside browsers, WPF, Store and Electron apps can't be detected; those surfaces are asked about and capped at 3 notches instead.
+  - A spin box's paired text field isn't one of its parents, so only the arrows themselves are recognised.
+  - Apps without standard scroll bars can only ever give `unverified`.
+  - Because the pointer is never moved, the user must place it over the window to scroll.
+- **Open decision for Phase 8.** Browsers and Electron apps can't be classified, so nearly every real-world scroll will ask for confirmation. If that becomes tiring in daily use, revisit — most likely by remembering the approval per window for the session, rather than by lowering the risk level.
 
 ---
 

@@ -25,6 +25,17 @@ opened itself (and only if that Notepad is the active window), approves only a p
 49 characters and one Enter press, then - as test code, not the assistant - empties that Notepad and
 marks it unmodified before closing it with close_app. If a "Save changes?" dialog appears anyway, the
 test answers Don't Save on its own Notepad.
+
+The shortcut test stays inside a Notepad the test opened: it types "abc", presses Ctrl+A (LOW - it must
+not ask), Ctrl+Z (MEDIUM, approved), empties the Notepad as test code, and closes it with Alt+F4 (HIGH,
+approved, allowed because the assistant opened that window). It never touches the clipboard, other
+windows, Alt+Tab or Win+D. The clipboard test additionally needs RUN_REAL_CLIPBOARD_TEST=1, because it
+REPLACES what is on your clipboard (Ctrl+C, then Ctrl+V into its own Notepad).
+
+The scroll test records where your mouse pointer is, opens its own Notepad, fills it with 200 short
+lines and moves the pointer over it (both as test code), scrolls down and up (LOW - no prompts), puts
+that Notepad at the top (test code) and checks "up 1" reports "already at the top", checks refusals,
+and ALWAYS - even if an assertion fails - puts your pointer back and closes only its own Notepad.
 """
 import ctypes
 import time
@@ -33,7 +44,7 @@ import pytest
 
 from app.executor import emergency_stop
 from app.executor.logic import execute_with_recovery
-from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, TYPE_TEXT, ExecutorAction, Outcome
+from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, SCROLL, SHORTCUT, TYPE_TEXT, ExecutorAction, Outcome
 from app.safety.models import RiskLevel
 from app.verifier import adapter as verifier_adapter
 from app.verifier import logic as verifier
@@ -246,8 +257,8 @@ def test_type_text_into_a_notepad_the_test_opened():
               f"progress: {typed.progress}, {time.monotonic() - started:.2f}s including confirmation and check)")
         assert typed.outcome is Outcome.DONE and typed.verified and typed.progress == (49, 49), typed.message
         assert prompts == ['type 49 characters into window "Untitled - Notepad" (field: Edit) AND PRESS ENTER 1 TIME'
-                           ' - Enter can submit a form, send a message or run a command: '
-                           '"Hello from the AI Desktop Companion test\u2026"']
+                           ' - Enter can submit a form, send a message or run a command']
+        assert not any(word in prompts[0] for word in ("Hello", "Companion", "line two"))  # no text in the prompt
 
         _discard_test_text(field)
         closed = execute_with_recovery(ExecutorAction(CLOSE_APP, "notepad"), confirm=lambda action, assessment: True)
@@ -260,5 +271,182 @@ def test_type_text_into_a_notepad_the_test_opened():
             "notepad", expectation, before,
             watch_seconds=WATCH_AFTER_DONE_SECONDS if closed is not None and closed.ok else CLEANUP_SECONDS)
         print(f"notepad: cleanup had to close {len(leftovers)} window(s)")
+    assert leftovers == [], f"cleanup had to close: {[_describe(w) for w in leftovers]}"
+    assert before <= verifier.snapshot_windows(expectation), "a window that was already open was closed"
+
+
+def _open_test_notepad(expectation, before, label):
+    opened = execute_with_recovery(ExecutorAction(OPEN_APP, "notepad"))
+    print(f"\n{label}: {opened.message}")
+    assert opened.ok, opened.message
+    notepad = next(w for w in _new_windows(expectation, before) if w.class_name == "Notepad")
+    active = verifier_adapter.active_target()
+    assert active.window is not None and active.window.handle == notepad.handle and active.control_handle, \
+        "the test's Notepad isn't the active window - not pressing anything"
+    return notepad, active.control_handle
+
+
+def _press(shortcut, label, expect_prompt_start=None):
+    """Press through the full pipeline. With expect_prompt_start=None the shortcut must NOT ask (LOW);
+    otherwise only a prompt starting with that text is approved."""
+    prompts = []
+
+    def confirm(action, assessment):
+        prompts.append((action.description, assessment.level.name))
+        return expect_prompt_start is not None and action.description.startswith(expect_prompt_start)
+    result = execute_with_recovery(ExecutorAction(SHORTCUT, shortcut), confirm=confirm)
+    print(f"{label}: {shortcut} -> {result.outcome.value}: {result.message} (prompts: {prompts})")
+    assert (prompts == []) is (expect_prompt_start is None), prompts
+    return result
+
+
+@pytest.mark.real_desktop
+def test_shortcuts_in_a_notepad_the_test_opened():
+    emergency_stop.reset("real-desktop-test")
+    expectation = verifier.expect_window("notepad")
+    before = verifier.snapshot_windows(expectation)
+    closed = None
+    try:
+        notepad, field = _open_test_notepad(expectation, before, "shortcuts")
+        typed = execute_with_recovery(ExecutorAction(TYPE_TEXT, "abc"), confirm=lambda action, assessment: True)
+        assert typed.outcome is Outcome.DONE, typed.message
+
+        started = time.monotonic()
+        select_all = _press("ctrl+a", "shortcuts")
+        print(f"shortcuts: Ctrl+A took {time.monotonic() - started:.2f}s")
+        assert select_all.outcome is Outcome.DONE, select_all.message
+
+        undo = _press("ctrl+z", "shortcuts", expect_prompt_start='press Ctrl+Z in window "')
+        assert undo.ok and undo.outcome is Outcome.UNVERIFIED, undo.message
+
+        _discard_test_text(field)
+        closed = _press("alt+f4", "shortcuts", expect_prompt_start=f'press Alt+F4 on window "{notepad.title}"')
+        if closed.outcome is Outcome.NEEDS_USER:
+            _answer_dont_save(notepad.handle)
+        assert closed.outcome is Outcome.DONE, closed.message
+        assert verifier_adapter.modifier_keys_down() == [], "a modifier key reads as still held down"
+    finally:
+        leftovers = _close_windows_opened_since(
+            "notepad", expectation, before,
+            watch_seconds=WATCH_AFTER_DONE_SECONDS if closed is not None and closed.ok else CLEANUP_SECONDS)
+        print(f"notepad: cleanup had to close {len(leftovers)} window(s)")
+    assert leftovers == [], f"cleanup had to close: {[_describe(w) for w in leftovers]}"
+    assert before <= verifier.snapshot_windows(expectation), "a window that was already open was closed"
+
+
+@pytest.mark.real_desktop
+@pytest.mark.real_clipboard
+def test_copy_and_paste_in_a_notepad_the_test_opened():
+    """REPLACES your clipboard's contents. Needs RUN_REAL_CLIPBOARD_TEST=1 as well."""
+    emergency_stop.reset("real-desktop-test")
+    expectation = verifier.expect_window("notepad")
+    before = verifier.snapshot_windows(expectation)
+    closed = None
+    try:
+        notepad, field = _open_test_notepad(expectation, before, "clipboard")
+        yes = lambda action, assessment: True  # noqa: E731
+        assert execute_with_recovery(ExecutorAction(TYPE_TEXT, "clipboard test"), confirm=yes).outcome is Outcome.DONE
+        assert _press("ctrl+a", "clipboard").outcome is Outcome.DONE
+        copied = _press("ctrl+c", "clipboard", expect_prompt_start='press Ctrl+C in window "')
+        assert copied.outcome is Outcome.DONE, copied.message
+        assert execute_with_recovery(ExecutorAction(TYPE_TEXT, " "), confirm=yes).ok  # replaces the selection
+        pasted = _press("ctrl+v", "clipboard", expect_prompt_start='press Ctrl+V in window "')
+        assert pasted.ok and pasted.outcome is Outcome.UNVERIFIED, pasted.message
+        assert verifier.wait_until(lambda: verifier.count_text(field, "clipboard test") == 1), \
+            "the pasted text didn't show up in the test's Notepad"  # checked by the TEST, not the assistant
+        _discard_test_text(field)
+        closed = _press("alt+f4", "clipboard", expect_prompt_start="press Alt+F4 on window")
+        if closed.outcome is Outcome.NEEDS_USER:
+            _answer_dont_save(notepad.handle)
+        assert closed.outcome is Outcome.DONE, closed.message
+    finally:
+        leftovers = _close_windows_opened_since(
+            "notepad", expectation, before,
+            watch_seconds=WATCH_AFTER_DONE_SECONDS if closed is not None and closed.ok else CLEANUP_SECONDS)
+    assert leftovers == []
+
+
+def _test_user32():
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32")
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = wintypes.LPARAM
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    return user32
+
+
+def _fill_with_lines(field_handle, count):
+    """Test setup, not an assistant action: put `count` short lines into the test's own Notepad."""
+    text = "\r\n".join(f"scroll test line {n}" for n in range(1, count + 1))
+    _test_user32().SendMessageW(field_handle, 0x000C, 0, ctypes.cast(ctypes.c_wchar_p(text), ctypes.c_void_p).value)
+
+
+def _scroll_to_top(field_handle):
+    """Test setup: scroll the test's own Notepad to the very top (WM_VSCROLL, SB_TOP)."""
+    _test_user32().SendMessageW(field_handle, 0x0115, 6, 0)
+
+
+def _scroll(target, label):
+    prompts = []
+    result = execute_with_recovery(ExecutorAction(SCROLL, target),
+                                   confirm=lambda action, assessment: prompts.append(action.description) or False)
+    print(f"{label}: scroll {target!r} -> {result.outcome.value}: {result.message} (progress {result.progress}, "
+          f"prompts {prompts})")
+    return result, prompts
+
+
+@pytest.mark.real_desktop
+def test_scroll_in_a_notepad_the_test_opened():
+    emergency_stop.reset("real-desktop-test")
+    expectation = verifier.expect_window("notepad")
+    before = verifier.snapshot_windows(expectation)
+    original_pointer = verifier_adapter.cursor_position()  # recorded before anything moves the pointer
+    print(f"\nscroll: original pointer position {original_pointer}")
+    closed, field = None, None
+    try:
+        notepad, field = _open_test_notepad(expectation, before, "scroll")
+        _fill_with_lines(field, 200)
+        _scroll_to_top(field)
+        x, y = _text_area_centre(field)
+        _test_user32().SetCursorPos(x, y)
+        start = verifier_adapter.vertical_scroll(field)
+        print(f"scroll: pointer at ({x}, {y}); scroll bar before: {start}")
+        assert start is not None and start.at_top
+
+        down, prompts = _scroll("down 5", "scroll")
+        assert prompts == [] and down.outcome is Outcome.DONE and down.progress == (5, 5), down.message
+        middle = verifier_adapter.vertical_scroll(field)
+        assert middle.position > start.position
+
+        up, prompts = _scroll("up 5", "scroll")
+        assert prompts == [] and up.outcome is Outcome.DONE, up.message
+
+        _scroll_to_top(field)  # explicitly at the top - not relying on down 5 + up 5 cancelling out
+        assert verifier_adapter.vertical_scroll(field).at_top
+        at_top, prompts = _scroll("up 1", "scroll")
+        assert prompts == [] and at_top.ok and at_top.outcome is Outcome.UNVERIFIED
+        assert at_top.message == "Scrolled up 1 notch, but it was already at the top, so nothing moved."
+
+        for target, message in [("down 999", "That's 999 notches; I scroll at most 20 at once."),
+                                ("left 3", "Horizontal scrolling isn't supported yet.")]:
+            refused, prompts = _scroll(target, "scroll")
+            assert not refused.ok and refused.message == message and prompts == []
+        assert verifier_adapter.vertical_scroll(field).at_top  # the refusals scrolled nothing
+    finally:
+        _test_user32().SetCursorPos(*original_pointer)  # always put the user's pointer back
+        print(f"scroll: pointer restored to {verifier_adapter.cursor_position()}")
+        if field:
+            _discard_test_text(field)
+        try:
+            closed = execute_with_recovery(ExecutorAction(CLOSE_APP, "notepad"), confirm=lambda action, assessment: True)
+            print(f"scroll: {closed.message} (outcome: {closed.outcome.value})")
+        except Exception as exc:  # cleanup must continue to the safety net below
+            print(f"scroll: close_app failed during cleanup: {exc!r}")
+        leftovers = _close_windows_opened_since(
+            "notepad", expectation, before,
+            watch_seconds=WATCH_AFTER_DONE_SECONDS if closed is not None and closed.ok else CLEANUP_SECONDS)
+        print(f"notepad: cleanup had to close {len(leftovers)} window(s)")
+    assert verifier_adapter.cursor_position() == original_pointer
+    assert closed is not None and closed.outcome is Outcome.DONE, closed and closed.message
     assert leftovers == [], f"cleanup had to close: {[_describe(w) for w in leftovers]}"
     assert before <= verifier.snapshot_windows(expectation), "a window that was already open was closed"

@@ -3,9 +3,15 @@ The only file in the Verifier allowed to talk to an external system. It READS th
 desktop - which visible top-level windows exist, their titles and window classes, whether each is
 enabled or cloaked, which titled windows are hosted inside another window, where each monitor is,
 which window is at a screen point, where the mouse pointer is, which window and control have
-keyboard focus, and the text of a control - and never changes anything. Reading a control's text
-asks the app for a copy (WM_GETTEXT, with a timeout so a hung app can't block); the text is
-returned to the caller only, never logged.
+keyboard focus, the text and selection of a control, which modifier keys are held down, two facts
+about the clipboard, the chain of controls under a screen point, and a standard scroll bar's
+position - and never changes anything. Reading a control's text asks the app for a
+copy (WM_GETTEXT, with a timeout so a hung app can't block); the text is returned to the caller
+only, never logged.
+
+The clipboard's CONTENTS are never read: nothing here opens the clipboard or fetches its data. Only
+its change counter (which moves whenever anything is copied) and which kinds of data it holds
+(text, image, files) are read.
 
 Coordinates are real screen pixels on every monitor: before reading anything, this process is made
 per-monitor DPI aware (the same call the Executor adapter makes before clicking), so a point read
@@ -17,7 +23,7 @@ extra dependency and has no side effects.
 import ctypes
 import sys
 
-from app.verifier.models import ActiveTarget, Screen, WindowInfo
+from app.verifier.models import ActiveTarget, ControlInfo, ScrollState, Screen, WindowInfo
 
 _MAX_CLASS_NAME = 256  # Windows limits window class names to 256 characters
 _DWMWA_CLOAKED = 14    # "cloaked": the window exists and counts as visible, but isn't drawn on screen
@@ -27,6 +33,13 @@ _PER_MONITOR_AWARE_V2 = -4  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 _WM_GETTEXT, _WM_GETTEXTLENGTH = 0x000D, 0x000E
 _SMTO_BLOCK_ABORTIFHUNG = 0x0001 | 0x0002
 _READ_TIMEOUT_MS = 500
+_EM_GETSEL = 0x00B0
+_GA_PARENT = 1
+_SB_VERT = 1
+_SIF_RANGE_PAGE_POS = 0x0001 | 0x0002 | 0x0004
+_MAX_CONTROL_DEPTH = 16  # a deterministic bound on how far up the parent chain is walked
+_MODIFIER_KEYS = {"Shift": (0x10,), "Ctrl": (0x11,), "Alt": (0x12,), "Win": (0x5B, 0x5C)}  # Win: left, right
+_CLIPBOARD_KINDS = [("text", (1, 7, 13)), ("image", (2, 8, 17)), ("files", (15,))]  # CF_* format numbers
 
 
 class VerifierAdapterError(Exception):
@@ -130,6 +143,76 @@ def read_text(handle: int, max_characters: int) -> str | None:
     return buffer.value
 
 
+def selection(handle: int) -> tuple[int, int] | None:
+    """(start, end) of the selection in a standard edit control, or None if it can't be read. Only
+    call this for "Edit"/"RichEdit" controls: EM_GETSEL means something else to other controls."""
+    api = _api()
+    result = ctypes.c_size_t(0)
+    if not api.user32.SendMessageTimeoutW(handle, _EM_GETSEL, 0, 0, _SMTO_BLOCK_ABORTIFHUNG,
+                                          _READ_TIMEOUT_MS, ctypes.byref(result)):
+        return None
+    return result.value & 0xFFFF, (result.value >> 16) & 0xFFFF
+
+
+def text_length(handle: int) -> int | None:
+    """How many characters a control's text has (WM_GETTEXTLENGTH), or None if it can't be read."""
+    api = _api()
+    length = ctypes.c_size_t(0)
+    if not api.user32.SendMessageTimeoutW(handle, _WM_GETTEXTLENGTH, 0, 0, _SMTO_BLOCK_ABORTIFHUNG,
+                                          _READ_TIMEOUT_MS, ctypes.byref(length)):
+        return None
+    return length.value
+
+
+def modifier_keys_down() -> list[str]:
+    """Which of Ctrl, Alt, Shift and Win are held down right now (physically or injected)."""
+    api = _api()
+    return [name for name, codes in _MODIFIER_KEYS.items()
+            if any(api.user32.GetAsyncKeyState(code) & 0x8000 for code in codes)]
+
+
+def clipboard_sequence_number() -> int:
+    """The clipboard's change counter. Reads no clipboard content."""
+    return int(_api().user32.GetClipboardSequenceNumber())
+
+
+def clipboard_kinds() -> list[str]:
+    """Which kinds of data the clipboard holds - "text", "image", "files", "other data" - or [] when it
+    is empty. Reads no clipboard content."""
+    api = _api()
+    kinds = [kind for kind, formats in _CLIPBOARD_KINDS
+             if any(api.user32.IsClipboardFormatAvailable(f) for f in formats)]
+    if not kinds and api.user32.CountClipboardFormats() > 0:
+        kinds.append("other data")
+    return kinds
+
+
+def control_chain_at(x: int, y: int) -> list[ControlInfo]:
+    """The control at screen point (x, y) followed by its parents, up to and including its top-level
+    window (at most 16 steps). Empty if there is nothing there. Reads handles and class names only."""
+    api = _api()
+    chain: list[ControlInfo] = []
+    desktop = api.user32.GetDesktopWindow()
+    hwnd = api.user32.WindowFromPoint(api.POINT(x, y))
+    while hwnd and hwnd != desktop and len(chain) < _MAX_CONTROL_DEPTH:
+        class_name = ctypes.create_unicode_buffer(_MAX_CLASS_NAME)
+        api.user32.GetClassNameW(hwnd, class_name, _MAX_CLASS_NAME)
+        chain.append(ControlInfo(int(hwnd), class_name.value))
+        hwnd = api.user32.GetAncestor(hwnd, _GA_PARENT)
+    return chain
+
+
+def vertical_scroll(handle: int) -> ScrollState | None:
+    """The standard vertical scroll bar of window `handle`, or None if it has none that can be read."""
+    api = _api()
+    info = api.ScrollInfo()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = _SIF_RANGE_PAGE_POS
+    if not api.user32.GetScrollInfo(handle, _SB_VERT, ctypes.byref(info)):
+        return None
+    return ScrollState(position=info.nPos, minimum=info.nMin, maximum=info.nMax, page=info.nPage)
+
+
 def cursor_position() -> tuple[int, int]:
     """Where the mouse pointer is, in screen pixels."""
     api = _api()
@@ -157,6 +240,13 @@ class _Api:
 
         self.DWORD, self.POINT, self.MonitorInfo = wintypes.DWORD, wintypes.POINT, MonitorInfo
         self.GuiThreadInfo = GuiThreadInfo
+
+        class ScrollInfo(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("fMask", wintypes.UINT), ("nMin", ctypes.c_int),
+                        ("nMax", ctypes.c_int), ("nPage", wintypes.UINT), ("nPos", ctypes.c_int),
+                        ("nTrackPos", ctypes.c_int)]
+
+        self.ScrollInfo = ScrollInfo
         self.user32 = user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.dwmapi = dwmapi = ctypes.WinDLL("dwmapi")
         self.enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -171,6 +261,12 @@ class _Api:
             ("GetAncestor", [wintypes.HWND, wintypes.UINT], wintypes.HWND),
             ("GetCursorPos", [ctypes.POINTER(wintypes.POINT)], wintypes.BOOL),
             ("GetForegroundWindow", [], wintypes.HWND),
+            ("GetDesktopWindow", [], wintypes.HWND),
+            ("GetScrollInfo", [wintypes.HWND, ctypes.c_int, ctypes.POINTER(ScrollInfo)], wintypes.BOOL),
+            ("GetAsyncKeyState", [ctypes.c_int], ctypes.c_short),
+            ("GetClipboardSequenceNumber", [], wintypes.DWORD),
+            ("IsClipboardFormatAvailable", [wintypes.UINT], wintypes.BOOL),
+            ("CountClipboardFormats", [], ctypes.c_int),
             ("GetWindowThreadProcessId", [wintypes.HWND, ctypes.c_void_p], wintypes.DWORD),
             ("GetGUIThreadInfo", [wintypes.DWORD, ctypes.POINTER(GuiThreadInfo)], wintypes.BOOL),
             ("SendMessageTimeoutW", [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,

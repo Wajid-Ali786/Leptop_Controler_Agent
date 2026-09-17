@@ -18,7 +18,7 @@ execute_with_recovery() adds the Action -> Result -> Recovery loop (docs/build-p
 a retryable failure is OFFERED for retry - never silently continued - and every retry runs the
 whole pipeline again, safety gate and verification included.
 
-Phase 1 is built one action at a time: open_app, close_app, click, then type_text.
+Phase 1 is built one action at a time: open_app, close_app, click, type_text, shortcut, then scroll.
 
 close_app closes ONLY windows the assistant opened in this session. open_app remembers them in
 memory, so nothing carries over a restart, and windows the user opened are never touched. Closing
@@ -46,8 +46,8 @@ type_text types exact text into the ACTIVE window's focused field:
     (line breaks are allowed), no broken Unicode, and there must be an active window
   - safety: always at least Medium risk; any line break makes it HIGH, because each one presses
     Enter, which can submit a form, send a message or run a command. The prompt names the character
-    count, the window, the field, the number of Enter presses (and whether the text ends with one),
-    and a preview of at most the first 40 characters with Enter shown as a return symbol
+    count, the window, the field and the number of Enter presses (and whether the text ends with
+    one) - and none of the text itself
   - right after confirmation: if the active window or focused field changed, nothing is typed
   - one character at a time; before EVERY character the emergency stop and the active window/field
     are checked, and the pause between characters is interruptible
@@ -56,9 +56,42 @@ type_text types exact text into the ACTIVE window's focused field:
     nothing was typed; PARTIAL (progress=(sent, total)) when typing stopped part-way. An emergency
     stop after something was typed raises TypingInterruptedError carrying that result
   - nothing about typing is ever retryable: a retry could type the text twice
-  - the text itself never appears in logs, result messages, repr() or errors - only its length. It
-    exists in memory while typing and checking, and (at most 40 characters of it) in the prompt,
-    which is shown on screen and never logged.
+  - the text itself never appears in the confirmation prompt, logs, result messages, repr() or
+    errors - only its length. It exists transiently in memory, only to validate it, type it and
+    check it was typed.
+
+shortcut presses one keyboard shortcut from the fixed allow-list in app/executor/shortcuts.py, whose
+risk levels decide confirmation (LOW runs without asking; MEDIUM and HIGH always ask):
+  - validation: a supported name; an active window where the shortcut acts on one; no modifier held
+    down on the keyboard; something on the clipboard for Ctrl+V; Alt+F4 only on a window the assistant
+    opened in this session, and never with the desktop or taskbar active
+  - after confirmation: if the active window, its title or its field changed, nothing is pressed
+  - the whole shortcut is ONE SendInput call (modifiers down, key down, key up, modifiers up), right
+    after the last emergency-stop check - so a stop can't leave keys down
+  - Windows accepted 0 events -> FAILED; some but not all -> every key involved is released at once
+    and the result is UNVERIFIED; all -> the shortcut's own check. Afterwards the modifiers must read as
+    released (released again if not; an honest note if still down)
+  - DONE only on evidence (clipboard change counter, full selection in an edit field, a different
+    active window, the desktop active, the window group closed); otherwise UNVERIFIED; Alt+Tab that
+    visibly didn't switch is FAILED; Alt+F4 can also be NEEDS_USER or STILL_OPEN
+  - never retryable; clipboard contents are never read; window titles and clipboard details appear only
+    in the on-screen prompt, never in logs or results
+
+scroll sends vertical mouse-wheel notches ("up N" / "down N") to the ACTIVE window:
+  - validation: explicit direction word and 1..executor.max_scroll_notches notches; the window under the
+    mouse pointer must BE the active window (so the wheel lands there whatever the "scroll inactive
+    windows" setting is); no modifier held down. The pointer is never moved.
+  - risk: LOW - no prompt - only where a standard scroll bar is positively identified (on the control
+    under the pointer or a parent). MEDIUM over a standard control whose value the wheel changes
+    (drop-down list, slider, spin box, date picker), found on the control or any of its parents
+  - MEDIUM too where no standard scroll bar can be identified (browsers, WPF, Store apps, Electron):
+    the prompt says so, and at most executor.max_unclassified_notches notches are sent - the cap is an
+    extra bound, not a substitute for confirmation - and the result says so
+  - one notch per SendInput call, with an interruptible pause; before EVERY notch the emergency stop,
+    the active window, the control under the pointer and held modifiers are checked
+  - DONE only when a standard scroll bar's position moved in the requested direction; otherwise
+    UNVERIFIED (unreadable, already at the end, didn't move); FAILED if nothing scrolled; PARTIAL if it
+    stopped part-way; an emergency stop part-way raises ActionInterruptedError. Never retryable.
 
 Measured real-desktop behavior and known open decisions: docs/step4 Section 4, implementation notes.
 """
@@ -69,9 +102,10 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Callable
 
-from app.executor import adapter, emergency_stop
-from app.executor.emergency_stop import EmergencyStopError, TypingInterruptedError
-from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, TYPE_TEXT, ActionResult, ExecutorAction, Outcome
+from app.executor import adapter, emergency_stop, shortcuts
+from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError, TypingInterruptedError
+from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, SCROLL, SHORTCUT, TYPE_TEXT, ActionResult,
+                                 ExecutorAction, Outcome)
 from app.safety.logic import Confirm, authorize
 from app.safety.models import Action, RiskLevel
 from app.verifier import logic as verifier
@@ -99,8 +133,6 @@ _TYPING_RISK_REASON = "typing text - always needs confirmation (the active windo
 _ENTER_RISK = RiskLevel.HIGH
 _ENTER_RISK_REASON = ("text contains line breaks - each presses Enter, which can submit a form, send a message "
                       "or run a command")
-PREVIEW_CHARACTERS = 40
-_ENTER_SYMBOL = "\u23ce"  # the return symbol that marks each Enter in the prompt's preview
 
 # Windows the assistant opened in this session: app name -> window groups, oldest first.
 _session_windows: dict[str, list[frozenset[int]]] = {}
@@ -425,7 +457,7 @@ def _prepare_type_text(action: ExecutorAction):
     if approved.window is None:
         return _result(action, False, "Didn't type: there's no active window to type into.")
     total, enters = len(text), text.count("\n")
-    safety_action = Action(_typing_prompt(text, approved, enters),
+    safety_action = Action(_typing_prompt(total, enters, text.endswith("\n"), approved),
                            minimum_level=_ENTER_RISK if enters else _TYPING_RISK,
                            minimum_reason=_ENTER_RISK_REASON if enters else _TYPING_RISK_REASON)
 
@@ -474,20 +506,18 @@ def _prepare_type_text(action: ExecutorAction):
     return _Prepared(run, safety_action)
 
 
-def _typing_prompt(text: str, target: ActiveTarget, enters: int) -> str:
-    """What the user approves: count, window, field, Enter presses and a short preview. Shown on screen
-    only - never logged."""
+def _typing_prompt(total: int, enters: int, ends_with_enter: bool, target: ActiveTarget) -> str:
+    """What the user approves: character count, window, field and Enter presses. It is deliberately
+    built without the text itself, so none of the text can ever appear in the prompt."""
     window = f'window "{target.window.title}"' if target.window.title else "a window with no readable title"
     field = target.control_class or "unknown"
-    prompt = f"type {len(text)} character{'s' if len(text) != 1 else ''} into {window} (field: {field})"
+    prompt = f"type {total} character{'s' if total != 1 else ''} into {window} (field: {field})"
     if enters:
         prompt += (f" AND PRESS ENTER {enters} TIME{'S' if enters != 1 else ''} - Enter can submit a form, "
                    f"send a message or run a command")
-        if text.endswith("\n"):
+        if ends_with_enter:
             prompt += " (ends with Enter: it will submit as soon as typing finishes)"
-    preview = text[:PREVIEW_CHARACTERS].replace("\n", _ENTER_SYMBOL)
-    ellipsis = "\u2026" if len(text) > PREVIEW_CHARACTERS else ""
-    return f'{prompt}: "{preview}{ellipsis}"'
+    return prompt
 
 
 def _typed_summary(total: int, enters: int) -> str:
@@ -543,10 +573,409 @@ def _typing_interval() -> float:
     return float(value)
 
 
+# --- shortcut ---------------------------------------------------------------------------
+
+_SHELL_CLASSES = ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")  # desktop and taskbar
+_DESKTOP_CLASSES = ("Progman", "WorkerW")
+
+
+def _prepare_shortcut(action: ExecutorAction):
+    parsed = shortcuts.parse(action.target)
+    if isinstance(parsed, shortcuts.ShortcutRefusal):
+        return _result(action, False, parsed.message)
+    shortcut = parsed
+    name = shortcut.name
+    try:
+        approved = verifier.active_target()
+        held = verifier.modifiers_held()
+        kinds = verifier.clipboard_kinds() if name == "Ctrl+V" else []
+    except verifier.VerifierUnavailableError as exc:
+        return _result(action, False, f"Didn't press {name}: I can't check the keyboard or the active window ({exc}).")
+    if shortcut.needs_active_window and approved.window is None:
+        return _result(action, False, f"Didn't press {name}: there's no active window.")
+    if held:
+        return _result(action, False, _held_message(name, held))
+    if name == "Ctrl+V" and not kinds:
+        return _result(action, False, "The clipboard is empty, so there's nothing to paste.")
+    session_group = None
+    if shortcut.check == shortcuts.CHECK_CLOSED:
+        if approved.window.class_name in _SHELL_CLASSES:
+            return _result(action, False, f"{name} with the desktop or taskbar active opens the Shut Down dialog, "
+                                          f"so I won't press it.")
+        try:
+            session_group = _session_group_containing(approved.window.handle)
+        except verifier.VerifierUnavailableError as exc:
+            return _result(action, False, f"Didn't press {name}: I can't check the active window ({exc}).")
+        except SettingsError as exc:
+            return _result(action, False, str(exc))
+        if session_group is None:
+            return _result(action, False, f"I only press {name} on windows I opened in this session, and the active "
+                                          f"window isn't one of them, so I left it alone.")
+    if shortcut.risk > RiskLevel.LOW:
+        description = _shortcut_prompt(shortcut, approved, kinds)
+    else:  # LOW runs without a prompt, so the gate sees no window title at all
+        description = f"press {name}"
+    safety_action = Action(description, minimum_level=shortcut.risk, minimum_reason=shortcut.reason)
+
+    def run() -> ActionResult:
+        try:
+            now = verifier.active_target()
+            held_now = verifier.modifiers_held()
+        except verifier.VerifierUnavailableError as exc:
+            return _result(action, False, f"Didn't press {name}: I can't check the keyboard or the active window ({exc}).")
+        if shortcut.needs_active_window and _focus_identity(now, with_title=True) != _focus_identity(approved, with_title=True):
+            return _result(action, False, f"The active window changed after you approved, so I didn't press {name}.")
+        if held_now:
+            return _result(action, False, _held_message(name, held_now))
+        baseline = _shortcut_baseline(shortcut, now, session_group)
+        emergency_stop.check()  # last checkpoint before the keys are sent
+        try:
+            accepted, expected = adapter.send_shortcut(shortcut.modifiers, shortcut.key)
+        except adapter.ExecutorAdapterError as exc:
+            return _result(action, False, f"I couldn't press {name}: {exc}.")
+        if accepted == 0:
+            return _result(action, False, f"Windows didn't accept the keyboard input for {name}, so nothing was pressed.")
+        if accepted < expected:
+            adapter.release_keys(shortcut.modifiers, shortcut.key)  # defensive: every key involved, at once
+            return _result(action, True, f"Windows accepted only part of the keyboard input for {name}, so I released "
+                                         f"every key involved. The shortcut may or may not have taken effect."
+                                         f"{_release_note(shortcut)}", outcome=Outcome.UNVERIFIED)
+        try:
+            note = _release_note(shortcut)
+            ok, outcome, message = _verify_shortcut(shortcut, now, baseline, session_group)
+        except EmergencyStopError:
+            log.warning("Emergency stop while checking shortcut %s: the keys were already sent and released", name)
+            raise
+        if outcome is Outcome.DONE and session_group:
+            _forget(*session_group[:2])
+        return _result(action, ok, message + note, outcome=outcome)
+
+    return _Prepared(run, safety_action)
+
+
+def _shortcut_prompt(shortcut, target: ActiveTarget, kinds: list[str]) -> str:
+    """What the user approves. Shown on screen only - never logged."""
+    effect = shortcut.effect.format(clipboard=f"it holds: {', '.join(kinds)}")
+    if not shortcut.needs_active_window:
+        return f"press {shortcut.name} - {effect}"
+    window = f'window "{target.window.title}"' if target.window.title else "a window with no readable title"
+    if shortcut.check == shortcuts.CHECK_CLOSED:
+        return f"press {shortcut.name} on {window} - {effect}"
+    return f"press {shortcut.name} in {window} (field: {target.control_class or 'unknown'}) - {effect}"
+
+
+def _held_message(name: str, held: list[str]) -> str:
+    keys = " and ".join(held)
+    return (f"Didn't press {name}: {keys} {'is' if len(held) == 1 else 'are'} held down on the keyboard, which "
+            f"would change the shortcut. Let go and try again.")
+
+
+def _session_group_containing(handle: int):
+    """(app name, window group, expectation, relevant handles) for the session window group containing
+    `handle` that is still open, or None."""
+    with _session_lock:
+        groups = [(app, group) for app, app_groups in _session_windows.items() for group in app_groups]
+    for app, group in groups:
+        if handle in group:
+            expectation = verifier.expect_window(app)
+            open_windows = verifier.find_open(expectation, group)
+            if open_windows:
+                hosted = verifier.hosted_windows(expectation, frozenset(w.handle for w in open_windows))
+                return app, group, expectation, group | hosted
+    return None
+
+
+def _shortcut_baseline(shortcut, target: ActiveTarget, session_group) -> dict:
+    """What the check afterwards compares against, read just before the keys are sent."""
+    if shortcut.check in (shortcuts.CHECK_CLIPBOARD, shortcuts.CHECK_CUT):
+        return {"clipboard": verifier.clipboard_sequence(), "length": verifier.field_text_length(target.control_handle)}
+    if shortcut.check == shortcuts.CHECK_ACTIVE_CHANGED:
+        return {"active": target.window.handle if target.window else None}
+    return {}
+
+
+def _verify_shortcut(shortcut, target: ActiveTarget, baseline: dict, session_group):
+    """(ok, outcome, message) - done only on evidence. Raises EmergencyStopError if stopped while waiting."""
+    name, check = shortcut.name, shortcut.check
+    if check == shortcuts.CHECK_CLIPBOARD:
+        if baseline["clipboard"] is not None and verifier.wait_until(
+                lambda: _changed(verifier.clipboard_sequence(), baseline["clipboard"])):
+            return True, Outcome.DONE, f"Pressed {name}; the clipboard was updated."
+        return True, Outcome.UNVERIFIED, f"Pressed {name}, but I couldn't confirm the clipboard changed (maybe nothing was selected)."
+    if check == shortcuts.CHECK_CUT:
+        def cut_happened():
+            length = verifier.field_text_length(target.control_handle)
+            changed = _changed(verifier.clipboard_sequence(), baseline["clipboard"])
+            if changed is None or length is None or baseline["length"] is None:
+                return None
+            return changed and length < baseline["length"]
+        if verifier.wait_until(cut_happened):
+            return True, Outcome.DONE, f"Pressed {name}; the clipboard was updated and the field's text got shorter."
+        return True, Outcome.UNVERIFIED, f"Pressed {name}, but I couldn't confirm it cut anything."
+    if check == shortcuts.CHECK_SELECT_ALL:
+        selected = verifier.wait_until(lambda: verifier.everything_selected(target))
+        if selected:
+            return True, Outcome.DONE, f"Pressed {name}; everything in the field is selected."
+        if selected is None:
+            return True, Outcome.UNVERIFIED, f"Pressed {name}. I can't check the selection in this field."
+        return True, Outcome.UNVERIFIED, f"Pressed {name}, but I couldn't confirm everything is selected."
+    if check == shortcuts.CHECK_ACTIVE_CHANGED:
+        switched = verifier.wait_until(lambda: _active_changed(baseline["active"]))
+        if switched:
+            return True, Outcome.DONE, f"Pressed {name}; a different window is now active."
+        if switched is None:
+            return True, Outcome.UNVERIFIED, f"Pressed {name}, but I couldn't check which window is active."
+        return False, Outcome.FAILED, f"Pressed {name}, but the active window didn't change."
+    if check == shortcuts.CHECK_DESKTOP:
+        if verifier.wait_until(_desktop_active):
+            return True, Outcome.DONE, f"Pressed {name}; the desktop is showing."
+        return True, Outcome.UNVERIFIED, f"Pressed {name}, but I couldn't confirm the desktop is showing."
+    if check == shortcuts.CHECK_CLOSED:
+        _, _, expectation, relevant = session_group
+        closed = verifier.wait_for_windows_to_close(expectation, relevant)
+        if closed.ok:
+            return True, Outcome.DONE, f"Pressed {name}; the window closed after {closed.elapsed_seconds:.1f}s."
+        if closed.needs_user:
+            return False, Outcome.NEEDS_USER, closed.message
+        if closed.elapsed_seconds is None:  # the desktop couldn't be observed
+            return True, Outcome.UNVERIFIED, f"Pressed {name}, but {closed.message[0].lower()}{closed.message[1:]}"
+        return False, Outcome.STILL_OPEN, closed.message
+    return True, Outcome.UNVERIFIED, f"Pressed {name}. I can't check what it did."
+
+
+def _changed(now: int | None, before: int | None) -> bool | None:
+    return None if now is None or before is None else now != before
+
+
+def _active_changed(before: int | None) -> bool | None:
+    try:
+        now = verifier.active_target()
+    except verifier.VerifierUnavailableError:
+        return None
+    return (now.window.handle if now.window else None) != before
+
+
+def _desktop_active() -> bool | None:
+    try:
+        now = verifier.active_target()
+    except verifier.VerifierUnavailableError:
+        return None
+    return bool(now.window and now.window.class_name in _DESKTOP_CLASSES)
+
+
+def _release_note(shortcut) -> str:
+    """Make sure the shortcut's modifiers are released: check, release again if needed, check again.
+    Returns "" when released, otherwise an honest note for the user."""
+    if not shortcut.modifiers:
+        return ""
+
+    def released():
+        try:
+            return not any(m in shortcut.modifiers for m in verifier.modifiers_held())
+        except verifier.VerifierUnavailableError:
+            return None
+    if verifier.wait_until(released):
+        return ""
+    adapter.release_keys(shortcut.modifiers, shortcut.key)
+    if verifier.wait_until(released):
+        return ""
+    keys = " and ".join(m for m in shortcut.modifiers)
+    return f" {keys} may still be held down; press and release {'it' if len(shortcut.modifiers) == 1 else 'them'} once."
+
+
+# --- scroll -----------------------------------------------------------------------------
+
+_SCROLL = re.compile(r"(up|down)\s+([0-9]+)", re.IGNORECASE)
+_SCROLL_RISK_REASON = "scrolling over a control whose value the wheel changes"
+_UNCLASSIFIED_RISK_REASON = "scrolling a surface whose scroll area can't be identified"
+
+
+def _prepare_scroll(action: ExecutorAction):
+    target = " ".join(action.target.split()) if isinstance(action.target, str) else ""
+    parsed = _parse_scroll(target)
+    if isinstance(parsed, str):
+        return _result(action, False, parsed)
+    direction, requested = parsed
+    try:
+        limit, unclassified_limit, interval = _scroll_settings()
+    except SettingsError as exc:
+        return _result(action, False, str(exc))
+    if requested > limit:
+        return _result(action, False, f"That's {requested} notches; I scroll at most {limit} at once.")
+    try:
+        approved = verifier.active_target()
+        _, chain = verifier.control_chain_at_pointer()
+        held = verifier.modifiers_held()
+    except verifier.VerifierUnavailableError as exc:
+        return _result(action, False, f"Didn't scroll: I can't check the pointer or the active window ({exc}).")
+    if approved.window is None:
+        return _result(action, False, "Didn't scroll: there's no active window.")
+    if not chain or chain[-1].handle != approved.window.handle:
+        return _result(action, False, "The mouse pointer isn't over the active window, so I can't be sure which "
+                                      "window would scroll. Move the pointer over the window you want to scroll.")
+    if held:
+        return _result(action, False, _scroll_held_message(held))
+    region = verifier.scroll_region(chain)
+    planned = requested if region else min(requested, unclassified_limit)
+    value_control = verifier.value_changing_control(chain)
+    notches = _notches(planned)
+    title = f'window "{approved.window.title}"' if approved.window.title else "a window with no readable title"
+    if value_control:
+        description = (f"scroll {direction} {notches} over {value_control} in {title} - scrolling over it changes "
+                       f"its value")
+        safety_action = Action(description, minimum_level=RiskLevel.MEDIUM, minimum_reason=_SCROLL_RISK_REASON)
+    elif region is None:
+        asked = f" (you asked for {requested})" if planned < requested else ""
+        description = (f"scroll {direction} {notches} in {title} - I couldn't confidently identify this window's "
+                       f"scroll area, so for safety I'll send at most {unclassified_limit} notches{asked}")
+        safety_action = Action(description, minimum_level=RiskLevel.MEDIUM, minimum_reason=_UNCLASSIFIED_RISK_REASON)
+    else:  # a standard scroll bar positively identified: LOW, no prompt
+        safety_action = Action(f"scroll {direction} {notches}")
+    pane = chain[0].handle
+
+    def run() -> ActionResult:
+        before = verifier.scroll_state(region[0]) if region else None
+        sent = 0
+        for _ in range(planned):
+            reason = _scroll_target_changed(approved, pane)
+            if reason:
+                return _scrolling_stopped(action, sent, planned, reason)
+            if emergency_stop.is_stopped():  # checked last, immediately before the notch is sent
+                _stop_scrolling(action, sent, planned)
+            try:
+                accepted = adapter.send_wheel_notch(direction == "up")
+            except adapter.ExecutorAdapterError as exc:
+                return _scrolling_stopped(action, sent, planned, str(exc))
+            if not accepted:
+                return _scrolling_stopped(action, sent, planned, "Windows stopped accepting mouse input")
+            sent += 1
+            if sent < planned and emergency_stop.wait(interval):
+                _stop_scrolling(action, sent, planned)
+        cap_note = (f" I couldn't identify this window's scroll area, so I scrolled at most {unclassified_limit} "
+                    f"notches (you asked for {requested})." if planned < requested else "")
+        scrolled = f"Scrolled {direction} {_notches(sent)}"
+        if region is None or before is None:
+            return _result(action, True, f"{scrolled}. I can't read this window's scroll position, so I can't confirm "
+                                         f"it moved.{cap_note}", outcome=Outcome.UNVERIFIED, progress=(sent, requested))
+        try:
+            moved = verifier.wait_until(lambda: _scrolled_toward(region[0], before, direction),
+                                        "verifier.scroll_settle_seconds")
+        except EmergencyStopError:
+            _stop_scrolling(action, sent, planned)
+        if moved:
+            return _result(action, True, f"{scrolled}; the scroll position moved {direction}.{cap_note}",
+                           progress=(sent, requested))
+        at_end = before.at_top if direction == "up" else before.at_bottom
+        if at_end:
+            message = f"{scrolled}, but it was already at the {'top' if direction == 'up' else 'bottom'}, so nothing moved."
+        elif moved is None:
+            message = f"{scrolled}, but I couldn't read the scroll position afterwards."
+        else:
+            message = f"{scrolled}, but the scroll position didn't move {direction}."
+        return _result(action, True, message + cap_note, outcome=Outcome.UNVERIFIED, progress=(sent, requested))
+
+    return _Prepared(run, safety_action)
+
+
+def _parse_scroll(target: str) -> tuple[str, int] | str:
+    """("up"|"down", notches) or a message saying what's wrong."""
+    example = "For example: down 3."
+    if not target:
+        return f"Which way and how far should I scroll? {example}"
+    if target[0] in "+-" or target.lstrip("+-").isdigit():
+        return f"Say up or down instead of + or -. {example}"
+    words = target.lower().split()
+    if words[0] in ("left", "right"):
+        return "Horizontal scrolling isn't supported yet."
+    if words in (["up"], ["down"]):
+        return f"How many notches? {example}"
+    match = _SCROLL.fullmatch(target)
+    if not match:
+        return f"I can't read '{target}': say up or down and a number of notches. {example}"
+    count = int(match.group(2))
+    if count < 1:
+        return "Scroll at least 1 notch."
+    return match.group(1).lower(), count
+
+
+def _notches(count: int) -> str:
+    return f"{count} notch{'es' if count != 1 else ''}"
+
+
+def _scroll_settings() -> tuple[int, int, float]:
+    values = []
+    for name in ("executor.max_scroll_notches", "executor.max_unclassified_notches"):
+        value = get_setting(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise SettingsError(f"Setting '{name}' must be a whole number of at least 1, got {value!r}.")
+        values.append(value)
+    interval = get_setting("executor.scroll_interval_seconds")
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 0:
+        raise SettingsError(f"Setting 'executor.scroll_interval_seconds' must be a number of seconds (0 or more), "
+                            f"got {interval!r}.")
+    return values[0], values[1], float(interval)
+
+
+def _scroll_held_message(held: list[str]) -> str:
+    keys = " and ".join(held)
+    return (f"Didn't scroll: {keys} {'is' if len(held) == 1 else 'are'} held down on the keyboard, which would "
+            f"change what the wheel does (e.g. zoom). Let go and try again.")
+
+
+def _scroll_target_changed(approved: ActiveTarget, pane: int) -> str | None:
+    """Why scrolling must stop now, or None: the active window, the control under the pointer, or a held
+    modifier changed since validation."""
+    try:
+        active = verifier.active_target()
+        _, chain = verifier.control_chain_at_pointer()
+        held = verifier.modifiers_held()
+    except verifier.VerifierUnavailableError:
+        return "I couldn't check the pointer or the active window"
+    if active.window is None or active.window.handle != approved.window.handle:
+        return "the active window changed"
+    if not chain or chain[0].handle != pane:
+        return "the mouse pointer moved off what it was over"
+    if held:
+        return f"{' and '.join(held)} {'was' if len(held) == 1 else 'were'} pressed"
+    return None
+
+
+def _scrolled_toward(handle: int, before, direction: str) -> bool | None:
+    now = verifier.scroll_state(handle)
+    if now is None:
+        return None
+    return now.position < before.position if direction == "up" else now.position > before.position
+
+
+def _scrolling_stopped(action: ExecutorAction, sent: int, total: int, reason: str) -> ActionResult:
+    """Scrolling ended early, not by the emergency stop. Never retryable."""
+    if sent == 0:
+        return _result(action, False, f"Didn't scroll: {reason} before the first notch, so nothing scrolled.")
+    return _result(action, False, f"Scrolled {sent} of {_notches(total)}, then {reason}, so I stopped.",
+                   outcome=Outcome.PARTIAL, progress=(sent, total))
+
+
+def _stop_scrolling(action: ExecutorAction, sent: int, total: int):
+    """The emergency stop fired while scrolling: the plain EmergencyStopError before the first notch,
+    otherwise ActionInterruptedError carrying how far it scrolled."""
+    if sent == 0:
+        emergency_stop.check()
+    status = emergency_stop.status()
+    if sent < total:
+        result = _result(action, False, f"Emergency stop: scrolled {sent} of {_notches(total)} before stopping.",
+                         outcome=Outcome.PARTIAL, progress=(sent, total))
+    else:
+        result = _result(action, True, f"Emergency stop: scrolled all {_notches(total)}, then stopped before "
+                                       f"checking the scroll position.", outcome=Outcome.UNVERIFIED,
+                         progress=(sent, total))
+    raise ActionInterruptedError(f"Emergency stop is active (triggered by {status.source}); scrolling stopped after "
+                                 f"{_notches(sent)} of {total}.", result)
+
+
 # --- Helpers ----------------------------------------------------------------------------
 
 _PREPARERS = {OPEN_APP: _prepare_open_app, CLOSE_APP: _prepare_close_app, CLICK: _prepare_click,
-              TYPE_TEXT: _prepare_type_text}
+              TYPE_TEXT: _prepare_type_text, SHORTCUT: _prepare_shortcut, SCROLL: _prepare_scroll}
 
 
 def _max_attempts() -> int:

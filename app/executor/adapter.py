@@ -18,6 +18,15 @@ layout, Caps Lock or an input method, and any language or emoji types exactly. A
 Enter key press. Every call carries a key's down AND up events together, so an interruption between
 characters never leaves a key held down. Typed text never appears in an error message.
 
+Keyboard shortcuts use SendInput with virtual keys (plus scan codes), the WHOLE shortcut in one call:
+modifiers down, key down, key up, modifiers up in reverse. Windows never mixes other input into the
+events of one call. release_keys() is the defensive release: a key-up for every key involved, with an
+unassigned key tapped first when Alt or Win is involved, so releasing them alone doesn't open the menu
+bar or the Start menu.
+
+Scrolling sends one mouse-wheel notch per SendInput call, at the pointer's current position (no
+coordinates are sent and the pointer is never moved).
+
 Every function here performs a real action on the computer, so nothing may call it except
 app/executor/logic.py, which routes every action through app/safety first (CLAUDE.md rule 5).
 """
@@ -59,6 +68,10 @@ class MouseFailSafeError(ExecutorAdapterError):
 
 class ClickError(ExecutorAdapterError):
     """The click couldn't be sent. The message completes "I couldn't click: ..."."""
+
+
+class ShortcutError(ExecutorAdapterError):
+    """A shortcut couldn't be attempted at all (e.g. not on Windows). Nothing was sent."""
 
 
 class TypingError(ExecutorAdapterError):
@@ -188,7 +201,10 @@ class _KeyboardApi:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int]
         user32.SendInput.restype = wintypes.UINT
+        user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        user32.MapVirtualKeyW.restype = wintypes.UINT
         self.SendInput = user32.SendInput
+        self.MapVirtualKeyW = user32.MapVirtualKeyW
 
 
 _keyboard = None
@@ -199,3 +215,70 @@ def _keyboard_api() -> _KeyboardApi:
     if _keyboard is None:
         _keyboard = _KeyboardApi()
     return _keyboard
+
+
+_KEYEVENTF_EXTENDEDKEY = 0x0001
+_UNASSIGNED = "(unassigned)"
+_NAMED_KEYS = {"Ctrl": 0x11, "Alt": 0x12, "Shift": 0x10, "Win": 0x5B, "Tab": 0x09, "Esc": 0x1B, "Enter": 0x0D,
+               "Space": 0x20, "Delete": 0x2E, _UNASSIGNED: 0xE8}
+_EXTENDED_KEYS = {"Win", "Delete"}
+
+
+def send_shortcut(modifiers: tuple[str, ...], key: str) -> tuple[int, int]:
+    """Press a shortcut in ONE SendInput call: modifiers down (in order), key down, key up, modifiers up
+    (in reverse). Returns (events Windows accepted, events sent)."""
+    events = ([(m, False) for m in modifiers] + [(key, False), (key, True)]
+              + [(m, True) for m in reversed(modifiers)])
+    return _send_keys(events), len(events)
+
+
+def release_keys(modifiers: tuple[str, ...], key: str) -> bool:
+    """Defensive release of every key in a shortcut. Returns True if Windows accepted all of it."""
+    events = [(key, True)]
+    if "Alt" in modifiers or "Win" in modifiers:  # so a lone Alt/Win release opens no menu
+        events += [(_UNASSIGNED, False), (_UNASSIGNED, True)]
+    events += [(m, True) for m in reversed(modifiers)]
+    return _send_keys(events) == len(events)
+
+
+def _virtual_key(name: str) -> int:
+    if name in _NAMED_KEYS:
+        return _NAMED_KEYS[name]
+    if len(name) == 1 and name.isascii() and name.isalnum():
+        return ord(name.upper())
+    if name.startswith("F") and name[1:].isdigit() and 1 <= int(name[1:]) <= 24:
+        return 0x70 + int(name[1:]) - 1
+    raise ShortcutError(f"the key {name} has no key code")
+
+
+def _send_keys(events: list[tuple[str, bool]]) -> int:
+    """Send (key name, is_key_up) events in one SendInput call; returns how many Windows accepted."""
+    if sys.platform != "win32":
+        raise ShortcutError("keyboard shortcuts are only supported on Windows")
+    api = _keyboard_api()
+    inputs = (api.Input * len(events))()
+    for item, (name, key_up) in zip(inputs, events):
+        virtual_key = _virtual_key(name)
+        item.type = _INPUT_KEYBOARD
+        item.ki.wVk = virtual_key
+        item.ki.wScan = api.MapVirtualKeyW(virtual_key, 0) & 0xFFFF
+        item.ki.dwFlags = (_KEYEVENTF_KEYUP if key_up else 0) | (_KEYEVENTF_EXTENDEDKEY if name in _EXTENDED_KEYS else 0)
+    return int(api.SendInput(len(events), inputs, ctypes.sizeof(api.Input)))
+
+
+_INPUT_MOUSE = 0
+_MOUSEEVENTF_WHEEL = 0x0800
+_WHEEL_DELTA = 120  # one notch of a standard mouse wheel
+
+
+def send_wheel_notch(up: bool) -> bool:
+    """One vertical wheel notch at the pointer's position: up (away from the user) or down. Returns
+    True if Windows accepted it."""
+    if sys.platform != "win32":
+        raise ShortcutError("scrolling is only supported on Windows")
+    api = _keyboard_api()
+    inputs = (api.Input * 1)()
+    inputs[0].type = _INPUT_MOUSE
+    inputs[0].mi.dwFlags = _MOUSEEVENTF_WHEEL
+    inputs[0].mi.mouseData = _WHEEL_DELTA if up else (-_WHEEL_DELTA) & 0xFFFFFFFF
+    return api.SendInput(1, inputs, ctypes.sizeof(api.Input)) == 1

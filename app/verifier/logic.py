@@ -42,7 +42,8 @@ import time
 
 from app.executor import emergency_stop
 from app.verifier import adapter
-from app.verifier.models import ActiveTarget, Screen, VerificationResult, WindowExpectation, WindowInfo
+from app.verifier.models import (ActiveTarget, ControlInfo, Screen, ScrollState, VerificationResult,
+                                 WindowExpectation, WindowInfo)
 from config.settings import SettingsError, get_setting
 
 log = logging.getLogger(__name__)
@@ -227,6 +228,116 @@ def wait_for_typed_text(control_handle: int | None, text: str, count_before: int
             return TEXT_NOT_FOUND
         if emergency_stop.wait(min(poll, remaining)):
             emergency_stop.check()
+
+
+# --- Keyboard shortcuts: facts only; clipboard CONTENTS are never read ----------------------
+
+_EDIT_CLASSES = ("edit", "richedit")  # controls that answer EM_GETSEL
+
+
+def modifiers_held() -> list[str]:
+    """Which of Ctrl, Alt, Shift and Win are held down. Raises VerifierUnavailableError."""
+    return _observe(adapter.modifier_keys_down)
+
+
+def clipboard_sequence() -> int | None:
+    """The clipboard's change counter, or None if it can't be read. Reads no content."""
+    try:
+        return adapter.clipboard_sequence_number()
+    except adapter.VerifierAdapterError:
+        return None
+
+
+def clipboard_kinds() -> list[str]:
+    """Kinds of data on the clipboard ("text", "image", "files", "other data"). Raises
+    VerifierUnavailableError. Reads no content."""
+    return _observe(adapter.clipboard_kinds)
+
+
+def field_text_length(control_handle: int | None) -> int | None:
+    """Length of the field's text, or None if it can't be read."""
+    if not control_handle:
+        return None
+    try:
+        return adapter.text_length(control_handle)
+    except adapter.VerifierAdapterError:
+        return None
+
+
+def everything_selected(target: ActiveTarget) -> bool | None:
+    """True when a standard edit field has all its text selected, False when not, None when this
+    field can't report its selection."""
+    if not target.control_handle or not target.control_class.lower().startswith(_EDIT_CLASSES):
+        return None
+    try:
+        length = adapter.text_length(target.control_handle)
+        selected = adapter.selection(target.control_handle)
+    except adapter.VerifierAdapterError:
+        return None
+    if length is None or selected is None or length > 0xFFFF:  # EM_GETSEL can only report 65535
+        return None
+    return selected == (0, length)
+
+
+def wait_until(check, settle_setting: str = "verifier.shortcut_settle_seconds") -> bool | None:
+    """Poll check() - returning True, False, or None for "can't tell" - until it is True or the settle
+    time runs out. Returns True, or None if the last answer was "can't tell", else False. Raises
+    EmergencyStopError if stopped while waiting."""
+    settle = _positive_number(settle_setting)
+    poll = _positive_number("verifier.poll_interval_seconds")
+    start = _now()
+    while True:
+        answer = check()
+        if answer is True:
+            return True
+        remaining = settle - (_now() - start)
+        if remaining <= 0:
+            return answer
+        if emergency_stop.wait(min(poll, remaining)):
+            emergency_stop.check()
+
+
+# --- Scrolling: what is under the pointer, and a standard scroll bar's position ----------------
+
+# Standard Windows controls whose VALUE the mouse wheel changes, with how a prompt names them. Checked on
+# the control under the pointer AND its parents, so e.g. the Edit inside a ComboBox counts too.
+VALUE_CHANGING_CONTROLS = {
+    "combobox": "a drop-down list", "comboboxex32": "a drop-down list", "msctls_trackbar32": "a slider",
+    "msctls_updown32": "a spin box", "sysdatetimepick32": "a date picker",
+}
+
+
+def control_chain_at_pointer() -> tuple[tuple[int, int], list[ControlInfo]]:
+    """The pointer position and the control chain under it (control first, top-level window last).
+    Raises VerifierUnavailableError."""
+    position = _observe(adapter.cursor_position)
+    return position, _observe(adapter.control_chain_at, *position)
+
+
+def value_changing_control(chain: list[ControlInfo]) -> str | None:
+    """How a prompt names the first value-changing control in the chain, or None."""
+    for control in chain:
+        label = VALUE_CHANGING_CONTROLS.get(control.class_name.lower())
+        if label:
+            return label
+    return None
+
+
+def scroll_region(chain: list[ControlInfo]) -> tuple[int, ScrollState] | None:
+    """The first control in the chain with a readable standard vertical scroll bar, and its state -
+    a positively identified scrollable region - or None."""
+    for control in chain:
+        state = scroll_state(control.handle)
+        if state is not None:
+            return control.handle, state
+    return None
+
+
+def scroll_state(handle: int) -> ScrollState | None:
+    try:
+        return adapter.vertical_scroll(handle)
+    except adapter.VerifierAdapterError:
+        return None
 
 
 def _normalise(text: str) -> str:

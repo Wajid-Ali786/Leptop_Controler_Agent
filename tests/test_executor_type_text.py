@@ -4,8 +4,9 @@ active window's focused field, one character at a time.
 
 No real keyboard input is ever sent: the active window, the focused field's text and the typing
 itself are faked, and the real SendInput is blocked. The REAL safety gate and the REAL Verifier logic
-decide every action. A unique secret-like string checks that typed text never leaks into logs,
-repr(), results, errors or safety diagnostics.
+decide every action. A unique secret-like string checks that typed text never leaks into the
+confirmation prompt, logs, repr(), results, errors or safety diagnostics - and planted leaks prove that
+check really detects one.
 """
 import ast
 import logging
@@ -47,7 +48,6 @@ CONFIG = (
 NOTEPAD = WindowInfo(500, "Untitled - Notepad", "Notepad")
 FIELD = 501
 TARGET = ActiveTarget(NOTEPAD, FIELD, "Edit")
-ENTER = "⏎"
 SECRET = "zq7-S3CR3T-pw-4f1c9"  # unique: must never show up anywhere but the on-screen prompt
 
 
@@ -138,7 +138,7 @@ def test_text_is_confirmed_typed_and_verified(world):
     assert result.ok and result.verified and result.outcome is Outcome.DONE and not result.retryable
     assert result.progress == (11, 11)
     assert result.message == "Typed 11 characters and confirmed they appeared in the field."
-    assert prompts(world) == ['type 11 characters into window "Untitled - Notepad" (field: Edit): "hello world"']
+    assert prompts(world) == ['type 11 characters into window "Untitled - Notepad" (field: Edit)']
     assert (assessments(world)[0].level, assessments(world)[0].rule) == (RiskLevel.MEDIUM, logic._TYPING_RISK_REASON)
     assert "".join(world.desktop.sent()) == "hello world"
     assert world.calls[0][0] == "confirm"  # asked before anything was typed
@@ -222,7 +222,7 @@ def test_line_break_is_high_risk_and_the_prompt_says_enter_will_be_pressed(world
     type_text(world, "Hello from the AI Desktop Companion test\nline two")
     assert prompts(world) == [
         'type 49 characters into window "Untitled - Notepad" (field: Edit) AND PRESS ENTER 1 TIME - Enter can '
-        'submit a form, send a message or run a command: "Hello from the AI Desktop Companion test…"']
+        'submit a form, send a message or run a command']
     assert (assessments(world)[0].level, assessments(world)[0].rule) == (RiskLevel.HIGH, logic._ENTER_RISK_REASON)
     assert world.desktop.sent()[40] == "\n"  # a real Enter, sent as its own key press
 
@@ -232,17 +232,21 @@ def test_text_ending_with_enter_warns_it_will_submit(world):
     assert prompts(world) == [
         'type 15 characters into window "Untitled - Notepad" (field: Edit) AND PRESS ENTER 2 TIMES - Enter can '
         'submit a form, send a message or run a command (ends with Enter: it will submit as soon as typing '
-        f'finishes): "hi{ENTER}how are you{ENTER}"']
+        'finishes)']
 
 
-@pytest.mark.parametrize("text, preview", [
-    ("x" * 40, "x" * 40),
-    ("x" * 41, "x" * 40 + "…"),
-    ("line one\nline two", f"line one{ENTER}line two"),
+@pytest.mark.parametrize("first, second", [
+    ("hello world", "zzzzzzzzzzz"),
+    ("password123\nsend now", "aaaaaaaaaaa\nbbbbbbbb"),
+    ("x" * 60, "y" * 60),
 ])
-def test_prompt_preview_is_at_most_40_characters(world, text, preview):
-    type_text(world, text)
-    assert prompts(world)[0].endswith(f': "{preview}"')
+def test_prompt_is_identical_whatever_the_text_says(world, first, second):
+    """Same length and Enter presses -> the very same prompt: nothing of the text can be in it."""
+    type_text(world, first)
+    type_text(world, second)
+    first_prompt, second_prompt = prompts(world)
+    assert first_prompt == second_prompt
+    assert not any(word in first_prompt for word in ("hello", "password", "send now", "xxxx", "yyyy"))
 
 
 @pytest.mark.parametrize("target, where", [
@@ -252,7 +256,7 @@ def test_prompt_preview_is_at_most_40_characters(world, text, preview):
 def test_prompt_without_a_title_or_field(world, target, where):
     world.desktop.target = target
     type_text(world, "a")
-    assert prompts(world) == [f'type 1 character into {where}: "a"']
+    assert prompts(world) == [f'type 1 character into {where}']
 
 
 def test_risky_words_in_the_text_keep_the_typing_rule(world):
@@ -464,30 +468,29 @@ def test_partial_result_rules():
         ActionResult(action, True, "x", outcome=Outcome.PARTIAL, progress=(2, 5))
 
 
-# --- Typed text never leaks (only the on-screen prompt may preview it) ---
+# --- Typed text never leaks - not even into the confirmation prompt ---
+
+LEAK_SCENARIOS = ["done", "declined", "partial", "interrupted", "refused", "unverified", "invalid", "too-long"]
+
 
 def _no_secret(*things):
     for thing in things:
         assert SECRET not in str(thing) and SECRET not in repr(thing), f"secret leaked into {type(thing).__name__}"
 
 
-@pytest.mark.parametrize("scenario", ["done", "declined", "partial", "interrupted", "refused", "invalid", "too-long",
-                                      "late-in-text"])
-def test_typed_text_never_leaks(world, caplog, scenario):
+def _run_and_collect(world, caplog, scenario):
+    """Type text containing SECRET in `scenario`; return everything diagnostic that came out of it:
+    prompts, safety actions and assessments, results, errors, and every captured log record."""
     caplog.set_level(logging.DEBUG)
-    text = f"{SECRET} and more"
-    if scenario == "late-in-text":
-        text = "x" * 41 + SECRET  # beyond the 40-character preview: not even the prompt shows it
-    if scenario == "invalid":
-        text = f"{SECRET}\t"
-    if scenario == "too-long":
-        text = SECRET * 4
+    text = {"invalid": f"{SECRET}\t", "too-long": SECRET * 4}.get(scenario, f"{SECRET} and more")
     if scenario == "partial":
         world.desktop.on_target_read[6] = lambda: setattr(world.desktop, "target", ActiveTarget(None))
     if scenario == "interrupted":
         world.desktop.on_send[4] = lambda: emergency_stop.trigger("hotkey")
     if scenario == "refused":
         world.desktop.send_error_at[3] = adapter.TypingError("Windows didn't accept the keyboard input")
+    if scenario == "unverified":
+        world.desktop.app_shows_text = False
     action = ExecutorAction(TYPE_TEXT, text)
     outputs = [action, action.description, action.log_label]
     try:
@@ -495,12 +498,36 @@ def test_typed_text_never_leaks(world, caplog, scenario):
     except (ActionDeniedError, TypingInterruptedError) as exc:
         outputs += [exc, exc.args, getattr(exc, "result", None), getattr(exc, "assessment", None)]
     for _, safety_action, assessment in [c for c in world.calls if c[0] == "confirm"]:
-        outputs += [safety_action, assessment, assessment.rule]
-        if scenario == "late-in-text":
-            assert SECRET not in safety_action.description
-        else:
-            assert SECRET in safety_action.description  # proves the test would see a leak: the prompt has it
-    _no_secret(caplog.text, *outputs, *[r.getMessage() for r in caplog.records], *[r.args for r in caplog.records])
+        outputs += [safety_action, safety_action.description, assessment, assessment.rule]
+    return outputs + [caplog.text, *[r.getMessage() for r in caplog.records], *[r.args for r in caplog.records]]
+
+
+@pytest.mark.parametrize("scenario", LEAK_SCENARIOS)
+def test_typed_text_never_leaks(world, caplog, scenario):
+    outputs = _run_and_collect(world, caplog, scenario)
+    _no_secret(*outputs)
+    if scenario == "done":  # the secret really went through the pipeline: typed, and checked in the field
+        assert SECRET in "".join(world.desktop.sent()) and SECRET in world.desktop.field
+    if scenario not in ("invalid", "too-long"):
+        assert prompts(world), "a confirmation prompt was shown and checked"
+
+
+@pytest.mark.parametrize("leak", ["prompt", "log-and-repr", "result-message"])
+def test_the_leak_check_catches_a_planted_leak(world, caplog, monkeypatch, leak):
+    """Without this, test_typed_text_never_leaks could pass trivially. Each planted leak puts the text
+    somewhere the check must look, and the check must fail."""
+    if leak == "prompt":
+        real_prompt = logic._typing_prompt
+        monkeypatch.setattr(logic, "_typing_prompt", lambda *args: real_prompt(*args) + f": {SECRET}")
+    elif leak == "log-and-repr":
+        monkeypatch.setattr(ExecutorAction, "log_label", property(lambda self: self.target))
+    else:
+        real_result = logic._result
+        monkeypatch.setattr(logic, "_result", lambda action, ok, message, *args, **kwargs:
+                            real_result(action, ok, f"{message} [{action.target}]", *args, **kwargs))
+    outputs = _run_and_collect(world, caplog, "done")
+    with pytest.raises(AssertionError, match="secret leaked"):
+        _no_secret(*outputs)
 
 
 # --- Adapter: SendInput with Unicode characters (a fake SendInput - no real input) ---

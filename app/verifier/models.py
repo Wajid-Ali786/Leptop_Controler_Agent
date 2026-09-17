@@ -38,6 +38,30 @@ class ActiveTarget:
 
 
 @dataclass(frozen=True)
+class ControlInfo:
+    """A window or control, identified by handle and Windows class only (no text is read)."""
+    handle: int
+    class_name: str
+
+
+@dataclass(frozen=True)
+class ScrollState:
+    """A standard vertical scroll bar: position within minimum..maximum, with `page` units visible."""
+    position: int
+    minimum: int
+    maximum: int
+    page: int
+
+    @property
+    def at_top(self) -> bool:
+        return self.position <= self.minimum
+
+    @property
+    def at_bottom(self) -> bool:
+        return self.position + max(self.page, 1) - 1 >= self.maximum
+
+
+@dataclass(frozen=True)
 class WindowExpectation:
     """What 'this app opened' looks like: a NEW window whose title matches `pattern`."""
     app_name: str
