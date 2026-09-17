@@ -5,7 +5,8 @@ enabled or cloaked, which titled windows are hosted inside another window, where
 which window is at a screen point, where the mouse pointer is, which window and control have
 keyboard focus, the text and selection of a control, which modifier keys are held down, two facts
 about the clipboard, the chain of controls under a screen point, a standard scroll bar's
-position, and which program (executable file name) owns a window - and never changes anything. Reading a control's text asks the app for a
+position, which program (executable file name) owns a window, and a window's minimized/maximized
+state and style - and never changes anything. Reading a control's text asks the app for a
 copy (WM_GETTEXT, with a timeout so a hung app can't block); the text is returned to the caller
 only, never logged.
 
@@ -23,7 +24,7 @@ extra dependency and has no side effects.
 import ctypes
 import sys
 
-from app.verifier.models import ActiveTarget, ControlInfo, ScrollState, Screen, WindowInfo
+from app.verifier.models import ActiveTarget, ControlInfo, ScrollState, Screen, WindowInfo, WindowState
 
 _MAX_CLASS_NAME = 256  # Windows limits window class names to 256 characters
 _DWMWA_CLOAKED = 14    # "cloaked": the window exists and counts as visible, but isn't drawn on screen
@@ -39,6 +40,8 @@ _SB_VERT = 1
 _SIF_RANGE_PAGE_POS = 0x0001 | 0x0002 | 0x0004
 _MAX_CONTROL_DEPTH = 16  # a deterministic bound on how far up the parent chain is walked
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_GWL_STYLE, _GWL_EXSTYLE = -16, -20
+_WS_MINIMIZEBOX, _WS_MAXIMIZEBOX, _WS_EX_TOOLWINDOW = 0x00020000, 0x00010000, 0x00000080
 _MODIFIER_KEYS = {"Shift": (0x10,), "Ctrl": (0x11,), "Alt": (0x12,), "Win": (0x5B, 0x5C)}  # Win: left, right
 _CLIPBOARD_KINDS = [("text", (1, 7, 13)), ("image", (2, 8, 17)), ("files", (15,))]  # CF_* format numbers
 
@@ -234,6 +237,18 @@ def process_image_name(handle: int) -> str | None:
         api.kernel32.CloseHandle(process)
 
 
+def window_state(handle: int) -> WindowState | None:
+    """The window's minimized/maximized state and what it offers, or None if the window no longer exists."""
+    api = _api()
+    if not api.user32.IsWindow(handle):
+        return None
+    style = api.user32.GetWindowLongPtrW(handle, _GWL_STYLE)
+    extended = api.user32.GetWindowLongPtrW(handle, _GWL_EXSTYLE)
+    return WindowState(minimized=bool(api.user32.IsIconic(handle)), maximized=bool(api.user32.IsZoomed(handle)),
+                       has_minimize_box=bool(style & _WS_MINIMIZEBOX), has_maximize_box=bool(style & _WS_MAXIMIZEBOX),
+                       tool_window=bool(extended & _WS_EX_TOOLWINDOW), hung=bool(api.user32.IsHungAppWindow(handle)))
+
+
 def cursor_position() -> tuple[int, int]:
     """Where the mouse pointer is, in screen pixels."""
     api = _api()
@@ -290,6 +305,11 @@ class _Api:
             ("GetAncestor", [wintypes.HWND, wintypes.UINT], wintypes.HWND),
             ("GetCursorPos", [ctypes.POINTER(wintypes.POINT)], wintypes.BOOL),
             ("GetForegroundWindow", [], wintypes.HWND),
+            ("IsWindow", [wintypes.HWND], wintypes.BOOL),
+            ("IsIconic", [wintypes.HWND], wintypes.BOOL),
+            ("IsZoomed", [wintypes.HWND], wintypes.BOOL),
+            ("IsHungAppWindow", [wintypes.HWND], wintypes.BOOL),
+            ("GetWindowLongPtrW", [wintypes.HWND, ctypes.c_int], ctypes.c_ssize_t),
             ("GetDesktopWindow", [], wintypes.HWND),
             ("GetScrollInfo", [wintypes.HWND, ctypes.c_int, ctypes.POINTER(ScrollInfo)], wintypes.BOOL),
             ("GetAsyncKeyState", [ctypes.c_int], ctypes.c_short),

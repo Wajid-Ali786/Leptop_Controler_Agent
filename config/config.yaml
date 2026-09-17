@@ -73,6 +73,7 @@ verifier:
   text_settle_seconds: 1.0      # after typing, how long to look for the text in the field
   shortcut_settle_seconds: 1.0  # after a keyboard shortcut, how long to look for its effect
   scroll_settle_seconds: 1.0    # after scrolling, how long to look for the scroll position to move
+  window_state_settle_seconds: 2.0  # after minimize/maximize/restore, how long to wait for the window's state
   max_read_characters: 100000   # a field with more text than this isn't read back (typing stays unverified)
   # Title of each app's window (case-insensitive regular expression). Opening an app only counts
   # as done when a NEW window matching it appears; windows already open never count. Closing an app

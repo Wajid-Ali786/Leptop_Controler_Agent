@@ -21,6 +21,7 @@ from app.executor.logic import execute, execute_with_recovery
 from app.executor.models import CLOSE_APP, OPEN_APP, ActionResult, ExecutorAction, Outcome
 from app.safety import logic as safety_logic
 from app.safety.logic import ActionDeniedError
+from app.safety.models import RiskLevel
 from app.verifier import adapter as verifier_adapter
 from app.verifier.models import WindowInfo
 from config import settings
@@ -469,9 +470,18 @@ def test_window_group_without_a_frame_asks_every_window(world):
 
 def test_close_without_a_confirmation_method_is_denied(world):
     open_app("notepad")
-    with pytest.raises(ActionDeniedError, match="risky keyword 'close'"):
+    with pytest.raises(ActionDeniedError, match="closing a window can lose unsaved work"):
         close_app("notepad", confirm=None)
     assert close_requests(world) == []
+
+
+def test_close_stays_medium_even_when_close_is_not_a_configured_keyword(world):
+    """The MEDIUM minimum is a code constant: configuration can't lower it."""
+    world.config_path.write_text(CONFIG.replace("send, close]", "send]"), encoding="utf-8")
+    open_app("notepad")
+    levels = []
+    result = close_app("notepad", confirm=lambda action, assessment: levels.append(assessment.level) or True)
+    assert levels == [RiskLevel.MEDIUM] and result.outcome is Outcome.DONE
 
 
 def test_close_declined_by_the_user_sends_nothing(world):

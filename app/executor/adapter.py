@@ -5,6 +5,9 @@ start processes, or to send messages to other applications' windows (CLAUDE.md r
 Closing is always a polite request - the same message as clicking a window's X button - so the
 app can save or ask about unsaved work. Nothing here ends a process.
 
+Minimize, maximize and restore are polite requests too: WM_SYSCOMMAND with SC_MINIMIZE, SC_MAXIMIZE or
+SC_RESTORE, exactly what the window's title-bar buttons send, so the app handles them its own way.
+
 Clicking uses pyautogui, imported only when a click is actually sent. Its fail-safe stays ON: if the
 mouse pointer is in a corner of the main screen, pyautogui refuses to act - a physical emergency
 stop - and that is reported as MouseFailSafeError. pyautogui's built-in pause after each action is
@@ -68,6 +71,10 @@ class MouseFailSafeError(ExecutorAdapterError):
 
 class ClickError(ExecutorAdapterError):
     """The click couldn't be sent. The message completes "I couldn't click: ..."."""
+
+
+class WindowControlError(ExecutorAdapterError):
+    """A minimize/maximize/restore request couldn't be sent. The message completes "I couldn't ...: ..."."""
 
 
 class ShortcutError(ExecutorAdapterError):
@@ -282,3 +289,28 @@ def send_wheel_notch(up: bool) -> bool:
     inputs[0].mi.dwFlags = _MOUSEEVENTF_WHEEL
     inputs[0].mi.mouseData = _WHEEL_DELTA if up else (-_WHEEL_DELTA) & 0xFFFFFFFF
     return api.SendInput(1, inputs, ctypes.sizeof(api.Input)) == 1
+
+
+_WM_SYSCOMMAND = 0x0112
+_SYSTEM_COMMANDS = {"minimize": 0xF020, "maximize": 0xF030, "restore": 0xF120}  # SC_MINIMIZE / SC_MAXIMIZE / SC_RESTORE
+
+
+def request_window_state(handle: int, operation: str) -> None:
+    """Ask window `handle` to minimize, maximize or restore, like clicking its title-bar button. Returns once
+    the request is queued; the Verifier reads the resulting state."""
+    if sys.platform != "win32":
+        raise WindowControlError("window controls are only supported on Windows")
+    command = _SYSTEM_COMMANDS[operation]
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+    if user32.PostMessageW(handle, _WM_SYSCOMMAND, command, 0):
+        return
+    error = ctypes.get_last_error()
+    if error == _WINDOWS_INVALID_WINDOW:
+        raise WindowGoneError("the window is already closed")
+    if error == _WINDOWS_ACCESS_DENIED:
+        raise WindowControlError("it runs with administrator rights, and the assistant doesn't run elevated")
+    raise WindowControlError(f"Windows refused the request (error {error})")

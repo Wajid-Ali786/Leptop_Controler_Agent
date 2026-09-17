@@ -18,8 +18,8 @@ execute_with_recovery() adds the Action -> Result -> Recovery loop (docs/build-p
 a retryable failure is OFFERED for retry - never silently continued - and every retry runs the
 whole pipeline again, safety gate and verification included.
 
-Phase 1 is built one action at a time: open_app, close_app, click, type_text, shortcut, scroll, then
-refresh.
+Phase 1 is built one action at a time: open_app, close_app, click, type_text, shortcut, scroll, refresh,
+then window_control.
 
 close_app closes ONLY windows the assistant opened in this session. open_app remembers them in
 memory, so nothing carries over a restart, and windows the user opened are never touched. Closing
@@ -27,6 +27,9 @@ is a polite request (like clicking the window's X), never ending a process, and 
 distinct (models.Outcome): a window already gone is ALREADY_CLOSED, one showing a dialog such as
 "Save changes?" is NEEDS_USER, and one that stays open is STILL_OPEN. Neither of the last two is
 ever retryable, so the recovery loop can't retry into an app that is waiting for the user.
+Closing is always at least MEDIUM (a code constant). close_app and window_control close both resolve a window
+group from this session's records, go through execute() (one confirmation), and then run the ONE close
+mechanism, _close_session_group() - which also re-checks that the group belongs to this session.
 
 click (by screen coordinates) is the Phase 1 last-resort fallback - no screen understanding yet:
   - validation: whole-number "x, y" that lies on an actual monitor (gaps between monitors don't
@@ -64,8 +67,7 @@ type_text types exact text into the ACTIVE window's focused field:
 shortcut presses one keyboard shortcut from the fixed allow-list in app/executor/shortcuts.py, whose
 risk levels decide confirmation (LOW runs without asking; MEDIUM and HIGH always ask):
   - validation: a supported name; an active window where the shortcut acts on one; no modifier held
-    down on the keyboard; something on the clipboard for Ctrl+V; Alt+F4 only on a window the assistant
-    opened in this session, and never with the desktop or taskbar active
+    down on the keyboard; something on the clipboard for Ctrl+V (Alt+F4 is refused: see close)
   - after confirmation: if the active window, its title or its field changed, nothing is pressed
   - the whole shortcut is ONE SendInput call (modifiers down, key down, key up, modifiers up), right
     after the last emergency-stop check - so a stop can't leave keys down
@@ -73,8 +75,7 @@ risk levels decide confirmation (LOW runs without asking; MEDIUM and HIGH always
     and the result is UNVERIFIED; all -> the shortcut's own check. Afterwards the modifiers must read as
     released (released again if not; an honest note if still down)
   - DONE only on evidence (clipboard change counter, full selection in an edit field, a different
-    active window, the desktop active, the window group closed); otherwise UNVERIFIED; Alt+Tab that
-    visibly didn't switch is FAILED; Alt+F4 can also be NEEDS_USER or STILL_OPEN
+    active window, the desktop active); otherwise UNVERIFIED; Alt+Tab that visibly didn't switch is FAILED
   - never retryable; clipboard contents are never read; window titles and clipboard details appear only
     in the on-screen prompt, never in logs or results
 
@@ -108,6 +109,20 @@ refused before the safety gate (Electron apps share Chrome's window class, and F
 F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R are refused as keyboard shortcuts, so this is the only way to
 send a refresh key.
 
+window_control minimizes, maximizes, restores or closes the ACTIVE window:
+  - refused before the safety gate: no active window, the desktop or taskbar, a tool window, a window that
+    isn't responding; minimize only if the window offers it, maximize only if it offers it
+  - minimize / maximize / restore are LOW: a WM_SYSCOMMAND request (what the title-bar buttons send), with
+    the window's identity (handle + executable + top-level class, not the title) re-checked and the
+    emergency stop checked immediately before sending. Already in the requested state -> DONE, nothing
+    sent; state read back as requested -> DONE; unreadable afterwards -> UNVERIFIED; readable but not changed
+    within verifier.window_state_settle_seconds, or the window vanished -> FAILED. "restore" means a normal
+    (neither minimized nor maximized) window
+  - close delegates to close_app's mechanism: only a window group this session opened, MEDIUM, one
+    confirmation, then _close_session_group (DONE / NEEDS_USER / STILL_OPEN / FAILED)
+  - never retryable; logs never contain window titles (only the close prompt shows one, on screen)
+Alt+F4 is refused as a keyboard shortcut, so closing has exactly one mechanism.
+
 Measured real-desktop behavior and known open decisions: docs/step4 Section 4, implementation notes.
 """
 import logging
@@ -119,8 +134,8 @@ from typing import Callable
 
 from app.executor import adapter, emergency_stop, shortcuts
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError, TypingInterruptedError
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, ActionResult,
-                                 ExecutorAction, Outcome)
+from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL,
+                                 ActionResult, ExecutorAction, Outcome)
 from app.safety.logic import Confirm, authorize
 from app.safety.models import Action, RiskLevel
 from app.verifier import logic as verifier
@@ -249,6 +264,21 @@ def _configured_apps() -> dict[str, str]:
 
 # --- close_app --------------------------------------------------------------------------
 
+# Closing can lose unsaved work: always at least MEDIUM - a code constant, so configuration can't lower it. Other
+# safety rules may still raise it (the gate takes the higher of the two).
+_CLOSE_RISK = RiskLevel.MEDIUM
+_CLOSE_RISK_REASON = "closing a window can lose unsaved work"
+
+
+@dataclass(frozen=True)
+class _SessionGroup:
+    """A window group the assistant opened in this session. Created only by _open_session_group and
+    _session_group_containing, which resolve it from the session's own records - never from a raw handle."""
+    app: str
+    group: frozenset[int]
+    expectation: WindowExpectation
+
+
 def _prepare_close_app(action: ExecutorAction):
     name = action.target.strip().lower()
     if not name:
@@ -270,40 +300,56 @@ def _prepare_close_app(action: ExecutorAction):
             return _nothing_of_mine_to_close(action, name, expectation)
     except verifier.VerifierUnavailableError as exc:
         return _cant_check(action, name, exc)
+    session = _SessionGroup(name, group, expectation)
+    safety_action = Action(action.description, minimum_level=_CLOSE_RISK, minimum_reason=_CLOSE_RISK_REASON)
+    return _Prepared(lambda: _close_session_group(action, session), safety_action)
 
-    def run() -> ActionResult:
-        try:
-            still_open = verifier.find_open(expectation, group)  # it may have closed during confirmation
-        except verifier.VerifierUnavailableError as exc:
-            return _cant_check(action, name, exc)
-        if not still_open:
-            _forget(name, group)
-            return _result(action, True, f"{name} is already closed.", outcome=Outcome.ALREADY_CLOSED)
-        try:
-            # Titled windows inside the group (a Store app's content window) must be gone too: they move
-            # out of the frame as a separate window while the app closes.
-            relevant = group | verifier.hosted_windows(expectation, frozenset(w.handle for w in still_open))
-        except verifier.VerifierUnavailableError as exc:
-            return _cant_check(action, name, exc)
-        failure = _request_close(name, still_open)
-        if failure:
-            return _result(action, False, failure)
-        try:
-            check = verifier.wait_for_windows_to_close(expectation, relevant)
-        except EmergencyStopError:
-            log.warning("Emergency stop while verifying close_app '%s': the close request was already sent "
-                        "and can't be taken back; stopped waiting to verify it", name)
-            raise
-        if check.ok:
-            _forget(name, group)
-            return _result(action, True, f"Closed {name} after {check.elapsed_seconds:.1f}s.")
-        if check.needs_user:
-            return _result(action, False, check.message, outcome=Outcome.NEEDS_USER)
-        if check.elapsed_seconds is None:  # the desktop couldn't be observed, so nothing is known
-            return _result(action, False, check.message)
-        return _result(action, False, check.message, outcome=Outcome.STILL_OPEN)
 
-    return run
+def _close_session_group(action: ExecutorAction, session: _SessionGroup) -> ActionResult:
+    """THE close mechanism - the only code that sends a close request. Call it only from the run() of a close
+    action that went through execute() (so it was validated and confirmed there, exactly once), with a group
+    resolved from this session's records. It asks nothing itself. As a defensive check it refuses any group
+    that isn't (still) one this session opened, so it can never close an unrelated window."""
+    name, group, expectation = session.app, session.group, session.expectation
+    if not _owned_by_session(session):
+        log.warning("Close refused: the window group isn't one this session opened")
+        return _result(action, False, "I only close windows I opened in this session, so I left it alone.")
+    try:
+        still_open = verifier.find_open(expectation, group)  # it may have closed during confirmation
+    except verifier.VerifierUnavailableError as exc:
+        return _cant_check(action, name, exc)
+    if not still_open:
+        _forget(name, group)
+        return _result(action, True, f"{name} is already closed.", outcome=Outcome.ALREADY_CLOSED)
+    try:
+        # Titled windows inside the group (a Store app's content window) must be gone too: they move
+        # out of the frame as a separate window while the app closes.
+        relevant = group | verifier.hosted_windows(expectation, frozenset(w.handle for w in still_open))
+    except verifier.VerifierUnavailableError as exc:
+        return _cant_check(action, name, exc)
+    emergency_stop.check()  # last checkpoint before the close request is sent
+    failure = _request_close(name, still_open)
+    if failure:
+        return _result(action, False, failure)
+    try:
+        check = verifier.wait_for_windows_to_close(expectation, relevant)
+    except EmergencyStopError:
+        log.warning("Emergency stop while verifying a close of '%s': the close request was already sent "
+                    "and can't be taken back; stopped waiting to verify it", name)
+        raise
+    if check.ok:
+        _forget(name, group)
+        return _result(action, True, f"Closed {name} after {check.elapsed_seconds:.1f}s.")
+    if check.needs_user:
+        return _result(action, False, check.message, outcome=Outcome.NEEDS_USER)
+    if check.elapsed_seconds is None:  # the desktop couldn't be observed, so nothing is known
+        return _result(action, False, check.message)
+    return _result(action, False, check.message, outcome=Outcome.STILL_OPEN)
+
+
+def _owned_by_session(session: _SessionGroup) -> bool:
+    with _session_lock:
+        return session.group in _session_windows.get(session.app, [])
 
 
 def _request_close(name: str, windows: list[WindowInfo]) -> str | None:
@@ -612,20 +658,6 @@ def _prepare_shortcut(action: ExecutorAction):
         return _result(action, False, _held_message(name, held))
     if name == "Ctrl+V" and not kinds:
         return _result(action, False, "The clipboard is empty, so there's nothing to paste.")
-    session_group = None
-    if shortcut.check == shortcuts.CHECK_CLOSED:
-        if approved.window.class_name in _SHELL_CLASSES:
-            return _result(action, False, f"{name} with the desktop or taskbar active opens the Shut Down dialog, "
-                                          f"so I won't press it.")
-        try:
-            session_group = _session_group_containing(approved.window.handle)
-        except verifier.VerifierUnavailableError as exc:
-            return _result(action, False, f"Didn't press {name}: I can't check the active window ({exc}).")
-        except SettingsError as exc:
-            return _result(action, False, str(exc))
-        if session_group is None:
-            return _result(action, False, f"I only press {name} on windows I opened in this session, and the active "
-                                          f"window isn't one of them, so I left it alone.")
     if shortcut.risk > RiskLevel.LOW:
         description = _shortcut_prompt(shortcut, approved, kinds)
     else:  # LOW runs without a prompt, so the gate sees no window title at all
@@ -642,7 +674,7 @@ def _prepare_shortcut(action: ExecutorAction):
             return _result(action, False, f"The active window changed after you approved, so I didn't press {name}.")
         if held_now:
             return _result(action, False, _held_message(name, held_now))
-        baseline = _shortcut_baseline(shortcut, now, session_group)
+        baseline = _shortcut_baseline(shortcut, now)
         emergency_stop.check()  # last checkpoint before the keys are sent
         try:
             accepted, expected = adapter.send_shortcut(shortcut.modifiers, shortcut.key)
@@ -657,12 +689,10 @@ def _prepare_shortcut(action: ExecutorAction):
                                          f"{_release_note(shortcut)}", outcome=Outcome.UNVERIFIED)
         try:
             note = _release_note(shortcut)
-            ok, outcome, message = _verify_shortcut(shortcut, now, baseline, session_group)
+            ok, outcome, message = _verify_shortcut(shortcut, now, baseline)
         except EmergencyStopError:
             log.warning("Emergency stop while checking shortcut %s: the keys were already sent and released", name)
             raise
-        if outcome is Outcome.DONE and session_group:
-            _forget(*session_group[:2])
         return _result(action, ok, message + note, outcome=outcome)
 
     return _Prepared(run, safety_action)
@@ -674,8 +704,6 @@ def _shortcut_prompt(shortcut, target: ActiveTarget, kinds: list[str]) -> str:
     if not shortcut.needs_active_window:
         return f"press {shortcut.name} - {effect}"
     window = f'window "{target.window.title}"' if target.window.title else "a window with no readable title"
-    if shortcut.check == shortcuts.CHECK_CLOSED:
-        return f"press {shortcut.name} on {window} - {effect}"
     return f"press {shortcut.name} in {window} (field: {target.control_class or 'unknown'}) - {effect}"
 
 
@@ -685,22 +713,7 @@ def _held_message(name: str, held: list[str]) -> str:
             f"would change the shortcut. Let go and try again.")
 
 
-def _session_group_containing(handle: int):
-    """(app name, window group, expectation, relevant handles) for the session window group containing
-    `handle` that is still open, or None."""
-    with _session_lock:
-        groups = [(app, group) for app, app_groups in _session_windows.items() for group in app_groups]
-    for app, group in groups:
-        if handle in group:
-            expectation = verifier.expect_window(app)
-            open_windows = verifier.find_open(expectation, group)
-            if open_windows:
-                hosted = verifier.hosted_windows(expectation, frozenset(w.handle for w in open_windows))
-                return app, group, expectation, group | hosted
-    return None
-
-
-def _shortcut_baseline(shortcut, target: ActiveTarget, session_group) -> dict:
+def _shortcut_baseline(shortcut, target: ActiveTarget) -> dict:
     """What the check afterwards compares against, read just before the keys are sent."""
     if shortcut.check in (shortcuts.CHECK_CLIPBOARD, shortcuts.CHECK_CUT):
         return {"clipboard": verifier.clipboard_sequence(), "length": verifier.field_text_length(target.control_handle)}
@@ -709,7 +722,7 @@ def _shortcut_baseline(shortcut, target: ActiveTarget, session_group) -> dict:
     return {}
 
 
-def _verify_shortcut(shortcut, target: ActiveTarget, baseline: dict, session_group):
+def _verify_shortcut(shortcut, target: ActiveTarget, baseline: dict):
     """(ok, outcome, message) - done only on evidence. Raises EmergencyStopError if stopped while waiting."""
     name, check = shortcut.name, shortcut.check
     if check == shortcuts.CHECK_CLIPBOARD:
@@ -745,16 +758,6 @@ def _verify_shortcut(shortcut, target: ActiveTarget, baseline: dict, session_gro
         if verifier.wait_until(_desktop_active):
             return True, Outcome.DONE, f"Pressed {name}; the desktop is showing."
         return True, Outcome.UNVERIFIED, f"Pressed {name}, but I couldn't confirm the desktop is showing."
-    if check == shortcuts.CHECK_CLOSED:
-        _, _, expectation, relevant = session_group
-        closed = verifier.wait_for_windows_to_close(expectation, relevant)
-        if closed.ok:
-            return True, Outcome.DONE, f"Pressed {name}; the window closed after {closed.elapsed_seconds:.1f}s."
-        if closed.needs_user:
-            return False, Outcome.NEEDS_USER, closed.message
-        if closed.elapsed_seconds is None:  # the desktop couldn't be observed
-            return True, Outcome.UNVERIFIED, f"Pressed {name}, but {closed.message[0].lower()}{closed.message[1:]}"
-        return False, Outcome.STILL_OPEN, closed.message
     return True, Outcome.UNVERIFIED, f"Pressed {name}. I can't check what it did."
 
 
@@ -1069,11 +1072,163 @@ def _refresh_held_message(held: list[str]) -> str:
             f"what F5 does (e.g. a hard reload). Let go and try again.")
 
 
+# --- window_control ---------------------------------------------------------------------
+
+_WINDOW_OPERATIONS = ("minimize", "maximize", "restore", "close")
+_PAST = {"minimize": "minimized", "maximize": "maximized", "restore": "restored"}
+
+
+def _prepare_window_control(action: ExecutorAction):
+    target = " ".join(action.target.lower().split()) if isinstance(action.target, str) else ""
+    if not target:
+        return _result(action, False, "Which window control? minimize, maximize, restore or close.")
+    if target not in _WINDOW_OPERATIONS:
+        return _result(action, False, f"I can't do '{action.target.strip()}' to a window. Window controls: minimize, "
+                                      f"maximize, restore or close.")
+    operation = target
+    try:
+        approved = verifier.active_target()
+        state = verifier.window_state(approved.window.handle) if approved.window else None
+    except verifier.VerifierUnavailableError as exc:
+        return _result(action, False, f"Didn't {operation} anything: I can't check the active window ({exc}).")
+    if approved.window is None:
+        return _result(action, False, f"Didn't {operation} anything: there's no active window.")
+    if approved.window.class_name in _SHELL_CLASSES:
+        return _result(action, False, f"The desktop or taskbar is active, so I didn't {operation} anything.")
+    if state is None:
+        return _result(action, False, f"The active window closed before I could {operation} it.")
+    if state.tool_window:
+        return _result(action, False, f"The active window is a tool window, so I didn't {operation} it.")
+    if state.hung:
+        return _result(action, False, f"The active window isn't responding, so I didn't {operation} it.")
+    identity = _window_control_identity(approved)
+
+    if operation == "close":
+        try:
+            session = _session_group_containing(approved.window.handle)
+        except verifier.VerifierUnavailableError as exc:
+            return _result(action, False, f"Didn't close anything: I can't check the active window ({exc}).")
+        except SettingsError as exc:
+            return _result(action, False, str(exc))
+        if session is None:
+            return _result(action, False, "I only close windows I opened in this session, and the active window isn't "
+                                          "one of them, so I left it alone.")
+        title = f'window "{approved.window.title}"' if approved.window.title else "a window with no readable title"
+        safety_action = Action(f"close {title} ({session.app}, opened by the assistant this session) - closing can "
+                               f"lose unsaved work", minimum_level=_CLOSE_RISK, minimum_reason=_CLOSE_RISK_REASON)
+
+        def run_close() -> ActionResult:
+            changed = _window_control_changed(action, identity, "close")
+            return changed or _close_session_group(action, session)
+
+        return _Prepared(run_close, safety_action)
+
+    if (operation == "minimize" and not state.has_minimize_box) or (operation == "maximize" and not state.has_maximize_box):
+        return _result(action, False, f"This window doesn't offer {operation}, so I didn't change it.")
+    handle = approved.window.handle
+
+    def run() -> ActionResult:
+        changed = _window_control_changed(action, identity, operation)
+        if changed:
+            return changed
+        try:
+            now = verifier.window_state(handle)
+        except verifier.VerifierUnavailableError as exc:
+            return _result(action, False, f"Didn't {operation} the window: I can't check it ({exc}).")
+        if now is None:
+            return _result(action, False, f"The window closed before I could {operation} it.")
+        if _in_requested_state(now, operation):
+            return _result(action, True, f"The window is already {_PAST[operation]}, so I didn't change anything.")
+        emergency_stop.check()  # last checkpoint before the request is sent
+        try:
+            adapter.request_window_state(handle, operation)
+        except adapter.WindowGoneError:
+            return _result(action, False, f"The window closed before I could {operation} it.")
+        except adapter.ExecutorAdapterError as exc:
+            return _result(action, False, f"I couldn't {operation} the window: {exc}.")
+        try:
+            verifier.wait_until(lambda: _state_settled(handle, operation), "verifier.window_state_settle_seconds")
+            final = verifier.window_state(handle)
+        except EmergencyStopError:
+            log.warning("Emergency stop while checking window_control %s: the request was already sent and can't be "
+                        "taken back", operation)
+            raise
+        except verifier.VerifierUnavailableError:
+            final = _UNREADABLE
+        if final is _UNREADABLE:
+            return _result(action, True, f"I asked the window to {operation}, but I couldn't read its state afterwards.",
+                           outcome=Outcome.UNVERIFIED)
+        if final is None:
+            return _result(action, False, "The window closed during the action.")
+        if _in_requested_state(final, operation):
+            return _result(action, True, f"{_PAST[operation].capitalize()} the window.")
+        return _result(action, False, f"I asked the window to {operation}, but it didn't {operation} within "
+                                      f"{_window_state_settle_seconds():g} seconds.")
+
+    return _Prepared(run, Action(f"{operation} the active window"))
+
+
+_UNREADABLE = object()
+
+
+def _window_control_identity(target: ActiveTarget) -> tuple | None:
+    """Handle + executable + top-level class. Deliberately not the title: titles change by themselves."""
+    if target.window is None:
+        return None
+    return target.window.handle, verifier.process_name(target.window.handle), target.window.class_name
+
+
+def _window_control_changed(action: ExecutorAction, identity: tuple, operation: str) -> ActionResult | None:
+    """A FAILED result if the active window is no longer the one captured at validation, else None."""
+    try:
+        now = verifier.active_target()
+    except verifier.VerifierUnavailableError as exc:
+        return _result(action, False, f"Didn't {operation} the window: I can't check the active window ({exc}).")
+    if _window_control_identity(now) != identity:
+        return _result(action, False, f"The active window changed, so I didn't {operation} it.")
+    return None
+
+
+def _in_requested_state(state, operation: str) -> bool:
+    if operation == "minimize":
+        return state.minimized
+    if operation == "maximize":
+        return state.maximized
+    return not state.minimized and not state.maximized  # restore: a normal window
+
+
+def _state_settled(handle: int, operation: str) -> bool | None:
+    """True once the window reached the requested state or is gone; None if it can't be read."""
+    try:
+        state = verifier.window_state(handle)
+    except verifier.VerifierUnavailableError:
+        return None
+    return state is None or _in_requested_state(state, operation)
+
+
+def _window_state_settle_seconds() -> float:
+    value = get_setting("verifier.window_state_settle_seconds")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def _session_group_containing(handle: int) -> _SessionGroup | None:
+    """The session window group containing `handle` that is still open, or None. Raises
+    VerifierUnavailableError or SettingsError."""
+    with _session_lock:
+        groups = [(app, group) for app, app_groups in _session_windows.items() for group in app_groups]
+    for app, group in groups:
+        if handle in group:
+            expectation = verifier.expect_window(app)
+            if verifier.find_open(expectation, group):
+                return _SessionGroup(app, group, expectation)
+    return None
+
+
 # --- Helpers ----------------------------------------------------------------------------
 
 _PREPARERS = {OPEN_APP: _prepare_open_app, CLOSE_APP: _prepare_close_app, CLICK: _prepare_click,
               TYPE_TEXT: _prepare_type_text, SHORTCUT: _prepare_shortcut, SCROLL: _prepare_scroll,
-              REFRESH: _prepare_refresh}
+              REFRESH: _prepare_refresh, WINDOW_CONTROL: _prepare_window_control}
 
 
 def _max_attempts() -> int:

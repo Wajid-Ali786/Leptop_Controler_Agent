@@ -23,10 +23,8 @@ Levels (the safety gate asks for confirmation at MEDIUM and above):
                  every following action lands there
   HIGH   Ctrl+V  puts unknown clipboard content into the active window: pasted lines can run as
                  commands in a terminal, and pasted files are copied in File Explorer
-         Alt+F4  closes the active window (some apps don't ask to save); only allowed on a window the
-                 assistant opened in this session, and never with the desktop or taskbar active,
-                 where it opens the Shut Down dialog
-F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R are refused here: refreshing goes only through the Refresh
+Alt+F4 is refused here: closing a window goes only through close_app or window control close, which share
+one close mechanism (only windows this assistant opened, a polite close request, verified). F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R are refused here: refreshing goes only through the Refresh
 action, which first identifies the app (F5 debugs in code editors, Ctrl+R replies in Outlook). Ctrl+Alt+Delete
 and Win+L are reserved and never sent.
 """
@@ -43,7 +41,6 @@ CHECK_CUT = "cut"                     # clipboard changed AND the field's text g
 CHECK_SELECT_ALL = "select_all"       # a standard edit field reports everything selected
 CHECK_ACTIVE_CHANGED = "active_changed"  # a different window is active
 CHECK_DESKTOP = "desktop"             # the desktop is the active window
-CHECK_CLOSED = "closed"               # the window group is gone (close_app's check)
 
 
 @dataclass(frozen=True)
@@ -96,8 +93,6 @@ SUPPORTED: dict[str, Shortcut] = {s.name: s for s in [
     _shortcut("Ctrl+V", RiskLevel.HIGH, "pastes clipboard content the assistant can't see",
               "pastes the clipboard ({clipboard}). I can't see what's on it; pasting into a terminal or chat can "
               "run or send it", True, CHECK_NONE),
-    _shortcut("Alt+F4", RiskLevel.HIGH, "closes the active window",
-              "closes it; unsaved work may be lost if the app doesn't ask", True, CHECK_CLOSED),
 ]}
 
 _RESERVED = {
@@ -108,6 +103,8 @@ _RESERVED = {
 _REFRESH_MESSAGE = ("{name} isn't available as a shortcut. Use the Refresh action instead: it checks which app is "
                     "active first, because these keys do different things in different apps.")
 _DEFERRED = {name: _REFRESH_MESSAGE.format(name=name) for name in ("F5", "Ctrl+R", "Ctrl+F5", "Shift+F5", "Ctrl+Shift+R")}
+_DEFERRED["Alt+F4"] = ("Alt+F4 isn't available as a shortcut. To close a window, use close_app or window control "
+                       "close: they only close windows this assistant opened, and confirm they closed.")
 
 
 def parse(text: str) -> Shortcut | ShortcutRefusal:

@@ -62,6 +62,17 @@ class ScrollState:
 
 
 @dataclass(frozen=True)
+class WindowState:
+    """What Windows reports about a top-level window's state and what it offers."""
+    minimized: bool
+    maximized: bool
+    has_minimize_box: bool
+    has_maximize_box: bool
+    tool_window: bool
+    hung: bool
+
+
+@dataclass(frozen=True)
 class WindowExpectation:
     """What 'this app opened' looks like: a NEW window whose title matches `pattern`."""
     app_name: str

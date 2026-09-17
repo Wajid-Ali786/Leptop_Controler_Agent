@@ -27,8 +27,8 @@ marks it unmodified before closing it with close_app. If a "Save changes?" dialo
 test answers Don't Save on its own Notepad.
 
 The shortcut test stays inside a Notepad the test opened: it types "abc", presses Ctrl+A (LOW - it must
-not ask), Ctrl+Z (MEDIUM, approved), empties the Notepad as test code, and closes it with Alt+F4 (HIGH,
-approved, allowed because the assistant opened that window). It never touches the clipboard, other
+not ask), Ctrl+Z (MEDIUM, approved), empties the Notepad as test code, and closes it with window control
+close (MEDIUM, approved - Alt+F4 is no longer a shortcut). It never touches the clipboard, other
 windows, Alt+Tab or Win+D. The clipboard test additionally needs RUN_REAL_CLIPBOARD_TEST=1, because it
 REPLACES what is on your clipboard (Ctrl+C, then Ctrl+V into its own Notepad).
 
@@ -41,6 +41,12 @@ The refresh test creates a temporary folder and opens it in a NEW File Explorer 
 code), refreshes it (File Explorer folder view: LOW - it must not ask; result unverified), and ALWAYS
 closes only that Explorer window and deletes only that temporary folder. There is no browser test: it
 would open your real browser profile.
+
+The window-control test uses only Notepads it started: A (opened by the assistant) is maximized, restored
+and minimized (LOW, each verified by reading the window state) and closed with close_app while minimized;
+B (opened by the assistant) is closed with window control close (MEDIUM, approved); C is started by the
+TEST, not the assistant, so window control close must refuse it (nothing sent) and the test closes it.
+Alt+F4 is checked to be refused as a shortcut. Everything the test started is closed in finally.
 """
 import ctypes
 import time
@@ -49,8 +55,8 @@ import pytest
 
 from app.executor import emergency_stop
 from app.executor.logic import execute_with_recovery
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, ExecutorAction,
-                                 Outcome)
+from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL,
+                                 ExecutorAction, Outcome)
 from app.safety.models import RiskLevel
 from app.verifier import adapter as verifier_adapter
 from app.verifier import logic as verifier
@@ -292,6 +298,20 @@ def _open_test_notepad(expectation, before, label):
     return notepad, active.control_handle
 
 
+def _window_control(operation, label, expect_prompt_start=None):
+    """Window control through the full pipeline. With expect_prompt_start=None it must NOT ask (LOW); otherwise
+    only a prompt starting with that text is approved."""
+    prompts = []
+
+    def confirm(action, assessment):
+        prompts.append((action.description, assessment.level.name))
+        return expect_prompt_start is not None and action.description.startswith(expect_prompt_start)
+    result = execute_with_recovery(ExecutorAction(WINDOW_CONTROL, operation), confirm=confirm)
+    print(f"{label}: window control {operation} -> {result.outcome.value}: {result.message} (prompts: {prompts})")
+    assert (prompts == []) is (expect_prompt_start is None), prompts
+    return result
+
+
 def _press(shortcut, label, expect_prompt_start=None):
     """Press through the full pipeline. With expect_prompt_start=None the shortcut must NOT ask (LOW);
     otherwise only a prompt starting with that text is approved."""
@@ -326,7 +346,7 @@ def test_shortcuts_in_a_notepad_the_test_opened():
         assert undo.ok and undo.outcome is Outcome.UNVERIFIED, undo.message
 
         _discard_test_text(field)
-        closed = _press("alt+f4", "shortcuts", expect_prompt_start=f'press Alt+F4 on window "{notepad.title}"')
+        closed = _window_control("close", "shortcuts", expect_prompt_start="close window ")
         if closed.outcome is Outcome.NEEDS_USER:
             _answer_dont_save(notepad.handle)
         assert closed.outcome is Outcome.DONE, closed.message
@@ -361,7 +381,7 @@ def test_copy_and_paste_in_a_notepad_the_test_opened():
         assert verifier.wait_until(lambda: verifier.count_text(field, "clipboard test") == 1), \
             "the pasted text didn't show up in the test's Notepad"  # checked by the TEST, not the assistant
         _discard_test_text(field)
-        closed = _press("alt+f4", "clipboard", expect_prompt_start="press Alt+F4 on window")
+        closed = _window_control("close", "clipboard", expect_prompt_start="close window ")
         if closed.outcome is Outcome.NEEDS_USER:
             _answer_dont_save(notepad.handle)
         assert closed.outcome is Outcome.DONE, closed.message
@@ -523,3 +543,77 @@ def test_refresh_a_file_explorer_window_the_test_opened():
     assert folder_removed and not folder.exists()
     still_open = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "CabinetWClass"}
     assert existing <= still_open, "a File Explorer window that was already open was closed"
+
+
+def _new_notepads(before):
+    return [w for w in verifier_adapter.list_windows() if w.class_name == "Notepad" and w.handle not in before]
+
+
+def _wait_active(handle, seconds=5):
+    return _wait_for(lambda: (verifier_adapter.active_target().window or SimpleWindow).handle == handle, seconds)
+
+
+class SimpleWindow:
+    handle = None
+
+
+@pytest.mark.real_desktop
+def test_window_controls_on_notepads_the_test_started():
+    import subprocess
+
+    emergency_stop.reset("real-desktop-test")
+    expectation = verifier.expect_window("notepad")
+    before = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "Notepad"}
+    before_matching = verifier.snapshot_windows(expectation)
+    try:
+        # --- A: opened by the assistant; maximize, restore, minimize - each read back - then close_app ---
+        a, _ = _open_test_notepad(expectation, before_matching, "window-control A")
+        state = verifier_adapter.window_state(a.handle)
+        print(f"window-control A: start state {state}")
+        assert state and not state.minimized and not state.maximized
+        started = time.monotonic()
+        assert _window_control("maximize", "window-control A").outcome is Outcome.DONE
+        assert verifier_adapter.window_state(a.handle).maximized
+        assert _window_control("restore", "window-control A").outcome is Outcome.DONE
+        restored = verifier_adapter.window_state(a.handle)
+        assert not restored.maximized and not restored.minimized
+        assert _window_control("minimize", "window-control A").outcome is Outcome.DONE
+        assert verifier_adapter.window_state(a.handle).minimized
+        print(f"window-control A: maximize + restore + minimize took {time.monotonic() - started:.2f}s")
+        closed_a = execute_with_recovery(ExecutorAction(CLOSE_APP, "notepad"), confirm=lambda action, assessment: True)
+        print(f"window-control A: close_app on the minimized window -> {closed_a.outcome.value}: {closed_a.message}")
+        assert closed_a.outcome is Outcome.DONE and verifier_adapter.window_state(a.handle) is None
+
+        # --- B: opened by the assistant; window control close (MEDIUM, one confirmation) ---
+        b, _ = _open_test_notepad(expectation, before_matching, "window-control B")
+        closed_b = _window_control("close", "window-control B",
+                                   expect_prompt_start=f'close window "{b.title}" (notepad, opened by the assistant')
+        assert closed_b.outcome is Outcome.DONE and verifier_adapter.window_state(b.handle) is None
+
+        # --- C: started by the TEST, not the assistant: window control close must refuse it ---
+        subprocess.Popen(["notepad.exe"])  # test setup - deliberately not a session window
+        c = _wait_for(lambda: _new_notepads(before), 15)
+        assert c, "the test's Notepad C didn't appear"
+        c = c[0]
+        assert _wait_active(c.handle), "Notepad C isn't the active window - not testing the refusal"
+        refused = _window_control("close", "window-control C")  # refused before the gate: no prompt at all
+        assert not refused.ok and "I only close windows I opened in this session" in refused.message
+        assert verifier_adapter.window_state(c.handle) is not None, "Notepad C must still be open"
+
+        # --- Alt+F4 is not a second close path ---
+        alt_f4 = execute_with_recovery(ExecutorAction(SHORTCUT, "alt+f4"), confirm=lambda action, assessment: True)
+        print(f"window-control: shortcut alt+f4 -> {alt_f4.outcome.value}: {alt_f4.message}")
+        assert not alt_f4.ok and "use close_app or window control close" in alt_f4.message
+        assert verifier_adapter.window_state(c.handle) is not None, "Alt+F4 must not have closed Notepad C"
+    finally:
+        # Close every Notepad the test started (A, B, C or any left behind), and only those.
+        leftovers = []
+        for w in _new_notepads(before):
+            ctypes.windll.user32.PostMessageW(ctypes.c_void_p(w.handle), WM_CLOSE, 0, 0)
+            leftovers.append(w)
+        _wait_for(lambda: not _new_notepads(before), CLEANUP_SECONDS)
+        print(f"window-control: cleanup closed {len(leftovers)} window(s): {[_describe(w) for w in leftovers]}")
+    assert _new_notepads(before) == [], "a Notepad the test started is still open"
+    assert [w.handle for w in leftovers] == [c.handle], "cleanup should only have had to close Notepad C"
+    still_open = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "Notepad"}
+    assert before <= still_open, "a Notepad that was already open was closed"

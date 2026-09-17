@@ -43,7 +43,7 @@ import time
 from app.executor import emergency_stop
 from app.verifier import adapter
 from app.verifier.models import (ActiveTarget, ControlInfo, Screen, ScrollState, VerificationResult,
-                                 WindowExpectation, WindowInfo)
+                                 WindowExpectation, WindowInfo, WindowState)
 from config.settings import SettingsError, get_setting
 
 log = logging.getLogger(__name__)
@@ -338,6 +338,11 @@ def scroll_state(handle: int) -> ScrollState | None:
         return adapter.vertical_scroll(handle)
     except adapter.VerifierAdapterError:
         return None
+
+
+def window_state(handle: int) -> WindowState | None:
+    """The window's state, or None if it no longer exists. Raises VerifierUnavailableError."""
+    return _observe(adapter.window_state, handle)
 
 
 def process_name(window_handle: int | None) -> str | None:

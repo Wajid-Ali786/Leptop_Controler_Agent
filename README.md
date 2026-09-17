@@ -6,8 +6,8 @@ verifies the result, and remembers what matters.
 
 **Status:** Phase 0 (Foundation) complete — tagged `v0.1`. Phase 1 (Basic Computer Control)
 is in progress: opening and closing apps, clicking by screen coordinate, typing text, keyboard
-shortcuts, scrolling and refresh (browsers and File Explorer) work. See `docs/step4-production-development.md`
-Section 4 (implementation notes) and Section 18.
+shortcuts, scrolling, refresh (browsers and File Explorer) and window controls work.
+See `docs/step4-production-development.md` Section 4 (implementation notes) and Section 18.
 
 ## Setup (fresh clone)
 

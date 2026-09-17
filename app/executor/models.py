@@ -11,6 +11,7 @@ TYPE_TEXT = "type_text"  # target: the exact text to type. It never appears in r
 SHORTCUT = "shortcut"    # target: a keyboard shortcut, e.g. ExecutorAction(SHORTCUT, "ctrl+c")
 SCROLL = "scroll"        # target: "up N" or "down N" wheel notches, e.g. ExecutorAction(SCROLL, "down 3")
 REFRESH = "refresh"      # no target: refreshes the active window, e.g. ExecutorAction(REFRESH)
+WINDOW_CONTROL = "window_control"  # target: minimize | maximize | restore | close (the active window)
 
 
 class Outcome(str, Enum):

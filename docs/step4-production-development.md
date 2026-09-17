@@ -82,7 +82,7 @@ These apply to every phase below, without exception:
 
 **Implementation notes — open/close apps (recorded 16 September 2026).** These record how Phase 1 behaves on a real Windows desktop and what was measured. They don't reopen any Step 1–3 decision.
 
-- **close_app closes only windows this session opened.** `open_app` remembers the windows it verified (in memory only, so nothing carries over a restart). `close_app` closes the most recently opened of those that is still open. A window the user opened themselves is never closed; the assistant says so and leaves it alone. Closing is always a polite request (`WM_CLOSE`, like clicking the window's X), never ending a process. Outcomes are distinct: `done`, `already_closed`, `needs_user` (e.g. a "Save changes?" dialog), `still_open`, `failed`. `needs_user` and `still_open` are never retryable, so the recovery loop can't retry into an app that is waiting for the user. Closing is Medium risk (`close`, like Roman Urdu `band`), so it is always confirmed.
+- **close_app closes only windows this session opened.** `open_app` remembers the windows it verified (in memory only, so nothing carries over a restart). `close_app` closes the most recently opened of those that is still open. A window the user opened themselves is never closed; the assistant says so and leaves it alone. Closing is always a polite request (`WM_CLOSE`, like clicking the window's X), never ending a process. Outcomes are distinct: `done`, `already_closed`, `needs_user` (e.g. a "Save changes?" dialog), `still_open`, `failed`. `needs_user` and `still_open` are never retryable, so the recovery loop can't retry into an app that is waiting for the user. Closing is always at least MEDIUM risk, so it is always confirmed. Since the Window Controls task (17 September 2026) this is a code constant, not the configurable `close` keyword, so configuration can't lower it; other safety rules may still raise it. close_app and window control close share one close mechanism (see the Window Controls notes).
 - **Store-app window groups (e.g. Calculator).** A Windows Store app has two windows with the same title: an outer frame (`ApplicationFrameWindow`, owned by `ApplicationFrameHost.exe`) and a content window (`Windows.UI.Core.CoreWindow`, owned by the app's own process). The observed sequence, the same in every run, was:
   1. The frame is created *cloaked* (it exists but isn't drawn on screen).
   2. 0.2–0.3 s later, the content window appears as a separate top-level window.
@@ -154,11 +154,11 @@ These apply to every phase below, without exception:
   | Ctrl+X | MEDIUM | removes the selection from the document and replaces the clipboard |
   | Alt+Tab | MEDIUM | changes no data, but the window it switches to can't be known in advance, and following actions land there |
   | Ctrl+V | HIGH | pastes clipboard content the assistant can't see; pasted lines can run in a terminal, pasted files are copied in File Explorer |
-  | Alt+F4 | HIGH | closes the active window (some apps don't ask to save); only on a window the assistant opened in this session, never with the desktop or taskbar active (that opens the Shut Down dialog) |
+  | ~~Alt+F4~~ | — | *removed on 17 September 2026 (Window Controls task)*: it was a separate way to close a window. It is now refused, pointing to close_app / window control close, which share the one close mechanism |
 
-  **Not supported:** **F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R** (refused with a message pointing to the Refresh action, which is the only way to send a refresh key — see the Refresh notes); every other combination ("isn't a supported shortcut yet"); **Ctrl+Alt+Delete** and **Win+L**, which are reserved Windows shortcuts this assistant will not send or test. Win+L is intentionally unsupported in Phase 1 because it locks the Windows session.
-- **Prompts** (MEDIUM and HIGH; on screen only, never logged) name the shortcut, the window title and field, and what it does. Examples: `press Ctrl+Z in window "Untitled - Notepad" (field: Edit) - undoes the last change; some apps can't redo it`, `press Ctrl+V in window "…" (field: Edit) - pastes the clipboard (it holds: text). I can't see what's on it; pasting into a terminal or chat can run or send it`, `press Alt+F4 on window "Untitled - Notepad" - closes it; unsaved work may be lost if the app doesn't ask`. LOW shortcuts run without a prompt and the gate sees only `press Ctrl+A`, never a title.
-- **Validation (before anything is asked or sent).** The shortcut must be supported. Shortcuts that act on a window need an active window. No Ctrl, Alt, Shift or Win may be held down on the keyboard (checked again right before sending). Ctrl+V needs something on the clipboard. Alt+F4 needs the active window to belong to this session. After confirmation, if the active window, its title or its field changed, nothing is pressed.
+  **Not supported:** **F5, Ctrl+R, Ctrl+F5, Shift+F5 and Ctrl+Shift+R** (refused with a message pointing to the Refresh action, which is the only way to send a refresh key — see the Refresh notes); **Alt+F4** (refused with a message pointing to close_app / window control close); every other combination ("isn't a supported shortcut yet"); **Ctrl+Alt+Delete** and **Win+L**, which are reserved Windows shortcuts this assistant will not send or test. Win+L is intentionally unsupported in Phase 1 because it locks the Windows session.
+- **Prompts** (MEDIUM and HIGH; on screen only, never logged) name the shortcut, the window title and field, and what it does. Examples: `press Ctrl+Z in window "Untitled - Notepad" (field: Edit) - undoes the last change; some apps can't redo it`, `press Ctrl+V in window "…" (field: Edit) - pastes the clipboard (it holds: text). I can't see what's on it; pasting into a terminal or chat can run or send it`. LOW shortcuts run without a prompt and the gate sees only `press Ctrl+A`, never a title.
+- **Validation (before anything is asked or sent).** The shortcut must be supported. Shortcuts that act on a window need an active window. No Ctrl, Alt, Shift or Win may be held down on the keyboard (checked again right before sending). Ctrl+V needs something on the clipboard. After confirmation, if the active window, its title or its field changed, nothing is pressed.
 - **Sending.** The whole shortcut is **one `SendInput` call** (virtual keys plus scan codes): modifiers down, key down, key up, modifiers up in reverse. It is sent immediately after the last emergency-stop check, so a stop can never leave keys down. If Windows accepts **0 events** the result is `failed`. If it accepts **some but not all**, every key and modifier involved is released at once (an unassigned key is tapped first when Alt or Win is involved, so a lone release opens no menu) and the result is `unverified`. If it accepts all, the shortcut's own check runs. In every case the modifiers must then read as released; if not they are released again, and if still down the message says to press and release them.
 - **Outcomes: `done` only on evidence.**
   - Ctrl+C: the clipboard's change counter moved.
@@ -166,7 +166,6 @@ These apply to every phase below, without exception:
   - Ctrl+A: a standard edit field reports all its text selected.
   - Alt+Tab: a different window is active; if visibly not, `failed`.
   - Win+D: the desktop is active.
-  - Alt+F4: close_app's window-group check (`done`, `needs_user`, `still_open`).
   - Ctrl+Z, Ctrl+S, Ctrl+V: always `unverified`, and anything that can't be confirmed is `unverified`.
   - **Never retryable.** An emergency stop while checking the effect raises `EmergencyStopError`; the keys were already sent and released.
 - **Clipboard.** Its **contents are never read** — nothing opens the clipboard or fetches its data (a rule test enforces it). Only its change counter and which kinds of data it holds (text, image, files) are read. The kinds appear only in the Ctrl+V prompt; nothing clipboard-related is logged.
@@ -174,7 +173,7 @@ These apply to every phase below, without exception:
   - parsing, aliases, refusals and reserved shortcuts; the full risk table; Ctrl+C MEDIUM in every window
   - LOW running without a prompt but through the gate; exact MEDIUM/HIGH prompts; decline and no confirmation method
   - no active window, held modifiers (before and after approval), empty clipboard, target changed after approval
-  - Alt+F4 session-only, desktop refusal, `done` / `needs_user` / `still_open`
+  - (originally) Alt+F4 session-only, desktop refusal, `done` / `needs_user` / `still_open` — replaced by an Alt+F4 refusal test when Alt+F4 was removed
   - 0 and partly accepted input with the defensive release; modifiers still down released again, or an honest note
   - emergency stop before, during confirmation, right before sending, and while checking
   - every verification case; never retried
@@ -182,9 +181,9 @@ These apply to every phase below, without exception:
   - the adapter's single batch, extended Win key, scan codes and release sequence
   - the clipboard-contents rule
 
-  Breaking Ctrl+V's HIGH level, the partial-input release, the held-modifier check, the Alt+F4 session restriction, or keeping titles out of results makes tests fail.
+  Breaking Ctrl+V's HIGH level, the partial-input release, the held-modifier check, the Alt+F4 session restriction (now: the Alt+F4 refusal), or keeping titles out of results makes tests fail.
 
-  Opt-in real-desktop test (17 September 2026): in a Notepad the test opened, it typed "abc". **Ctrl+A** ran with no prompt → `done` (everything selected), 0.20 s. **Ctrl+Z** prompted at MEDIUM → `unverified`. **Alt+F4** prompted at HIGH on that session window → `done`. Cleanup had to close 0 windows, no modifier read as held afterwards, and the clipboard's change counter was unchanged. The clipboard test (Ctrl+C, then Ctrl+V into its own Notepad) exists behind a second opt-in, `RUN_REAL_CLIPBOARD_TEST=1`, because it replaces the clipboard's contents; it has **not** been run.
+  Opt-in real-desktop test (17 September 2026): in a Notepad the test opened, it typed "abc". **Ctrl+A** ran with no prompt → `done` (everything selected), 0.20 s. **Ctrl+Z** prompted at MEDIUM → `unverified`. **Alt+F4** prompted at HIGH on that session window → `done` (since the Window Controls task this test closes its Notepad with window control close instead: MEDIUM → `done`, re-run 17 September 2026). Cleanup had to close 0 windows, no modifier read as held afterwards, and the clipboard's change counter was unchanged. The clipboard test (Ctrl+C, then Ctrl+V into its own Notepad) exists behind a second opt-in, `RUN_REAL_CLIPBOARD_TEST=1`, because it replaces the clipboard's contents; it has **not** been run.
 - **Limitations.**
   - A held modifier can't be told apart from one stuck after sending, so the "may still be held down" note can also appear while the user is holding a key.
   - Ctrl+A is verifiable only in standard edit fields.
@@ -267,6 +266,59 @@ These apply to every phase below, without exception:
   - A program renamed to one of these executable names would be treated as that app.
   - Installed web apps (PWAs) running under `chrome.exe` or `msedge.exe` count as browsers.
 - **What would make refresh verifiable (Phase 5).** UI Automation access to an app's own controls (e.g. a browser's Reload/Stop button state), recognition of in-page contexts that capture F5 (web IDEs), and detection of unsaved form input, so a browser refresh could be `done` and possibly lower risk.
+
+**Implementation notes — window controls (recorded 17 September 2026).**
+
+- **Action.** `ExecutorAction(WINDOW_CONTROL, "minimize" | "maximize" | "restore" | "close")` acts on the **active window** only. Case and spaces are ignored; anything else is refused ("Window controls: minimize, maximize, restore or close").
+- **Refused before the safety gate** (nothing asked or sent): no active window; the desktop or taskbar; a tool window; a window that isn't responding. The capability checks are operation-specific: minimize is refused only if the window has no minimize box, and maximize only if it has no maximize box. They don't apply to restore or close.
+- **Identity** = window handle + executable + top-level class, captured at validation and re-read **immediately before sending**. The title is deliberately not part of it, because titles change by themselves (Notepad adds "*"). If the identity changed: `failed`, nothing sent.
+- **Risk levels:**
+
+  | Operation | Level | Why |
+  |---|---|---|
+  | minimize | LOW | changes no data; one click brings the window back. Windows then activates another window, but every action that could do harm re-checks its own target and asks with the window title |
+  | maximize | LOW | only changes the window's size; undone by restore |
+  | restore | LOW | only changes size or position |
+  | close | MEDIUM (code-constant minimum) | can lose unsaved work; effective risk = max(MEDIUM, any other safety rule) |
+
+- **Minimize / maximize / restore — the first Phase 1 actions that return `done` on direct evidence.** The mechanism is a posted `WM_SYSCOMMAND` (`SC_MINIMIZE` / `SC_MAXIMIZE` / `SC_RESTORE`), exactly what the title-bar buttons send, so the app handles it its own way. No keyboard shortcuts; no forced `ShowWindow`. The emergency stop is checked immediately before posting. The window's state is then **read back** (`IsIconic` / `IsZoomed`) for up to `verifier.window_state_settle_seconds` (2 s):
+  - `done` when the requested state is read back, or when the window is **already** in that state (nothing is sent)
+  - `unverified` when the request was accepted but the state can't be read afterwards
+  - `failed` when the state is readable but didn't change in time, the window disappeared, or Windows refused the request (e.g. an app running as administrator)
+
+  "restore" means a normal window (neither minimized nor maximized). Restoring a *minimized* window is outside this task: a minimized window normally isn't the active window.
+- **Close — one mechanism, no bypass.** close_app ("close notepad") and window control close ("close the active window") both first **resolve a window group from this session's own records**: `_open_session_group` by app name, `_session_group_containing` by the active window's handle. A group is never built from a raw window handle.
+  - If the active window isn't one the assistant opened, window control close is refused before the safety gate ("I only close windows I opened in this session…"). Option A stands.
+  - Both actions then go through `execute()` with **exactly one confirmation** (MEDIUM). Prompt for window control close: `close window "…" (notepad, opened by the assistant this session) - closing can lose unsaved work`.
+  - Both call the **one internal close mechanism**, `_close_session_group()`. It does the graceful `WM_CLOSE` (to the Store-app frame if there is one), handles hosted windows, checks the emergency stop immediately before the request, waits for the close, detects save dialogs, and returns `done` / `already_closed` / `needs_user` / `still_open` / `failed`. It asks nothing itself.
+  - As a **defensive check**, the mechanism refuses any group that isn't (still) recorded as opened by this session, so a future caller can't hand it an unrelated window, and a session forgotten during confirmation closes nothing.
+  - A rule test checks the structure: only `_request_close` sends a close request, only `_close_session_group` calls it, and only `_prepare_close_app` and `_prepare_window_control` reach `_close_session_group`.
+  - **Alt+F4 was removed from the keyboard-shortcut allow-list** and is refused, pointing to close_app / window control close. There is no other way to close a window.
+- **Emergency stop.** Checked before validation, after confirmation, and immediately before the request. A request is one posted message, so there's nothing to interrupt mid-way. A stop while checking the result raises `EmergencyStopError`, logging that the request was already sent. **Never retryable.**
+- **Privacy.** Logs contain the operation, level, rule and outcome, never window titles. Only the close prompt shows a title, on screen.
+- **Tested.** 70 offline tests in `tests/test_executor_window_control.py` cover:
+  - unknown operations; LOW with no prompt and `done` on read-back for all three state changes
+  - already in the requested state (nothing sent); a slow app; a state that doesn't change → `failed`; unreadable afterwards → `unverified`; the window disappearing; requests refused by Windows
+  - every refusal before the gate; operation-specific capability checks (a missing maximize box doesn't block minimize, and neither blocks close)
+  - identity changes (window, executable, class, none) and a title-only change not blocking
+  - emergency stop before, right before sending, and while checking; never retried
+  - close: session-only, MEDIUM with one confirmation, capabilities ignored, decline and no confirmation method; MEDIUM without the `close` keyword for both close actions; the MEDIUM floor raised by a stricter rule; identity change after approval; `needs_user` / `still_open`; stop right before the close request
+  - both close actions using the one mechanism; the mechanism refusing a forged group and a forgotten session; Alt+F4 refused; the one-mechanism rule test
+  - titles never leaking, plus a planted leak the check must catch
+  - the adapter's `WM_SYSCOMMAND` codes and errors; a read-only real window-state read
+
+  Also: close_app's existing tests pass unchanged apart from the rule text ("closing a window can lose unsaved work"), plus a test that close_app stays MEDIUM without the `close` keyword; the shortcut tests replace the Alt+F4 tests with a refusal. Mutation checks: removing window control close's session restriction (1 test fails), the mechanism's ownership check (2), the MEDIUM constant (6), close_app's minimum (3), the identity re-check (5), the minimize capability check (1), "done only on read-back" (1), or the Alt+F4 refusal (3) makes tests fail.
+
+  Opt-in real-desktop test (17 September 2026), using only Notepads the test started:
+  - **A** (opened by the assistant): maximize → `done`, restore → `done`, minimize → `done` (each with no prompt, each state read back; 0.58 s for all three); then close_app closed the minimized window → `done`.
+  - **B** (opened by the assistant): window control close prompted once at MEDIUM → `done`.
+  - **C** (started by the test, not the assistant): window control close was refused with no prompt and C stayed open; Alt+F4 as a shortcut was refused and C stayed open.
+  - Cleanup closed exactly C. 0 Notepad windows and 0 Notepad processes before and after. The shortcut real test, now closing with window control close, was re-run and passed.
+- **Limitations and open decisions.**
+  - Restoring a minimized window needs targeting beyond the active window (later).
+  - **For Phase 3 (Planner):** "already in the requested state" is `done` just like a real change; only the message tells them apart. Consider a separate field, together with the Scroll `progress` note.
+  - Closing the user's own windows remains refused (Option A); changing that is an explicit decision for the project owner.
+  - Observation, not changed: Alt+Tab is MEDIUM because silent LOW actions could land in an unexpected window. Since Ctrl+S moved to MEDIUM, only harmless LOW actions remain, so that reason is weaker than when it was set.
 
 ---
 

@@ -46,7 +46,7 @@ FIELD = 501
 IN_NOTEPAD = ActiveTarget(NOTEPAD, FIELD, "Edit")
 OTHER = ActiveTarget(WindowInfo(900, "Inbox - Mail", "Mail"), 901, "Edit")
 DESKTOP = ActiveTarget(WindowInfo(65554, "", "Progman"), None, "")
-SUPPORTED_NAMES = ["Ctrl+A", "Win+D", "Ctrl+C", "Ctrl+S", "Ctrl+Z", "Ctrl+X", "Alt+Tab", "Ctrl+V", "Alt+F4"]
+SUPPORTED_NAMES = ["Ctrl+A", "Win+D", "Ctrl+C", "Ctrl+S", "Ctrl+Z", "Ctrl+X", "Alt+Tab", "Ctrl+V"]
 
 
 class FakeDesktop:
@@ -127,9 +127,6 @@ class FakeDesktop:
             self.target = OTHER
         elif name == "Win+D":
             self.target = DESKTOP
-        elif name == "Alt+F4":
-            self.windows.pop(self.target.window.handle, None)
-            self.target = OTHER
 
 
 @pytest.fixture
@@ -176,15 +173,11 @@ def confirmations(world):
     return [call for call in world.calls if call[0] == "confirm"]
 
 
-def open_in_session(world):
-    logic._remember_opened("notepad", frozenset({NOTEPAD.handle}))
-
-
 # --- Parsing and the allow-list ---
 
 @pytest.mark.parametrize("text, name", [
     ("ctrl+c", "Ctrl+C"), ("CTRL + C", "Ctrl+C"), ("control+c", "Ctrl+C"), (" a + ctrl ", "Ctrl+A"),
-    ("windows+d", "Win+D"), ("win+D", "Win+D"), ("tab+alt", "Alt+Tab"), ("alt+f4", "Alt+F4"),
+    ("windows+d", "Win+D"), ("win+D", "Win+D"), ("tab+alt", "Alt+Tab"),
 ])
 def test_names_are_normalized(text, name):
     assert shortcuts.parse(text).name == name
@@ -198,7 +191,9 @@ def test_names_are_normalized(text, name):
     ("ctrl+alt", "'ctrl+alt' needs exactly one key besides Ctrl, Alt, Shift or Win."),
     ("ctrl+a+b", "'ctrl+a+b' needs exactly one key besides Ctrl, Alt, Shift or Win."),
     ("shift+ctrl+z", "Ctrl+Shift+Z isn't a supported shortcut yet. Supported: Ctrl+A, Win+D, Ctrl+C, Ctrl+S, "
-                     "Ctrl+Z, Ctrl+X, Alt+Tab, Ctrl+V, Alt+F4."),
+                     "Ctrl+Z, Ctrl+X, Alt+Tab, Ctrl+V."),
+    ("alt+f4", "Alt+F4 isn't available as a shortcut. To close a window, use close_app or window control close: "
+               "they only close windows this assistant opened, and confirm they closed."),
     ("f5", "F5 isn't available as a shortcut. Use the Refresh action instead: it checks which app is active first, "
            "because these keys do different things in different apps."),
     ("ctrl+r", "Ctrl+R isn't available as a shortcut. Use the Refresh action instead: it checks which app is active "
@@ -222,7 +217,7 @@ def test_malformed_unknown_unsupported_and_reserved_are_refused(text, message):
     ("Ctrl+A", RiskLevel.LOW), ("Win+D", RiskLevel.LOW),
     ("Ctrl+C", RiskLevel.MEDIUM), ("Ctrl+S", RiskLevel.MEDIUM), ("Ctrl+Z", RiskLevel.MEDIUM),
     ("Ctrl+X", RiskLevel.MEDIUM), ("Alt+Tab", RiskLevel.MEDIUM),
-    ("Ctrl+V", RiskLevel.HIGH), ("Alt+F4", RiskLevel.HIGH),
+    ("Ctrl+V", RiskLevel.HIGH),
 ])
 def test_risk_table(name, risk):
     assert shortcuts.SUPPORTED[name].risk == risk
@@ -362,44 +357,15 @@ def test_changed_target_after_approval_means_nothing_is_pressed(world, changed):
     assert sent(world) == []
 
 
-# --- Alt+F4: only on this session's windows ---
+# --- Alt+F4: refused - closing has exactly one mechanism (close_app / window control close) ---
 
-def test_alt_f4_closes_a_window_the_assistant_opened(world):
-    open_in_session(world)
+def test_alt_f4_is_refused_even_for_a_window_the_assistant_opened(world):
+    logic._remember_opened("notepad", frozenset({NOTEPAD.handle}))
     result = press(world, "alt+f4")
-    assert result.outcome is Outcome.DONE and result.message.startswith("Pressed Alt+F4; the window closed after")
-    assert confirmations(world)[0][1:3] == (
-        'press Alt+F4 on window "Untitled - Notepad" - closes it; unsaved work may be lost if the app doesn\'t ask',
-        RiskLevel.HIGH)
-    assert logic._session_windows["notepad"] == []  # forgotten once closed
-
-
-def test_alt_f4_on_a_window_the_assistant_did_not_open_is_refused(world):
-    result = press(world, "alt+f4")
-    assert result.message == ("I only press Alt+F4 on windows I opened in this session, and the active window "
-                              "isn't one of them, so I left it alone.")
-    assert world.calls == []
-
-
-def test_alt_f4_with_the_desktop_active_is_refused(world):
-    world.desktop.target = DESKTOP
-    result = press(world, "alt+f4")
-    assert result.message == "Alt+F4 with the desktop or taskbar active opens the Shut Down dialog, so I won't press it."
-    assert world.calls == []
-
-
-def test_alt_f4_on_an_app_asking_to_save_needs_the_user(world):
-    open_in_session(world)
-    world.desktop.effects = False
-    world.desktop.windows[NOTEPAD.handle] = WindowInfo(500, "Untitled - Notepad", "Notepad", enabled=False)
-    result = press(world, "alt+f4")
-    assert result.outcome is Outcome.NEEDS_USER and not result.retryable
-
-
-def test_alt_f4_that_leaves_the_window_open_is_still_open(world):
-    open_in_session(world)
-    world.desktop.effects = False
-    assert press(world, "alt+f4").outcome is Outcome.STILL_OPEN
+    assert not result.ok and result.outcome is Outcome.FAILED
+    assert "use close_app or window control close" in result.message
+    assert world.calls == [] and world.authorized == []
+    assert "Alt+F4" not in shortcuts.SUPPORTED
 
 
 # --- Sending: one batch; partial acceptance releases everything ---
