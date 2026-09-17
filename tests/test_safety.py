@@ -302,3 +302,37 @@ def test_close_app_requires_confirmation_end_to_end():
     with pytest.raises(ActionDeniedError, match="risky keyword 'close'"):
         authorize(Action("close app notepad"))
     assert authorize(Action("close app notepad"), ScriptedConfirm(answer=True)).confirmed is True
+
+
+# --- Minimum risk level: a floor the words can raise but never lower (Phase 1 coordinate clicks) ---
+
+def test_minimum_level_makes_harmless_words_need_confirmation(safety_config):
+    action = Action("click at (500, 300) on window notepad", minimum_level=RiskLevel.MEDIUM,
+                    minimum_reason="coordinate click - always needs confirmation")
+    assessment = assess(action)
+    assert assessment.level == RiskLevel.MEDIUM
+    assert assessment.rule == "coordinate click - always needs confirmation"
+    with pytest.raises(ActionDeniedError, match="coordinate click - always needs confirmation"):
+        authorize(action)
+    assert authorize(action, ScriptedConfirm(answer=True)).confirmed is True
+
+
+def test_minimum_level_rule_is_reported_even_when_a_keyword_also_matches(safety_config):
+    action = Action("click at (5, 5) on window delete everything", minimum_level=RiskLevel.MEDIUM,
+                    minimum_reason="coordinate click")
+    assert assess(action).rule == "coordinate click"  # the title's words never reach the log
+
+
+def test_default_minimum_level_changes_nothing(safety_config):
+    assert assess(Action("open notepad")).level == RiskLevel.LOW
+    assert "risky keyword 'delete'" in assess(Action("delete it")).rule
+
+
+def test_minimum_level_without_a_reason_still_explains_itself(safety_config):
+    assert assess(Action("open notepad", minimum_level=RiskLevel.MEDIUM)).rule == "always at least MEDIUM risk"
+
+
+@pytest.mark.parametrize("bad", [0, 99, "high", None])
+def test_invalid_minimum_level_fails_closed(safety_config, bad):
+    assessment = assess(Action("open notepad", minimum_level=bad))
+    assert assessment.level == RiskLevel.MEDIUM and "invalid minimum risk level" in assessment.rule

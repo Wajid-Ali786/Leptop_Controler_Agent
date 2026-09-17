@@ -5,7 +5,7 @@ practical). You speak or type a command; it understands, plans, checks safety, a
 verifies the result, and remembers what matters.
 
 **Status:** Phase 0 (Foundation) complete — tagged `v0.1`. Phase 1 (Basic Computer Control)
-is in progress: opening and closing apps work. See `docs/step4-production-development.md`
+is in progress: opening and closing apps, clicking by screen coordinate and typing text work. See `docs/step4-production-development.md`
 Section 4 (implementation notes) and Section 18.
 
 ## Setup (fresh clone)

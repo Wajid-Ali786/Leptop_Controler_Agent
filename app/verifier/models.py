@@ -16,6 +16,28 @@ class WindowInfo:
 
 
 @dataclass(frozen=True)
+class Screen:
+    """One monitor's area in screen pixels. right and bottom are exclusive: the screen covers
+    x from left to right - 1 and y from top to bottom - 1. Other monitors may have negative coordinates."""
+    left: int
+    top: int
+    right: int
+    bottom: int
+    primary: bool = False
+
+    def contains(self, x: int, y: int) -> bool:
+        return self.left <= x < self.right and self.top <= y < self.bottom
+
+
+@dataclass(frozen=True)
+class ActiveTarget:
+    """Where keyboard input goes right now: the active (foreground) window and its focused control."""
+    window: WindowInfo | None  # None when no window is active
+    control_handle: int | None = None
+    control_class: str = ""
+
+
+@dataclass(frozen=True)
 class WindowExpectation:
     """What 'this app opened' looks like: a NEW window whose title matches `pattern`."""
     app_name: str

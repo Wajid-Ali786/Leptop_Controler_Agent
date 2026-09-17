@@ -29,6 +29,16 @@ class EmergencyStopError(Exception):
     """Raised at an Executor checkpoint while the emergency stop is active."""
 
 
+class TypingInterruptedError(EmergencyStopError):
+    """The emergency stop interrupted typing after some text was already sent. `result` is the
+    Executor's ActionResult saying how much was typed (outcome PARTIAL, or UNVERIFIED if everything
+    was sent and only the check was interrupted). The message never contains the text."""
+
+    def __init__(self, message: str, result):
+        super().__init__(message)
+        self.result = result
+
+
 @dataclass(frozen=True)
 class StopStatus:
     stopped: bool

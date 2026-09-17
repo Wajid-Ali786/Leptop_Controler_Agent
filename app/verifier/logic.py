@@ -19,10 +19,22 @@ Notepad is on screen the moment its window exists, so this adds no wait.
 Closing is verified the other way round: wait_for_windows_to_close() succeeds only when every
 window in the group is gone - including, via hosted_windows(), titled windows living inside the
 group's windows, because a Store app's content window moves out of its frame again while closing.
+A window left disabled (a modal dialog such as "Save changes?" is waiting for the user) is reported
+as needing the user, not as a failure to retry. A handle that now belongs to a window whose title no
+longer matches counts as gone - Windows reuses handles.
+
+Coordinate clicks are NOT verified: their effect can't be observed in Phase 1. For them the Verifier
+only answers facts - which screens exist, which window is at a point, where the pointer is - that
+the Executor uses to refuse a click or to catch one that went to the wrong place.
+
+Typed text is checked as far as Phase 1 honestly can: the focused field's text is read before and
+after typing, and the typing counts as confirmed only when the exact text (line endings normalised)
+now appears MORE times than before. A field that can't be read, or text that doesn't show up (apps
+auto-correct, auto-indent or replace a selection), is "unverified" - never a failure to retry, since
+retyping would duplicate text. Field text is compared in memory only and never logged.
+
 Measured timings, the latency cost and the pre-launched-Calculator open decision: docs/step4
-Section 4, implementation notes. A window left disabled (a modal dialog such as "Save changes?" is
-waiting for the user) is reported as needing the user, not as a failure to retry. A handle that
-now belongs to a window whose title no longer matches counts as gone - Windows reuses handles.
+Section 4, implementation notes.
 """
 import logging
 import re
@@ -30,7 +42,7 @@ import time
 
 from app.executor import emergency_stop
 from app.verifier import adapter
-from app.verifier.models import VerificationResult, WindowExpectation, WindowInfo
+from app.verifier.models import ActiveTarget, Screen, VerificationResult, WindowExpectation, WindowInfo
 from config.settings import SettingsError, get_setting
 
 log = logging.getLogger(__name__)
@@ -146,6 +158,86 @@ def wait_for_windows_to_close(expectation: WindowExpectation, handles: frozenset
                        f"It may be waiting for you.", elapsed_seconds=elapsed)
         if emergency_stop.wait(min(expectation.poll_interval_seconds, remaining)):
             emergency_stop.check()
+
+
+# --- Screen points (for coordinate clicks) -----------------------------------------------------
+# A coordinate click's EFFECT can't be observed in Phase 1, so nothing here confirms a click worked.
+# These only answer factual questions the Executor uses to refuse or to catch a misdelivered click.
+
+def screens() -> list[Screen]:
+    """Every monitor's area. Raises VerifierUnavailableError."""
+    return _observe(adapter.list_screens)
+
+
+def on_screen(all_screens: list[Screen], x: int, y: int) -> bool:
+    """Is (x, y) on an actual monitor? Gaps between monitors of different sizes don't count."""
+    return any(screen.contains(x, y) for screen in all_screens)
+
+
+def window_at(x: int, y: int) -> WindowInfo | None:
+    """The top-level window at (x, y), or None. Raises VerifierUnavailableError."""
+    return _observe(adapter.window_at, x, y)
+
+
+def cursor_position() -> tuple[int, int]:
+    """Where the mouse pointer is. Raises VerifierUnavailableError."""
+    return _observe(adapter.cursor_position)
+
+
+def active_target() -> ActiveTarget:
+    """The active window and its focused control. Raises VerifierUnavailableError."""
+    return _observe(adapter.active_target)
+
+
+# Typed-text check results
+TEXT_CONFIRMED, TEXT_UNREADABLE, TEXT_NOT_FOUND = "confirmed", "unreadable", "not_found"
+
+
+def count_text(control_handle: int | None, text: str) -> int | None:
+    """How many times `text` appears in the control's text right now, or None if it can't be read."""
+    if not control_handle:
+        return None
+    try:
+        limit = get_setting("verifier.max_read_characters")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return None
+        content = adapter.read_text(control_handle, limit)
+    except (adapter.VerifierAdapterError, SettingsError):
+        return None
+    return None if content is None else _normalise(content).count(_normalise(text))
+
+
+def wait_for_typed_text(control_handle: int | None, text: str, count_before: int | None) -> str:
+    """After typing: TEXT_CONFIRMED once `text` appears more often than `count_before`, TEXT_UNREADABLE
+    if the field can't be read (before or now), TEXT_NOT_FOUND if it didn't appear within
+    verifier.text_settle_seconds. Raises EmergencyStopError if stopped while waiting."""
+    if count_before is None:
+        return TEXT_UNREADABLE
+    settle = _positive_number("verifier.text_settle_seconds")
+    poll = _positive_number("verifier.poll_interval_seconds")
+    start = _now()
+    while True:
+        count = count_text(control_handle, text)
+        if count is None:
+            return TEXT_UNREADABLE
+        if count > count_before:
+            return TEXT_CONFIRMED
+        remaining = settle - (_now() - start)
+        if remaining <= 0:
+            return TEXT_NOT_FOUND
+        if emergency_stop.wait(min(poll, remaining)):
+            emergency_stop.check()
+
+
+def _normalise(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _observe(read, *args):
+    try:
+        return read(*args)
+    except adapter.VerifierAdapterError as exc:
+        raise VerifierUnavailableError(str(exc)) from None
 
 
 def _list_windows():

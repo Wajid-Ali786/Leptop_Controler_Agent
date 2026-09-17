@@ -4,7 +4,9 @@ passes through authorize() before it may run (CLAUDE.md rule 5). Reasoning-aware
 Phase 3, full Low/Medium/High/Critical system in Phase 8 (docs/step4 Sections 6, 11).
 
 Phase 0 rule: an action containing a configured risky keyword is Medium risk, and
-Medium or above needs the user's confirmation (CLAUDE.md rule 6).
+Medium or above needs the user's confirmation (CLAUDE.md rule 6). An action may also carry a
+minimum risk level (Action.minimum_level) that the keyword rule can raise but never lower - Phase 1
+uses it so every coordinate click is confirmed.
 
 Fail closed throughout:
 - Keywords match as whole words plus common verb forms (delete/deletes/deleted/deleting).
@@ -77,7 +79,21 @@ def authorize(action: Action, confirm: Confirm | None = None) -> SafetyDecision:
 
 
 def assess(action: Action) -> RiskAssessment:
-    """Classify an action's risk. Never raises; any doubt counts as risky."""
+    """Classify an action's risk. Never raises; any doubt counts as risky. The action's own
+    minimum_level wins whenever it is at least as high as what the words suggest."""
+    words = _assess_words(action)
+    try:
+        minimum = RiskLevel(action.minimum_level)
+    except Exception:  # an invalid floor fails closed
+        return _risky("invalid minimum risk level (treated as risky)")
+    if minimum > RiskLevel.LOW and minimum >= words.level:
+        reason = action.minimum_reason if isinstance(action.minimum_reason, str) and action.minimum_reason             else f"always at least {minimum.name} risk"
+        return RiskAssessment(minimum, reason)
+    return words
+
+
+def _assess_words(action: Action) -> RiskAssessment:
+    """The keyword rule on the action's description."""
     try:
         keywords, safe_words = _load_rules()
     except Exception as exc:  # any config problem fails closed; never crash the gate

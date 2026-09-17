@@ -15,7 +15,7 @@ import pytest
 from app.executor import emergency_stop
 from app.executor.emergency_stop import EmergencyStopError
 from app.verifier import adapter, logic
-from app.verifier.models import WindowExpectation, WindowInfo
+from app.verifier.models import Screen, WindowExpectation, WindowInfo
 from config import settings
 from config.settings import SettingsError
 
@@ -295,3 +295,39 @@ def test_real_adapter_lists_windows_without_changing_anything():
                for w in windows)
     for window in windows[:5]:
         assert all(child.title for child in adapter.list_child_windows(window.handle))
+
+
+# --- Screen facts for coordinate clicks (they never verify a click's effect) ---
+
+def test_on_screen_needs_an_actual_monitor_not_just_the_bounding_box():
+    screens = [Screen(0, 0, 1920, 1080, primary=True), Screen(1920, 0, 3200, 720), Screen(-1280, 0, 0, 1024)]
+    assert logic.on_screen(screens, 0, 0) and logic.on_screen(screens, 1919, 1079)
+    assert logic.on_screen(screens, -1280, 1023) and logic.on_screen(screens, 3199, 719)
+    assert not logic.on_screen(screens, 1920, 1079)   # below the shorter right-hand monitor
+    assert not logic.on_screen(screens, 3200, 0)       # right edge is exclusive
+    assert not logic.on_screen(screens, 0, 1080)
+    assert not logic.on_screen([], 0, 0)
+
+
+@pytest.mark.parametrize("function, args, name", [
+    (logic.screens, (), "list_screens"),
+    (logic.window_at, (1, 2), "window_at"),
+    (logic.cursor_position, (), "cursor_position"),
+])
+def test_screen_reads_on_an_unobservable_desktop_raise(monkeypatch, function, args, name):
+    def unavailable(*a):
+        raise adapter.VerifierAdapterError("checking windows is only supported on Windows")
+    monkeypatch.setattr(adapter, name, unavailable)
+    with pytest.raises(logic.VerifierUnavailableError, match="only supported on Windows"):
+        function(*args)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the real desktop can only be read on Windows")
+def test_real_adapter_reads_screens_pointer_and_window_at_a_point_without_changing_anything():
+    screens = adapter.list_screens()
+    assert screens and sum(s.primary for s in screens) == 1
+    assert all(s.right > s.left and s.bottom > s.top for s in screens)
+    x, y = adapter.cursor_position()
+    assert adapter.cursor_position() == (x, y)  # reading didn't move the pointer
+    window = adapter.window_at(x, y)
+    assert window is None or (isinstance(window.handle, int) and isinstance(window.title, str))
