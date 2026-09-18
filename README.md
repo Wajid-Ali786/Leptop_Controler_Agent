@@ -5,8 +5,9 @@ practical). You speak or type a command; it understands, plans, checks safety, a
 verifies the result, and remembers what matters.
 
 **Status:** Phase 0 (Foundation) complete — tagged `v0.1`. Phase 1 (Basic Computer Control)
-is in progress: opening and closing apps, clicking by screen coordinate, typing text, keyboard
-shortcuts, scrolling, refresh (browsers and File Explorer) and window controls work.
+is in progress: typed commands (`python main.py --console`) drive opening and closing apps,
+clicking by screen coordinate, typing text, keyboard shortcuts, scrolling, refresh (browsers and
+File Explorer) and window controls.
 See `docs/step4-production-development.md` Section 4 (implementation notes) and Section 18.
 
 ## Setup (fresh clone)
@@ -42,9 +43,17 @@ pip freeze > requirements.txt
 ```powershell
 python main.py                 # startup health check, offline only
 python main.py --check-claude  # also makes one real, minimal Claude request (costs a few tokens)
+python main.py --console       # type commands ("open notepad"); help lists them, exit leaves
 ```
 
 `main.py` exits 0 when every check passes and 1 otherwise, naming what is wrong.
+
+In the console, one line is one command: `open notepad`, `close notepad`, `close window`,
+`click 500, 300`, `type hello`, `shortcut ctrl+a`, `scroll down 3`, `refresh`, `minimize`,
+`maximize`, `restore`. Anything Medium risk or above asks first, and only the exact answer `yes`
+runs it. Because the console is itself the active window while you type, a command that acts on
+another window waits for you to switch to it first — the console only watches which window is in
+front, and never switches windows itself.
 
 ## Tests
 

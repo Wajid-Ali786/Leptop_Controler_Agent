@@ -66,6 +66,15 @@ executor:
   max_unclassified_notches: 3
   scroll_interval_seconds: 0.05
 
+# --- Typed-command console (app/console.py) ---
+console:
+  # A typed command that lands wherever the desktop's focus or pointer is (typing, shortcuts, scroll,
+  # refresh, window controls, clicks) waits for YOU to put the window you mean in front - the console
+  # is the active window while you type, and it never switches windows itself.
+  focus_handover_seconds: 15    # how long to wait for you to switch windows before giving up
+  focus_settle_seconds: 0.5     # how long that window must stay in front (so Alt+Tab isn't mistaken for it)
+  poll_interval_seconds: 0.1    # how often to look (the emergency stop interrupts the wait)
+
 # --- Verifier (app/verifier/) ---
 verifier:
   window_timeout_seconds: 15    # how long a newly opened app gets to show its window, or a closed one to go

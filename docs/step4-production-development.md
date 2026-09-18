@@ -56,6 +56,7 @@ These apply to every phase below, without exception:
 ## 4. Phase 1 — Basic Computer Control
 
 **Build (typed commands only — no voice yet):**
+- Typed commands: `app/executor/commands.py` (grammar) + `app/console.py` (`python main.py --console`)
 - Open/close applications
 - Mouse click (by coordinate, as the deliberate last-resort fallback per the observation hierarchy — full hierarchy arrives in Phase 5)
 - Type text
@@ -319,6 +320,59 @@ These apply to every phase below, without exception:
   - **For Phase 3 (Planner):** "already in the requested state" is `done` just like a real change; only the message tells them apart. Consider a separate field, together with the Scroll `progress` note.
   - Closing the user's own windows remains refused (Option A); changing that is an explicit decision for the project owner.
   - Observation, not changed: Alt+Tab is MEDIUM because silent LOW actions could land in an unexpected window. Since Ctrl+S moved to MEDIUM, only harmless LOW actions remain, so that reason is weaker than when it was set.
+
+**Implementation notes — typed commands (recorded 18 September 2026).** This is where a command enters the assistant in Phase 1: `python main.py --console`.
+
+- **Two files, one path.** `app/executor/commands.py` is a deterministic grammar that turns one line into an `ExecutorAction` (or a refusal) and does nothing else: it imports only `app/executor/models.py`, reads no window and sends no input. `app/console.py` is the entry point: it parses, asks, and hands the action to `execute_with_recovery()` - the only way anything runs from here. No Claude, no fuzzy matching, no closest-command guessing; understanding loosely worded commands is Phase 3.
+- **The grammar** (the command word is case-insensitive; runs of whitespace count as one):
+
+  | Line | Action |
+  |---|---|
+  | `open <app>` | `OPEN_APP` |
+  | `close <app>` | `CLOSE_APP` |
+  | `close window` | `WINDOW_CONTROL close` |
+  | `click <x>, <y>` | `CLICK` |
+  | `type <text>` / `type "<text>"` | `TYPE_TEXT` |
+  | `shortcut <keys>` | `SHORTCUT` |
+  | `scroll up\|down <n>` | `SCROLL` |
+  | `refresh` | `REFRESH` |
+  | `minimize` / `maximize` / `restore`, each optionally followed by `window` | `WINDOW_CONTROL` |
+  | `help`, `exit` | the console itself; never actions |
+
+  The only alias is that optional `window`. `window` is therefore reserved after `close`, so an app can never be called "window".
+- **Parsing versus validation.** The parser picks the action and passes the raw target on; the Executor's own preparers still decide whether it is usable, so `click abc`, `shortcut ctrl+q`, `scroll 3`, `refresh now` and a bare `open` ("Which app should I open?") are refused there, with no side effects and nothing asked. The parser refuses only what the grammar itself decides: a bare `close` (**ambiguous** - close an app, or the active window? - never guessed), words after a window control, an unclosed quote, and anything unknown. Every unknown line gets the **same** message, so it can't hint at a nearest match. Nothing is executed in any of these cases.
+- **Typed text.** Everything after `type ` is text and is never re-read as a command (`type close window` types those words). Spaces inside it are kept exactly, spaces around it are not; `type "  hello  "` keeps them, and only the outer pair of quotes is the quoting (`type ""quoted""` types `"quoted"`). There are no escape characters, so a backslash is a backslash and **a line break can't be typed from a command in Phase 1**. Text is never logged, never repeated in a refusal and never put in a repr, and no refusal message quotes the line it refused, so a mistyped `type` can't leak either. The console logs nothing of the line; the Executor still logs its own targets (e.g. an app name) exactly as before.
+- **Focus hand-over - the console is itself the active window.** While you type, the window in front is the console, so a command that lands wherever the desktop's focus or pointer is would land on the console (`minimize` would minimize it; `type` would type into it). Those commands - **click, type, shortcut, scroll, refresh and window controls** - therefore wait for **you** to put the window you mean in front. `open` and `close <app>` don't, because they name the app. Every action kind is classified explicitly, an unclassified one fails safe by asking, and a rule test checks that a new action can't silently default to either.
+  - The console **only watches**: it reads which window is in front and whether a modifier key is held, and never activates a window or sends input. Focus counts as handed over once a window other than the console has been in front, with no modifier held (so the Alt+Tab switcher isn't mistaken for a window), for `console.focus_settle_seconds` (0.5 s), within `console.focus_handover_seconds` (15 s).
+  - A confirmation is answered in the console, which takes focus back, so after a "yes" it waits the same way again. If that hand-back doesn't happen, nothing is sent. The Executor's own "the window changed after you approved it" check stays the final word - the hand-over is a convenience, not a safety mechanism.
+  - The Phase 2/9 command window can hand focus back itself; this is the Phase 1 stand-in for that (see the Type Text limitation above).
+- **Confirmation by a real person - the first time this isn't a test fixture.** Medium risk and above prints the level, the rule and what will happen, and only the exact answer `yes` (any capitals, surrounding spaces ignored) allows it. `y`, `ok`, `yes please`, Enter, `no`, end of input and Ctrl+C all deny, matching the safety gate, which allows only a literal `True`. The retry offer uses the same answer.
+- **Emergency stop.** Every wait is interruptible, and **the console never resets the flag**: once it is set, each command reports it and nothing runs until the assistant is restarted. A stop while confirming is reported as a stop, not a denial, and an interrupted action comes back with how much had already happened. Ctrl+C in the console is *not* the emergency stop: it says so and leaves. Whether to wire it to the stop is part of the emergency-stop measurement task, which this entry point is built for: `handle_command()` is a plain function on the main thread, a trigger from any thread lands at the next checkpoint, and a stop comes back as its own status with the partial result rather than as a failure.
+- **Outcomes** (`CommandReply.status`): `refused` (the parser), `ran` (see the result), `denied` (the safety gate), `stopped`, `not_handed_over`.
+- **How this reaches Phase 3.** `handle_command()` is where later input arrives: the Phase 2 transcript, and a Phase 9 tray window with its own confirm and hand-over. The deterministic parser stays as the direct-command path Phase 3 needs when Claude is unreachable, and a line the parser calls unknown is what would go to Brain -> Planner, each planned action running through the same step.
+- **Tested.** 88 offline tests in `tests/test_executor_commands.py` (every supported form, case and whitespace, ambiguous/malformed/unknown lines, raw targets left to the Executor, all the typed-text rules, privacy with a planted leak, and rule tests that the parser imports nothing that can act and calls no adapter) and 81 in `tests/test_console.py` (a parsed command reaching `execute_with_recovery` and a refused one reaching nothing, LOW without a prompt and MEDIUM with one, the full answer table, the retry offer, hand-over classification and behaviour before and after a confirmation, the real hand-over watching and never switching, the emergency stop in four places, the loop with help/exit/blank lines/Ctrl+C/an unexpected failure, privacy, and rule tests that the console imports no adapter, runs only through `execute_with_recovery`, only reads from the Verifier and never triggers or resets the stop). Mutation checks: guessing what a bare `close` means (3 tests fail), turning an unknown line into the closest command (19), typing an unclosed quote as-is (5), logging typed text (8), accepting any answer starting with "y" (6), dropping the click hand-over (1), skipping the hand-back after a confirmation (3), ignoring a failed hand-over (1), resetting the stop (3), or importing an adapter (1).
+- **The Phase 1 acceptance run** (opt-in real-desktop test, 18 September 2026): ten different commands typed into the real console, back to back, 4.9 s in total, three confirmations. Test setup started its own Notepad as a scroll fixture (200 lines, put at the top) and opened a temporary folder in a new File Explorer window; the test, never the console, switched windows.
+
+  | # | Typed | Result |
+  |---|---|---|
+  | 1 | `refresh` (Explorer) | no prompt, `unverified`: "Pressed F5 to refresh File Explorer..." |
+  | 2 | `open calculator` | `done` after 1.3 s |
+  | 3 | `close calculator` | MEDIUM, `yes` -> `done` after 0.3 s |
+  | 4 | `open notepad` | `done` after 0.3 s |
+  | 5 | `maximize` | no prompt, `done`, read back as maximized |
+  | 6 | `type Hello from the typed-command test` | MEDIUM (`type 33 characters into window "Untitled - Notepad" (field: Edit)`), `yes` -> `done`, verified, `progress=(33, 33)` |
+  | 7 | `shortcut ctrl+a` | no prompt, `done` (everything selected) |
+  | 8 | `click 716, 264` (the fixture's text area) | MEDIUM, `yes` -> `unverified`, pointer at (716, 264) |
+  | 9 | `scroll down 3` (the same fixture) | no prompt, `done`, scroll position 0 -> 9 |
+  | 10 | `minimize` | no prompt, `done`, read back as minimized |
+
+  None of the prompts contained the typed text. Cleanup closed exactly the two Notepads the test started and its one Explorer window, deleted only its folder, put the pointer back, and left no Calculator window, no modifier held and the clipboard's change counter unchanged.
+- **Limitations and open decisions.**
+  - The interactive hand-over is clunky for a Medium command: switch to the window, switch back to answer, switch again. It is covered offline; the acceptance run scripts it as test code, so the waiting itself has only been tried by hand.
+  - A typed command can't press Enter or type a line break (no escape syntax, and Enter isn't a supported shortcut).
+  - There is still no way for a person to *trigger* the emergency stop while an action runs - that belongs to the measurement task, together with whether Ctrl+C should do it.
+  - Unchanged, as decided: the Executor logs an app name it was given (so a sentence typed after `open` is logged as an unknown app name). Only typed text is private.
+  - A console window that is itself a target can't be used: the hand-over always waits for a *different* window.
 
 ---
 

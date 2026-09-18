@@ -47,9 +47,20 @@ and minimized (LOW, each verified by reading the window state) and closed with c
 B (opened by the assistant) is closed with window control close (MEDIUM, approved); C is started by the
 TEST, not the assistant, so window control close must refuse it (nothing sent) and the test closes it.
 Alt+F4 is checked to be refused as a shortcut. Everything the test started is closed in finally.
+
+The typed-command test is Phase 1's acceptance run: ten different commands typed into the REAL console
+(app/console.py), back to back, each going through the normal Executor pipeline. As TEST setup it starts
+its own Notepad as a scroll fixture (filled with 200 lines, put at the top - it is what the click and
+scroll commands act on), and opens a temporary folder in a NEW File Explorer window. The commands open
+and close Calculator, open a Notepad and maximize, type into, select in and minimize it. The TEST, never
+the console, switches windows: the console only watches which window is in front. Confirmations are
+answered "yes" only when the console asked exactly what that command should ask. In finally it puts the
+pointer back and closes only the windows it started, leaving no Notepad, Calculator or Explorer window
+behind and never touching the clipboard.
 """
 import ctypes
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -617,3 +628,248 @@ def test_window_controls_on_notepads_the_test_started():
     assert [w.handle for w in leftovers] == [c.handle], "cleanup should only have had to close Notepad C"
     still_open = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "Notepad"}
     assert before <= still_open, "a Notepad that was already open was closed"
+
+
+# --- Typed commands: the Phase 1 acceptance run ---------------------------------------------------
+
+TYPED_TEXT = "Hello from the typed-command test"  # 33 characters, no line break
+
+
+def _step(line, target=None, expect_prompt=None):
+    """One typed command: the line, the window the person would switch to first (None if the command
+    doesn't depend on which window is in front), and the confirmation it must ask (None: must not ask)."""
+    return SimpleNamespace(line=line, target=target, expect_prompt=expect_prompt)
+
+
+def _bring_to_front(handle, seconds=5):
+    """TEST CODE standing in for the person switching windows. app/console.py never does this: it only
+    watches which window is in front."""
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32")
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
+    user32.SetForegroundWindow(handle)
+    if not _wait_active(handle, 1):
+        user32.SwitchToThisWindow(handle, True)
+    return _wait_active(handle, seconds)
+
+
+class TypedSession:
+    """Types commands into the REAL console (app/console.py) and answers its prompts, the way a person
+    would. Nothing reaches the Executor any other way."""
+
+    def __init__(self, steps):
+        self.steps = list(steps)
+        self.index = -1
+        self.current = None
+        self.written = []
+        self.since_command = []
+        self.confirmations = []
+        self.replies = []
+
+    def read(self, prompt=""):
+        if prompt.startswith(">"):
+            self.index += 1
+            if self.index >= len(self.steps):
+                return "exit"
+            self.current = self.steps[self.index]
+            self.since_command = []
+            print(f"\ntyped [{self.index + 1}]> {self.current.line}")
+            return self.current.line
+        asked = "\n".join(self.since_command)  # everything the console said before it asked
+        expected = self.current.expect_prompt
+        answer = "yes" if expected and expected in asked else "no"
+        self.confirmations.append((self.index + 1, asked, answer))
+        print(f"  console asked: {asked!r} -> {answer}")
+        return answer
+
+    def write(self, text=""):
+        self.written.append(str(text))
+        self.since_command.append(str(text))
+        print(f"  {text}")
+
+
+class TypedFocus:
+    """The focus hand-over, done by the TEST: it puts the window the current command is for in front, and
+    refuses - so nothing runs - if that window isn't in front afterwards."""
+
+    def __init__(self, session):
+        self.session = session
+        self.calls = []
+
+    def note_console_window(self):
+        self.calls.append((self.session.index + 1, "noted"))
+
+    def hand_over(self, prompt):
+        step = self.session.current
+        self.calls.append((self.session.index + 1, prompt))
+        assert step.target, f"command {step.line!r} asked for a hand-over but the test names no window"
+        if not _bring_to_front(step.target):
+            return f"the test couldn't put window {step.target:#x} in front"
+        return None
+
+
+@pytest.mark.real_desktop
+def test_ten_typed_commands_back_to_back_through_the_console():
+    """Phase 1's done-when: ten different typed commands, through the real typed-command entry point and
+    the normal Executor pipeline, back to back with no code changes between them."""
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from app import console
+
+    emergency_stop.reset("real-desktop-test")
+    expectation = verifier.expect_window("notepad")
+    notepads_before = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "Notepad"}
+    matching_before = verifier.snapshot_windows(expectation)
+    calculator = verifier.expect_window("calculator")
+    calculators_before = verifier.snapshot_windows(calculator)
+    explorers_before = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "CabinetWClass"}
+    original_pointer = verifier_adapter.cursor_position()
+    clipboard_before = verifier.clipboard_sequence()
+    folder = Path(tempfile.mkdtemp(prefix="companion-typed-test-"))
+    print(f"\ntyped: temporary folder {folder.name}; pointer at {original_pointer}")
+
+    fixture = fixture_field = session_notepad = session_field = None
+    leftovers, calc_left, explorer_left, folder_removed = [], [], [], False
+    try:
+        # --- TEST SETUP (not typed commands): the scroll fixture Notepad and an Explorer window ---
+        subprocess.Popen(["notepad.exe"])  # started by the TEST, deliberately NOT a session window
+        fixture = _wait_for(lambda: _new_notepads(notepads_before), 15)
+        assert fixture, "the test's scroll-fixture Notepad didn't appear"
+        fixture = fixture[0]
+        assert _wait_active(fixture.handle, 2) or _bring_to_front(fixture.handle), \
+            "the scroll fixture isn't in front - not filling it"
+        fixture_field = verifier_adapter.active_target().control_handle
+        _fill_with_lines(fixture_field, 200)
+        _scroll_to_top(fixture_field)
+        start_scroll = verifier_adapter.vertical_scroll(fixture_field)
+        click_x, click_y = _text_area_centre(fixture_field)
+        print(f"typed: scroll fixture {fixture.handle:#x}, scroll bar {start_scroll}, "
+              f"click point ({click_x}, {click_y})")
+        assert start_scroll is not None and start_scroll.at_top and not start_scroll.at_bottom
+
+        subprocess.Popen(["explorer.exe", str(folder)])  # test setup: a NEW Explorer window on the test's folder
+        explorer = _wait_for(lambda: _explorer_windows_for(folder.name, explorers_before), 15)
+        assert explorer, "the test's File Explorer window didn't appear"
+        explorer = explorer[0]
+
+        # --- THE TEN TYPED COMMANDS ---
+        steps = [
+            _step("refresh", explorer.handle),
+            _step("open calculator"),
+            _step("close calculator", expect_prompt="close app calculator"),
+            _step("open notepad"),
+            _step("maximize"),                      # target filled in once the assistant's Notepad exists
+            _step(f"type {TYPED_TEXT}", expect_prompt="type 33 characters into window"),
+            _step("shortcut ctrl+a"),
+            _step(f"click {click_x}, {click_y}", fixture.handle,
+                  expect_prompt=f"click at ({click_x}, {click_y}) on window"),
+            _step("scroll down 3", fixture.handle),
+            _step("minimize"),
+        ]
+        session = TypedSession(steps)
+        focus = TypedFocus(session)
+        real_handle_command = console.handle_command
+
+        observed = []  # what the desktop looked like right AFTER each command (before the next one)
+
+        def recording(text, **kwargs):  # the real entry point; the test only records what came back
+            nonlocal session_field, session_notepad
+            reply = real_handle_command(text, **kwargs)
+            session.replies.append(reply)
+            if reply.action is not None and reply.action.kind == OPEN_APP and reply.action.target == "notepad":
+                found = [w for w in _new_notepads(notepads_before) if w.handle != fixture.handle]
+                assert found, "the Notepad the assistant opened wasn't found"
+                session_notepad = found[0]
+                for step in (steps[4], steps[5], steps[6], steps[9]):  # the commands that act on it
+                    step.target = session_notepad.handle
+                session_field = verifier_adapter.active_target().control_handle  # for cleanup only
+            observed.append(SimpleNamespace(
+                state=verifier_adapter.window_state(session_notepad.handle) if session_notepad else None,
+                scroll=verifier_adapter.vertical_scroll(fixture_field),
+                pointer=verifier_adapter.cursor_position()))
+            return reply
+        console.handle_command = recording
+        try:
+            started = time.monotonic()
+            exit_code = console.run_console(read=session.read, write=session.write, focus=focus)
+        finally:
+            console.handle_command = real_handle_command
+        elapsed = time.monotonic() - started
+        session_notepad = next(w for w in _new_notepads(notepads_before) if w.handle != fixture.handle)
+        print(f"\ntyped: ten commands took {elapsed:.1f}s; exit code {exit_code}; "
+              f"{len(session.confirmations)} confirmation(s)")
+
+        # --- What each command must have done ---
+        assert exit_code == 0 and len(session.replies) == 10, [r.status for r in session.replies]
+        for step, reply in zip(steps, session.replies):
+            print(f"typed: {step.line!r} -> {reply.status.value}/"
+                  f"{reply.result.outcome.value if reply.result else None}: {reply.message}")
+        assert all(r.status.value == "ran" and r.result.ok for r in session.replies), \
+            [(r.status.value, r.message) for r in session.replies]
+
+        refresh, calc_open, calc_close, np_open, maximize, typing, select, click, scroll, minimize = session.replies
+        assert refresh.result.outcome is Outcome.UNVERIFIED
+        assert refresh.message == "Pressed F5 to refresh File Explorer. I can't confirm the refresh happened."
+        assert calc_open.result.outcome is Outcome.DONE and calc_open.message.startswith("Opened calculator")
+        assert calc_close.result.outcome is Outcome.DONE and calc_close.message.startswith("Closed calculator")
+        assert np_open.result.outcome is Outcome.DONE and np_open.message.startswith("Opened notepad")
+        assert maximize.result.outcome is Outcome.DONE and maximize.message == "Maximized the window."
+        assert observed[4].state.maximized, "the window wasn't maximized after the maximize command"
+        assert typing.result.outcome is Outcome.DONE and typing.result.verified
+        assert typing.result.progress == (33, 33) and TYPED_TEXT not in typing.message
+        assert select.result.outcome is Outcome.DONE, select.message
+        assert click.result.outcome is Outcome.UNVERIFIED
+        assert click.message == f"Clicked at ({click_x}, {click_y}). I can't check what the click did."
+        assert observed[7].pointer == (click_x, click_y)
+        assert scroll.result.outcome is Outcome.DONE and scroll.result.progress == (3, 3)
+        print(f"typed: scroll fixture position {start_scroll.position} -> {observed[8].scroll}")
+        assert observed[8].scroll.position > start_scroll.position, "the fixture Notepad didn't actually scroll"
+        assert minimize.result.outcome is Outcome.DONE and minimize.message == "Minimized the window."
+        assert observed[9].state.minimized, "the window wasn't minimized after the minimize command"
+
+        # --- Exactly three confirmations, and the hand-over for every command that lands on the desktop ---
+        assert [number for number, _, _ in session.confirmations] == [3, 6, 8], session.confirmations
+        assert all(answer == "yes" for _, _, answer in session.confirmations), session.confirmations
+        assert not any(TYPED_TEXT in asked for _, asked, _ in session.confirmations)  # never the text itself
+        handed = [number for number, prompt in focus.calls if prompt != "noted"]
+        assert handed == [1, 5, 6, 6, 7, 8, 8, 9, 10], focus.calls  # twice where a confirmation came between
+        assert TYPED_TEXT not in "\n".join(session.written)
+    finally:
+        _test_user32().SetCursorPos(*original_pointer)  # always put the user's pointer back
+        for field in (session_field, fixture_field):
+            if field:
+                _discard_test_text(field)  # test cleanup: its own Notepads then close without a save dialog
+        for w in _new_notepads(notepads_before):
+            ctypes.windll.user32.PostMessageW(ctypes.c_void_p(w.handle), WM_CLOSE, 0, 0)
+            leftovers.append(w)
+        _wait_for(lambda: not _new_notepads(notepads_before), CLEANUP_SECONDS)
+        calc_left = _close_windows_opened_since("calculator", calculator, calculators_before,
+                                                watch_seconds=WATCH_AFTER_DONE_SECONDS)
+        explorer_left = _explorer_windows_for(folder.name, explorers_before)
+        for w in explorer_left:
+            ctypes.windll.user32.PostMessageW(ctypes.c_void_p(w.handle), WM_CLOSE, 0, 0)
+        _wait_for(lambda: not _explorer_windows_for(folder.name, explorers_before), CLEANUP_SECONDS)
+        try:
+            shutil.rmtree(folder)
+            folder_removed = True
+        except OSError as exc:
+            print(f"typed: couldn't delete the temporary folder yet: {exc!r}")
+        print(f"typed: cleanup closed {len(leftovers)} Notepad(s), {len(calc_left)} Calculator window(s), "
+              f"{len(explorer_left)} Explorer window(s)")
+    assert _new_notepads(notepads_before) == [], "a Notepad the test started is still open"
+    assert sorted(w.handle for w in leftovers) == sorted([fixture.handle, session_notepad.handle]), \
+        "cleanup should have closed exactly the scroll fixture and the Notepad the assistant opened"
+    assert calc_left == [], "the typed close command should have closed Calculator"
+    assert len(explorer_left) == 1 and _explorer_windows_for(folder.name, explorers_before) == []
+    assert folder_removed and not folder.exists()
+    assert verifier_adapter.cursor_position() == original_pointer
+    assert verifier_adapter.modifier_keys_down() == [], "a modifier key reads as still held down"
+    assert verifier.clipboard_sequence() == clipboard_before, "the clipboard changed"
+    assert matching_before <= verifier.snapshot_windows(expectation), "a Notepad that was already open was closed"
+    assert calculators_before <= verifier.snapshot_windows(calculator), "a Calculator that was already open was closed"
+    still_open = {w.handle for w in verifier_adapter.list_windows() if w.class_name == "CabinetWClass"}
+    assert explorers_before <= still_open, "a File Explorer window that was already open was closed"
