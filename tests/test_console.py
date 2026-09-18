@@ -19,7 +19,7 @@ import pytest
 import main
 from app import console
 from app.console import CommandReply, FocusHandover, Status, handle_command, run_console
-from app.executor import adapter, commands, emergency_stop
+from app.executor import adapter, commands, emergency_stop, hotkey
 from app.executor import logic as executor_logic
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError
 from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, TYPE_TEXT, WINDOW_CONTROL, ActionResult, ExecutorAction, \
@@ -651,3 +651,63 @@ def test_main_without_console_still_runs_the_health_check(monkeypatch):
 def test_console_and_check_claude_cannot_be_combined():
     with pytest.raises(SystemExit):
         main.main(["--console", "--check-claude"])
+
+
+# --- The emergency-stop hotkey, as the console sees it ---------------------------------------------
+
+def hotkey_state(monkeypatch, *states):
+    """Make hotkey.status() answer with each state in turn (the last one repeats)."""
+    seen = list(states)
+
+    def status():
+        return seen[0] if len(seen) == 1 else seen.pop(0)
+    monkeypatch.setattr(hotkey, "status", status)
+
+
+def test_the_startup_line_says_what_to_press(world, monkeypatch):
+    hotkey_state(monkeypatch, hotkey.HotkeyStatus(hotkey.ACTIVE, "Ctrl+Alt+Backspace"))
+    scripted = ScriptedConsole(["exit"])
+    run_console(read=scripted.read, write=scripted.write, focus=ScriptedFocus())
+    assert "Emergency stop: press Ctrl+Alt+Backspace at any time" in scripted.output
+
+
+def test_the_startup_line_says_when_there_is_no_hotkey(world, monkeypatch):
+    hotkey_state(monkeypatch, hotkey.HotkeyStatus(hotkey.UNAVAILABLE, "Ctrl+Alt+Backspace",
+                                                  "another program has already registered that key combination"))
+    scripted = ScriptedConsole(["exit"])
+    run_console(read=scripted.read, write=scripted.write, focus=ScriptedFocus())
+    assert "is NOT active" in scripted.output and "another program" in scripted.output
+
+
+def test_a_hotkey_that_stops_working_is_reported_once(world, monkeypatch):
+    active = hotkey.HotkeyStatus(hotkey.ACTIVE, "Ctrl+Alt+Backspace")
+    broken = hotkey.HotkeyStatus(hotkey.FAILED, "Ctrl+Alt+Backspace", "Windows stopped delivering messages.")
+    hotkey_state(monkeypatch, active, active, broken)
+    scripted = ScriptedConsole(["minimize", "minimize", "minimize", "exit"])
+    run_console(read=scripted.read, write=scripted.write, focus=ScriptedFocus())
+    assert scripted.output.count("has stopped working") == 1, scripted.output  # said once, not before every command
+    assert "Windows stopped delivering messages." in scripted.output
+
+
+def test_the_console_never_starts_or_stops_the_hotkey(world, monkeypatch):
+    for name in ("start", "stop"):
+        monkeypatch.setattr(hotkey, name, lambda *a, **k: pytest.fail("the console must not manage the listener"))
+    scripted = ScriptedConsole(["minimize", "exit"])
+    run_console(read=scripted.read, write=scripted.write, focus=ScriptedFocus())
+
+
+def test_main_console_runs_inside_the_hotkey_listener(monkeypatch):
+    order = []
+    monkeypatch.setattr(main.hotkey, "start", lambda: order.append("start") or hotkey.HotkeyStatus(hotkey.ACTIVE, "X"))
+    monkeypatch.setattr(main.hotkey, "stop", lambda: order.append("stop"))
+    monkeypatch.setattr(main, "run_console", lambda: order.append("console") or 0)
+    assert main.main(["--console"]) == 0
+    assert order == ["start", "console", "stop"]  # started before, stopped after - even though it is a daemon
+
+
+def test_the_help_text_names_the_configured_hotkey(monkeypatch, capsys):
+    monkeypatch.setattr(hotkey, "configured_name", lambda: "Ctrl+Alt+Backspace")
+    with pytest.raises(SystemExit):
+        main.main(["--help"])
+    printed = capsys.readouterr().out
+    assert "Ctrl+Alt+Backspace" in printed and hotkey.SETTING in printed

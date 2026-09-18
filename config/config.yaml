@@ -60,6 +60,11 @@ executor:
   # emergency stop and a change of active window are checked before every character).
   max_type_characters: 1000
   typing_interval_seconds: 0.01
+  # Emergency stop: one system-wide key combination that stops whatever the assistant is doing, from
+  # any window (app/executor/hotkey.py). Ctrl, Alt, Shift and Win may be combined with one key that
+  # types nothing: Backspace, Esc, Insert, Pause or F1-F24. Combinations Windows keeps for itself
+  # (Ctrl+Alt+Delete, Ctrl+Shift+Esc, Win+L) are refused. Changing it needs a restart.
+  emergency_stop_hotkey: "Ctrl+Alt+Backspace"
   # Scroll: most wheel notches per command; fewer where no standard scroll bar can be identified
   # (browsers, WPF, Store apps), so a mis-scrolled unknown control moves only a little; pause between notches.
   max_scroll_notches: 20

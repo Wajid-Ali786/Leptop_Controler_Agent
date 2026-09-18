@@ -30,7 +30,12 @@ bar or the Start menu.
 Scrolling sends one mouse-wheel notch per SendInput call, at the pointer's current position (no
 coordinates are sent and the pointer is never moved).
 
-Every function here performs a real action on the computer, so nothing may call it except
+The global emergency-stop hotkey is registered with RegisterHotKey, so Windows delivers ONLY that
+one combination to us: no keyboard hook, no key polling, no other keystroke ever seen. Those
+functions send nothing and change nothing; app/executor/hotkey.py is the only caller, and a press
+does exactly one thing - the existing emergency stop.
+
+Every other function here performs a real action on the computer, so nothing may call it except
 app/executor/logic.py, which routes every action through app/safety first (CLAUDE.md rule 5).
 """
 import ctypes
@@ -314,3 +319,109 @@ def request_window_state(handle: int, operation: str) -> None:
     if error == _WINDOWS_ACCESS_DENIED:
         raise WindowControlError("it runs with administrator rights, and the assistant doesn't run elevated")
     raise WindowControlError(f"Windows refused the request (error {error})")
+
+
+# --- Global emergency-stop hotkey -------------------------------------------------------------
+# RegisterHotKey is deliberate: Windows delivers ONLY the one registered combination to us, so no
+# keyboard hook and no key polling is needed and no other keystroke is ever seen. These functions
+# send nothing and change nothing on the desktop; app/executor/hotkey.py owns the thread that uses
+# them, and the only thing a press does is call the existing emergency stop (CLAUDE.md rule 4).
+
+_WM_QUIT = 0x0012
+_WM_HOTKEY = 0x0312
+_WM_USER = 0x0400
+_PM_NOREMOVE = 0x0000
+_WINDOWS_HOTKEY_TAKEN = 1409  # ERROR_HOTKEY_ALREADY_REGISTERED
+
+HOTKEY_MESSAGE, QUIT_MESSAGE, OTHER_MESSAGE = "hotkey", "quit", "other"
+
+
+class HotkeyError(ExecutorAdapterError):
+    """A global hotkey couldn't be registered or watched."""
+
+
+class _HotkeyApi:
+    def __init__(self):
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.UnregisterHotKey.restype = wintypes.BOOL
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int  # -1 is a real failure, so this must NOT be BOOL
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+                                        wintypes.UINT]
+        user32.PeekMessageW.restype = wintypes.BOOL
+        user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostThreadMessageW.restype = wintypes.BOOL
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        self.user32, self.kernel32, self.MSG = user32, kernel32, wintypes.MSG
+
+
+_hotkey_api = None
+
+
+def _hotkey() -> _HotkeyApi:
+    global _hotkey_api
+    if sys.platform != "win32":
+        raise HotkeyError("a global hotkey is only supported on Windows")
+    if _hotkey_api is None:
+        _hotkey_api = _HotkeyApi()
+    return _hotkey_api
+
+
+def current_thread_id() -> int:
+    """The Windows id of the calling thread - the thread a hotkey is delivered to."""
+    return int(_hotkey().kernel32.GetCurrentThreadId())
+
+
+def create_message_queue() -> None:
+    """Make Windows create this thread's message queue, so a WM_QUIT posted to it can't be lost."""
+    api = _hotkey()
+    message = api.MSG()
+    api.user32.PeekMessageW(ctypes.byref(message), None, _WM_USER, _WM_USER, _PM_NOREMOVE)
+
+
+def register_hotkey(hotkey_id: int, modifiers: int, virtual_key: int) -> None:
+    """Register one system-wide hotkey for the CALLING thread; its presses arrive as messages there."""
+    api = _hotkey()
+    if api.user32.RegisterHotKey(None, hotkey_id, modifiers, virtual_key):
+        return
+    error = ctypes.get_last_error()
+    if error == _WINDOWS_HOTKEY_TAKEN:
+        raise HotkeyError("another program has already registered that key combination")
+    raise HotkeyError(f"Windows refused the key combination (error {error})")
+
+
+def unregister_hotkey(hotkey_id: int) -> bool:
+    """Give the hotkey back. Must run on the thread that registered it. Never raises."""
+    try:
+        return bool(_hotkey().user32.UnregisterHotKey(None, hotkey_id))
+    except Exception:  # shutting down must never fail because of this
+        return False
+
+
+def wait_for_hotkey_message() -> tuple[str, int | None]:
+    """Block until this thread gets a message: ("hotkey", id), ("quit", None) for WM_QUIT, or
+    ("other", None). Raises HotkeyError if Windows reports a failure, which must end the loop."""
+    api = _hotkey()
+    message = api.MSG()
+    result = int(api.user32.GetMessageW(ctypes.byref(message), None, 0, 0))
+    if result == -1:  # a real error: the caller must stop, never loop on this
+        raise HotkeyError(f"Windows stopped delivering messages (error {ctypes.get_last_error()})")
+    if result == 0:
+        return QUIT_MESSAGE, None
+    if message.message == _WM_HOTKEY:
+        return HOTKEY_MESSAGE, int(message.wParam)
+    return OTHER_MESSAGE, None
+
+
+def post_quit_to_thread(thread_id: int) -> bool:
+    """Ask the listener thread to end its message loop. False if it is already gone. Never raises."""
+    try:
+        return bool(_hotkey().user32.PostThreadMessageW(thread_id, _WM_QUIT, 0, 0))
+    except Exception:
+        return False

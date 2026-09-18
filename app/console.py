@@ -27,7 +27,9 @@ Ctrl+C, denies it, matching the safety gate, which allows only a literal True.
 
 Emergency stop. Every wait here is interruptible, and the flag is never reset from the console: once
 it is set, every command reports it and nothing runs until the assistant is restarted. A stop that
-interrupts an action comes back as STOPPED, carrying how much had already happened.
+interrupts an action comes back as STOPPED, carrying how much had already happened. The global hotkey
+(app/executor/hotkey.py, started by main.py --console) is what a person presses to cause one, from any
+window; this module only reports whether it is active. Ctrl+C here is NOT the emergency stop.
 
 Privacy: the console never logs the line you typed or the confirmation prompts, and prints only
 messages the Executor already made safe to show (typed text is never in them).
@@ -38,7 +40,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
-from app.executor import commands, emergency_stop
+from app.executor import commands, emergency_stop, hotkey
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError
 from app.executor.logic import execute_with_recovery
 from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL, \
@@ -63,6 +65,7 @@ NO_FRONT_WINDOW = "I can't tell which window is in front, so I did nothing."
 DIDNT_SWITCH = "You didn't switch to another window, so I did nothing."
 INTERRUPTED = ("Interrupted with Ctrl+C. That is not the emergency stop and wasn't measured; if an action had "
                "started, part of it may have happened.")
+HOTKEY_LOST = "The emergency-stop hotkey has stopped working: {reason} Nothing can interrupt an action by keyboard."
 
 log = logging.getLogger(__name__)
 
@@ -191,9 +194,14 @@ class FocusHandover:
 def run_console(read=input, write=print, focus=None) -> int:
     """Read typed commands and run them one at a time until the user leaves. Returns an exit code."""
     write(WELCOME)
+    write(_hotkey_line(hotkey.status()))
+    was_active = hotkey.status().active
     focus = FocusHandover(write) if focus is None else focus
     confirm, offer_retry = _confirm(read, write), _offer_retry(read, write)
     while True:
+        if was_active and not hotkey.status().active:  # said once, when it changes - not before every command
+            was_active = False
+            write(HOTKEY_LOST.format(reason=hotkey.status().reason or "it is no longer registered."))
         try:
             line = read("> ")
         except (EOFError, KeyboardInterrupt):
@@ -218,6 +226,15 @@ def run_console(read=input, write=print, focus=None) -> int:
             write(f"Something went wrong ({type(exc).__name__}); nothing else was tried.")
             continue
         write(reply.message)
+
+
+def _hotkey_line(state) -> str:
+    """One line so the emergency stop isn't a secret: what to press, or why there is nothing to press."""
+    if state.active:
+        return f"Emergency stop: press {state.hotkey} at any time - it works even when this window isn't in front."
+    reason = f" ({state.reason})" if state.reason else ""
+    return (f"Emergency stop hotkey {state.hotkey} is NOT active{reason}. "
+            f"Nothing can interrupt an action by keyboard.")
 
 
 # --- Prompts ----------------------------------------------------------------------------------

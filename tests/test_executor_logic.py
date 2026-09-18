@@ -380,20 +380,23 @@ def _python_files():
 
 
 @pytest.mark.parametrize("package, allowed", [
-    ("app.executor", "app/executor/logic.py"),
-    ("app.verifier", "app/verifier/logic.py"),
+    # hotkey.py registers the global emergency-stop hotkey, which sends nothing and acts on nothing.
+    # tests/test_executor_hotkey.py limits it to the adapter's five hotkey functions.
+    ("app.executor", ("app/executor/logic.py", "app/executor/hotkey.py")),
+    ("app.verifier", ("app/verifier/logic.py",)),
 ])
 def test_only_each_modules_logic_uses_its_adapter(package, allowed):
     """Every real action must pass the safety gate in executor.execute(), and desktop reads go
     through verifier logic; nothing may call either adapter directly."""
     root = settings.PROJECT_ROOT
+    allowed_paths = {root / name for name in allowed}
     offenders = [
         f"{path.relative_to(root)}: {module} {name}".strip()
-        for path in _python_files() if path != root / allowed
+        for path in _python_files() if path not in allowed_paths
         for module, name in _imports(path)
         if module == f"{package}.adapter" or (module == package and name == "adapter")
     ]
-    assert offenders == [], f"Only {allowed} may use {package}.adapter: {offenders}"
+    assert offenders == [], f"Only {', '.join(allowed)} may use {package}.adapter: {offenders}"
 
 
 def test_only_executor_adapter_controls_the_computer():
