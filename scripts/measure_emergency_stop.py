@@ -18,8 +18,11 @@ do NOT include the physical keyboard and driver path:
     C  synthetic key press  ->  the action actually stopped             (SYNTHETIC)
 
 A physical press can't be timestamped from Python, so --physical proves only that pressing the keys
-by hand really triggers the stop. Nothing here sets or checks a pass threshold: that comes after
-reading the numbers.
+by hand really triggers the stop. That is REACHABILITY evidence, never a timing measurement.
+
+Since 18 September 2026 a run also judges itself against the thresholds the project owner approved
+(docs/step4 Section 4) and exits 1 if any of them is missed. If a run fails, report the numbers and
+stop: never loosen a threshold, and never tune the code to chase one.
 """
 import argparse
 import ctypes
@@ -79,6 +82,8 @@ def _user32():
     user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
     user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
     return user32
 
 
@@ -339,7 +344,7 @@ def percentile(values, fraction):
     return ordered[index]
 
 
-def report(name, rows, note=""):
+def report(key, name, rows, note=""):
     print(f"\n=== {name} ({len(rows)} trials) {note}")
     for trial in rows:
         print(trial.row())
@@ -356,7 +361,135 @@ def report(name, rows, note=""):
     print(f"  action retried after the stop:  {retried or 'never'}")
     if missed:
         print(f"  trials needing a look: {[(t.number, t.note) for t in rows if t.note]}")
-    return rows
+    return Scenario(key, name, rows)
+
+
+# --- Acceptance: the approved Phase 1 thresholds ---------------------------------------------------
+# Approved by the project owner on 18 September 2026, after reading the first measurement. They judge
+# the SYNTHETIC path only - SendInput -> WM_HOTKEY -> the existing emergency stop -> the Executor stops
+# - and make no claim about physical keyboard or driver latency. A failing run is reported as it is:
+# the thresholds are not adjusted to make a run pass, and the code is not tuned to chase a number.
+
+HARD_MAX_C_MS = 100.0         # rule 1: EVERY timed trial of EVERY scenario
+TYPICAL_MEDIAN_C_MS = 25.0    # rule 2: the two 20-trial scenarios only
+TYPICAL_P95_C_MS = 50.0
+# rule 3: idle and one-shot keep the hard maximum and are deliberately given no p95 requirement -
+# 5 one-shot trials are far too few to support one.
+TYPICAL_SCENARIOS = ("typing", "scrolling")
+
+
+class Check:
+    """One approved threshold, measured. `value` is in milliseconds, or None if nothing was timed."""
+
+    def __init__(self, label, value, limit):
+        self.label, self.value, self.limit = label, value, limit
+        self.passed = value is not None and value <= limit
+
+    def line(self):
+        measured = f"{self.value:7.1f} ms" if self.value is not None else "      - ms"
+        return (f"      {self.label:<10} {measured}  <=  {self.limit:6.1f} ms   "
+                f"{'PASS' if self.passed else 'FAIL'}")
+
+
+class Scenario:
+    """One scenario's trials, and how they measure against the thresholds that apply to it."""
+
+    def __init__(self, key, name, rows):
+        self.key, self.name, self.rows = key, name, rows
+
+    @property
+    def timings(self):
+        """Every trial's end-to-end latency C, in milliseconds."""
+        return sorted(trial.c * 1000 for trial in self.rows if trial.c is not None)
+
+    def checks(self):
+        values = self.timings
+        if not values:
+            return [Check("max C", None, HARD_MAX_C_MS)]
+        checks = [Check("max C", max(values), HARD_MAX_C_MS)]
+        if self.key in TYPICAL_SCENARIOS:  # rule 2
+            checks.append(Check("median C", statistics.median(values), TYPICAL_MEDIAN_C_MS))
+            checks.append(Check("p95 C", percentile(values, 0.95), TYPICAL_P95_C_MS))
+        return checks
+
+    def continued(self):
+        """Rule 4: trials where input carried on after the stop took effect (for the one-shot
+        scenario, where anything at all was sent)."""
+        return [trial.number for trial in self.rows if trial.continued]
+
+    def retried(self):
+        """Rule 4: trials where a stopped action was offered for retry."""
+        return [trial.number for trial in self.rows if trial.retried]
+
+    def untimed(self):
+        """Trials where no stop was measured at all. Not one of the four rules - it means the run
+        itself didn't observe what it claims to, so the result can't be called a pass."""
+        return [trial.number for trial in self.rows if trial.c is None]
+
+    def failures(self):
+        reasons = [f"{self.name}: {check.label} "
+                   f"{'not measured' if check.value is None else f'{check.value:.1f} ms'} "
+                   f"exceeds the {check.limit:.1f} ms threshold"
+                   for check in self.checks() if not check.passed]
+        if self.continued():
+            reasons.append(f"{self.name}: input continued after the stop in trial(s) {self.continued()}")
+        if self.retried():
+            reasons.append(f"{self.name}: a stopped action was retried in trial(s) {self.retried()}")
+        if self.untimed():
+            reasons.append(f"{self.name}: no stop was measured in trial(s) {self.untimed()}")
+        return reasons
+
+
+class Verdict:
+    """The whole acceptance run: every scenario, and whether all four approved rules held."""
+
+    def __init__(self, scenarios):
+        self.scenarios = list(scenarios)
+
+    @property
+    def failures(self):
+        return [reason for scenario in self.scenarios for reason in scenario.failures()]
+
+    @property
+    def passed(self):
+        return bool(self.scenarios) and not self.failures
+
+    @property
+    def trials(self):
+        return sum(len(scenario.rows) for scenario in self.scenarios)
+
+
+def print_acceptance(verdict):
+    """The pass/fail report: trial count, min/median/p95/max, every threshold, and the two
+    non-timing rules, per scenario and then overall."""
+    print("\n=== Acceptance against the approved Phase 1 thresholds (SYNTHETIC input)")
+    print(f"  C = synthetic key press -> the action actually stopped. "
+          f"Thresholds: every trial <= {HARD_MAX_C_MS:.0f} ms; "
+          f"median <= {TYPICAL_MEDIAN_C_MS:.0f} ms and p95 <= {TYPICAL_P95_C_MS:.0f} ms "
+          f"for {' and '.join(TYPICAL_SCENARIOS)}.")
+    for scenario in verdict.scenarios:
+        values = scenario.timings
+        stats = (f"min {min(values):.1f} | median {statistics.median(values):.1f} | "
+                 f"p95 {percentile(values, 0.95):.1f} | max {max(values):.1f} ms" if values
+                 else "nothing timed")
+        print(f"\n  {scenario.name} - {len(scenario.rows)} trials, {len(values)} timed")
+        print(f"      C: {stats}")
+        for check in scenario.checks():
+            print(check.line())
+        print(f"      input continued after the stop: {scenario.continued() or 'never'}")
+        print(f"      stopped action retried:         {scenario.retried() or 'never'}")
+        if scenario.untimed():
+            print(f"      NO STOP MEASURED in trial(s):   {scenario.untimed()}")
+    print(f"\n=== RESULT: {'PASS' if verdict.passed else 'FAIL'} "
+          f"over {verdict.trials} trials in {len(verdict.scenarios)} scenarios")
+    for reason in verdict.failures:
+        print(f"  FAILED: {reason}")
+    if not verdict.passed:
+        print("  Report these numbers as they are. Do not loosen a threshold and do not tune the code "
+              "to chase one.")
+    print("  These thresholds judge the synthetic path only; they make no claim about physical "
+          "keyboard latency.")
+    return verdict
 
 
 # --- Physical checks (a person presses the keys) --------------------------------------------------
@@ -392,15 +525,51 @@ def physical_check(chosen, elevated=False, seconds=60):
 
 # --- Main ---------------------------------------------------------------------------------------------
 
-def open_notepad():
+def bring_to_front(handle, seconds=2.0):
+    """HARNESS code standing in for the person switching windows - the assistant never activates a
+    window. Only ever called on the Notepad this run opened itself."""
+    user32 = _user32()
+    user32.SetForegroundWindow(handle)
+    deadline = time.monotonic() + seconds
+    switched = False
+    while time.monotonic() < deadline:
+        target = verifier.active_target()
+        if target.window is not None and target.window.handle == handle:
+            return True
+        if not switched:  # Windows can refuse SetForegroundWindow while another app owns the front
+            user32.SwitchToThisWindow(handle, True)
+            switched = True
+        time.sleep(0.1)
+    return False
+
+
+def open_notepad(seconds=10.0):
+    """Open the measurement's own Notepad and get it to the front.
+
+    Nothing is measured against a window that isn't the active one (typing would land somewhere else),
+    and never against a Notepad this run didn't open: the handles present beforehand are remembered.
+    A run that can't get there closes the Notepad it opened rather than leaving it behind."""
+    expectation = verifier.expect_window("notepad")
+    before = verifier.snapshot_windows(expectation)
     result = execute_with_recovery(ExecutorAction(OPEN_APP, "notepad"))
     print(f"  {result.message}")
     if not result.ok:
         raise SystemExit("couldn't open the Notepad this measurement types into")
-    target = verifier.active_target()
-    if target.window is None or target.window.class_name != "Notepad" or not target.control_handle:
-        raise SystemExit("the Notepad this measurement opened isn't in front; nothing was measured")
-    return target.window, target.control_handle
+    opened = verifier.snapshot_windows(expectation) - before
+    deadline = time.monotonic() + seconds
+    while True:
+        target = verifier.active_target()
+        if (target.window is not None and target.window.class_name == "Notepad" and target.control_handle
+                and (not opened or target.window.handle in opened)):
+            return target.window, target.control_handle
+        if opened:
+            bring_to_front(next(iter(opened)))
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    close_notepad(None, None)
+    raise SystemExit(f"the Notepad this measurement opened didn't come to the front within {seconds:.0f}s, "
+                     f"so nothing was measured (its window was closed again).")
 
 
 def close_notepad(window, field):
@@ -416,8 +585,51 @@ def close_notepad(window, field):
         print("  cleanup posted a close request to the measurement's own Notepad")
 
 
+DEFAULT_COUNTS = {"idle": 20, "typing": 20, "scrolling": 20, "one-shot": 5}
+
+
+def acceptance_run(counts=None):
+    """THE acceptance path: run every scenario and judge it against the approved thresholds.
+
+    Starts and stops the hotkey listener itself, opens and closes its own Notepad, and always puts the
+    mouse pointer back. Returns a Verdict; it never adjusts a threshold and never retries a failure.
+    The opt-in real-desktop test calls this, so there is one measurement system, not two."""
+    counts = dict(counts or DEFAULT_COUNTS)
+    emergency_stop.reset("measurement")
+    state = hotkey.start()
+    chosen = hotkey.configured()
+    print(f"Emergency-stop hotkey: {state.hotkey} - {state.state}{': ' + state.reason if state.reason else ''}")
+    if not state.active:
+        hotkey.stop()
+        raise RuntimeError("the hotkey isn't registered, so there is nothing to measure")
+    try:
+        pointer_before = verifier.cursor_position()
+        print(f"\nPointer at {pointer_before}; opening the measurement's own Notepad...")
+        window, field = open_notepad()
+        scenarios = []
+        try:
+            scenarios.append(report("idle", "Idle press (A only)",
+                                    measure_idle(chosen, counts["idle"]), "SYNTHETIC input"))
+            scenarios.append(report("typing", "Type Text (810 characters)",
+                                    measure_typing(chosen, counts["typing"], field), "SYNTHETIC input"))
+            scenarios.append(report("scrolling", f"Scroll ({SCROLL_TARGET}, {LINES} lines)",
+                                    measure_scrolling(chosen, counts["scrolling"], window, field), "SYNTHETIC input"))
+            scenarios.append(report("one-shot", "One-shot click, stopped before sending",
+                                    measure_one_shot(chosen, counts["one-shot"], window), "SYNTHETIC input"))
+        finally:
+            _user32().SetCursorPos(*pointer_before)
+            print(f"\nPointer restored to {verifier.cursor_position()}")
+            close_notepad(window, field)
+        print("\n  A and C exclude the physical keyboard path; run --physical to confirm a real press works.")
+        return print_acceptance(Verdict(scenarios))
+    finally:
+        hotkey.stop()
+        emergency_stop.reset("measurement")
+
+
 def main(argv=()):
-    parser = argparse.ArgumentParser(description="Measure the emergency stop's real response time.")
+    parser = argparse.ArgumentParser(description="Measure the emergency stop's real response time and "
+                                                 "judge it against the approved thresholds.")
     parser.add_argument("--trials", type=int, default=0, help="override the trial count for every scenario")
     parser.add_argument("--physical", action="store_true", help="wait for a real key press instead of measuring")
     parser.add_argument("--elevated", action="store_true", help="the same, with an elevated window in front")
@@ -425,47 +637,23 @@ def main(argv=()):
     setup_logging()
     emergency_stop.reset("measurement")
 
-    state = hotkey.start()
-    chosen = hotkey.configured()
-    print(f"Emergency-stop hotkey: {state.hotkey} - {state.state}{': ' + state.reason if state.reason else ''}")
-    if not state.active:
-        raise SystemExit("the hotkey isn't registered, so there is nothing to measure")
-    try:
-        if args.physical or args.elevated:
-            physical_check(chosen, elevated=args.elevated)
-            return 0
-
-        counts = {"idle": 20, "typing": 20, "scrolling": 20, "one-shot": 5}
-        if args.trials:
-            counts = {name: args.trials for name in counts}
-        pointer_before = verifier.cursor_position()
-        print(f"\nPointer at {pointer_before}; opening the measurement's own Notepad...")
-        window, field = open_notepad()
-        everything = []
+    if args.physical or args.elevated:
+        state = hotkey.start()
+        print(f"Emergency-stop hotkey: {state.hotkey} - {state.state}"
+              f"{': ' + state.reason if state.reason else ''}")
         try:
-            everything += report("Idle press (A only)", measure_idle(chosen, counts["idle"]),
-                                 "SYNTHETIC input")
-            everything += report("Type Text (810 characters)", measure_typing(chosen, counts["typing"], field),
-                                 "SYNTHETIC input")
-            everything += report(f"Scroll ({SCROLL_TARGET}, {LINES} lines)",
-                                 measure_scrolling(chosen, counts["scrolling"], window, field), "SYNTHETIC input")
-            everything += report("One-shot click, stopped before sending",
-                                 measure_one_shot(chosen, counts["one-shot"], window), "SYNTHETIC input")
+            if not state.active:
+                raise SystemExit("the hotkey isn't registered, so there is nothing to measure")
+            physical_check(hotkey.configured(), elevated=args.elevated)
+            return 0
         finally:
-            _user32().SetCursorPos(*pointer_before)
-            print(f"\nPointer restored to {verifier.cursor_position()}")
-            close_notepad(window, field)
-        worst = max((t.c for t in everything if t.c is not None), default=None)
-        print(f"\n=== Overall (SYNTHETIC input): worst C = {worst * 1000:.1f} ms" if worst else "\n=== Overall: no C")
-        print(f"  input continued after the stop in any trial: "
-              f"{[t.number for t in everything if t.continued] or 'never'}")
-        print(f"  any action retried after the stop:            "
-              f"{[t.number for t in everything if t.retried] or 'never'}")
-        print("  A and C exclude the physical keyboard path; run --physical to confirm a real press works.")
-        return 0
-    finally:
-        hotkey.stop()
-        emergency_stop.reset("measurement")
+            hotkey.stop()
+            emergency_stop.reset("measurement")
+    try:
+        verdict = acceptance_run({name: args.trials for name in DEFAULT_COUNTS} if args.trials else None)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc))
+    return 0 if verdict.passed else 1  # a failing run must be visible to whatever ran it
 
 
 if __name__ == "__main__":
