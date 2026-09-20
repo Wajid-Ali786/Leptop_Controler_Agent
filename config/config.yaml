@@ -111,7 +111,13 @@ listener:
   language: auto                # auto-detect, or a code such as en, ur, hi (one language per utterance)
   sample_rate: 16000            # the canonical rate the Listener and model consume; the only
                                 # accepted value (no resampling path is designed yet)
-  input_device: ""              # "" = the system default microphone; otherwise its name or index
+  input_device: ""              # "" = the system default microphone. Otherwise PREFER A NAME: device
+                                # indexes are assigned fresh every run and move when hardware or
+                                # Bluetooth comes and goes, so an index that worked yesterday can
+                                # point at another microphone today. A name is matched exactly first,
+                                # then as a substring; one microphone appears once per sound path
+                                # (MME, DirectSound, WASAPI, WDM-KS) and the default path wins that
+                                # tie. Anything still ambiguous is refused, never guessed.
   vad_filter: true              # drop silence before transcribing (Silero, bundled with faster-whisper)
   min_silence_ms: 800           # how much silence ends an utterance
   max_utterance_seconds: 15     # hard cap on one recording

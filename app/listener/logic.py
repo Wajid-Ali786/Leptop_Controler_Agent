@@ -16,7 +16,7 @@ job, and the raw Transcript is always preserved alongside anything derived from 
 """
 import re
 
-from app.listener.models import ListenerSettings
+from app.listener.models import NO_DEVICE, InputDevice, ListenerSettings, VoiceFailure
 from config.settings import SettingsError, get_setting
 
 LISTENER = "listener"
@@ -82,6 +82,86 @@ def for_matching(text: str) -> str:
 def is_silence(text: str) -> bool:
     """True when a transcript carries no words - silence or noise must never become a command."""
     return not any(character.isalnum() for character in tidy(text))
+
+
+# --- Choosing which microphone `listener.input_device` means -------------------------------------
+# Pure on purpose: it is handed the device list and decides, so every matching rule below is
+# testable with no microphone, no backend and no I/O. The adapter only enumerates and obeys.
+
+MAX_NAME_CHARACTERS = 80  # a driver name this long is already unreadable; longer ones are cut
+MAX_LISTED_CANDIDATES = 5  # an ambiguity message stays readable rather than listing everything
+
+
+def readable(name) -> str:
+    """A device name flattened and shortened for DISPLAY.
+
+    Driver names are not tidy strings: MME truncates them at 31 characters, and a WDM-KS name on
+    this machine contains a literal line break inside a driver resource path. Anything that shows a
+    name to the user sends it through here first."""
+    flat = _SPACES.sub(" ", str(name)).strip()
+    return flat if len(flat) <= MAX_NAME_CHARACTERS else flat[:MAX_NAME_CHARACTERS - 3] + "..."
+
+
+def choose_device(selector, devices) -> InputDevice | VoiceFailure:
+    """The microphone `selector` names, out of `devices`, or a VoiceFailure saying why there isn't one.
+
+    "" (or whitespace) means the backend's own default microphone. A whole number is used as a device
+    index. A name is matched in two passes - exact (ignoring case) first, then substring - and where
+    ONE physical microphone appears once per host API, the default host API breaks the tie. Anything
+    still ambiguous is refused with the candidates listed: a device is never picked arbitrarily.
+    """
+    devices = tuple(devices)
+    if isinstance(selector, bool):  # True/False is never a device; be explicit rather than surprising
+        return VoiceFailure(NO_DEVICE, f"{selector!r} does not name a microphone. Use \"\" for the "
+                                       f"default one, or a name or index from the device list.")
+    if isinstance(selector, int):
+        return _device_by_index(selector, devices)
+    return _device_by_name(str(selector).strip(), devices) if str(selector).strip() \
+        else _default_device(devices)
+
+
+def _default_device(devices) -> InputDevice | VoiceFailure:
+    if not devices:
+        return VoiceFailure(NO_DEVICE, "This computer has no microphone the assistant can use.")
+    for device in devices:
+        if device.is_default:
+            return device
+    return VoiceFailure(NO_DEVICE, "There is no default microphone set on this computer. Put a name "
+                                   "from the device list in listener.input_device.")
+
+
+def _device_by_index(index: int, devices) -> InputDevice | VoiceFailure:
+    for device in devices:
+        if device.index == index:
+            return device
+    return VoiceFailure(NO_DEVICE, f"No microphone has index {index} right now. Indexes change "
+                                   f"between restarts, so a name in listener.input_device is safer.")
+
+
+def _device_by_name(wanted: str, devices) -> InputDevice | VoiceFailure:
+    folded = wanted.casefold()
+    exact = [device for device in devices if device.name.strip().casefold() == folded]
+    candidates = exact or [device for device in devices if folded in device.name.casefold()]
+    if not candidates:
+        return VoiceFailure(NO_DEVICE, f"No microphone on this computer is called '{readable(wanted)}'. "
+                                       f"Use a name from the device list.")
+    if len(candidates) == 1:
+        return candidates[0]
+    # One microphone usually appears once per host API (MME, DirectSound, WASAPI, WDM-KS). Preferring
+    # the default host API resolves exactly that duplication - and nothing else.
+    on_default_api = [device for device in candidates if device.is_default_host_api]
+    if len(on_default_api) == 1:
+        return on_default_api[0]
+    return VoiceFailure(NO_DEVICE, f"'{readable(wanted)}' matches {len(candidates)} microphones "
+                                   f"({_listed(candidates)}). Set listener.input_device to one of "
+                                   f"those names in full, or to its index.")
+
+
+def _listed(devices) -> str:
+    shown = "; ".join(f"[{device.index}] {readable(device.name)} via {device.host_api}"
+                      for device in devices[:MAX_LISTED_CANDIDATES])
+    extra = len(devices) - MAX_LISTED_CANDIDATES
+    return f"{shown}; and {extra} more" if extra > 0 else shown
 
 
 # --- Validation helpers (the project's style: raise SettingsError naming the key) ----------------

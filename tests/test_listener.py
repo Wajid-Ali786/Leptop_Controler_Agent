@@ -14,8 +14,9 @@ import ast
 import pytest
 
 from app.listener import logic, models
-from app.listener.models import (DEVICE_LOST, MODEL_UNAVAILABLE, NO_DEVICE, NO_SPEECH,
-                                 PERMISSION_DENIED, TRANSCRIPTION_FAILED, Transcript, VoiceFailure)
+from app.listener.models import (CAPTURE_UNAVAILABLE, DEVICE_BUSY, DEVICE_LOST, MODEL_UNAVAILABLE,
+                                 NO_DEVICE, NO_SPEECH, PERMISSION_DENIED, TRANSCRIPTION_FAILED,
+                                 Transcript, VoiceFailure)
 from config import settings
 from config.settings import SettingsError
 
@@ -194,8 +195,9 @@ def test_a_transcript_needs_text():
         Transcript(text=None)
 
 
-@pytest.mark.parametrize("kind", [NO_DEVICE, PERMISSION_DENIED, DEVICE_LOST, NO_SPEECH,
-                                  MODEL_UNAVAILABLE, TRANSCRIPTION_FAILED])
+@pytest.mark.parametrize("kind", [NO_DEVICE, PERMISSION_DENIED, DEVICE_BUSY, DEVICE_LOST,
+                                  CAPTURE_UNAVAILABLE, NO_SPEECH, MODEL_UNAVAILABLE,
+                                  TRANSCRIPTION_FAILED])
 def test_every_failure_kind_can_be_built_and_carries_a_message(kind):
     failure = VoiceFailure(kind=kind, message="something to show the user")
     assert failure.kind in models.FAILURE_KINDS and failure.message
@@ -204,6 +206,18 @@ def test_every_failure_kind_can_be_built_and_carries_a_message(kind):
 def test_an_unknown_failure_kind_is_refused():
     with pytest.raises(ValueError, match="Unknown voice failure kind"):
         VoiceFailure(kind="whoops", message="...")
+
+
+def test_the_failure_kinds_are_exactly_the_ones_the_project_has_agreed():
+    """A new kind is a contract change, so it is listed here deliberately rather than discovered."""
+    assert models.FAILURE_KINDS == frozenset({
+        "no_device", "permission_denied", "device_busy", "device_lost",
+        "capture_unavailable", "no_speech", "model_unavailable", "transcription_failed"})
+
+
+def test_a_missing_backend_and_a_missing_microphone_are_different_kinds():
+    assert CAPTURE_UNAVAILABLE != NO_DEVICE
+    assert DEVICE_BUSY not in (NO_DEVICE, DEVICE_LOST)
 
 
 # --- Architecture rules, pinned before the code that could break them exists ---------------------
@@ -264,6 +278,36 @@ def test_voice_modules_never_reach_the_executor_or_act(package):
                  if module in forbidden or module.split(".")[0] in forbidden
                  or (module == "app.executor" and name in ("adapter", "logic", "commands"))]
     assert offenders == [], f"{package} must not execute actions: {offenders}"
+
+
+AUDIO_FILE_LIBRARIES = {"wave", "soundfile", "aifc", "sunau", "scipy"}
+DISK_WRITERS = ("write_bytes", "write_text", "writeframes", "savetxt")
+
+
+def test_the_listener_can_never_write_audio_to_disk():
+    """'Raw audio stays in memory' as a structural fact, not a promise: nothing under app/listener/
+    may import an audio-file library, and no code path there writes bytes anywhere."""
+    root = settings.PROJECT_ROOT
+    offenders = [f"{path.relative_to(root)}: {module}"
+                 for path in (root / "app" / "listener").rglob("*.py")
+                 for module, _ in _imports(path)
+                 if module.split(".")[0] in AUDIO_FILE_LIBRARIES]
+    assert offenders == [], f"app/listener must not import an audio-file library: {offenders}"
+
+    writers = []
+    for path in (root / "app" / "listener").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(
+                    node.func, "id", "")
+                if name in DISK_WRITERS:
+                    writers.append(f"{path.relative_to(root)}: {name}()")
+                if name == "open" and any(
+                        isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                        and "w" in arg.value for arg in node.args[1:]):
+                    writers.append(f"{path.relative_to(root)}: open(..., write)")
+    assert writers == [], f"app/listener must not write files: {writers}"
 
 
 def test_a_future_voice_console_must_route_through_handle_command():

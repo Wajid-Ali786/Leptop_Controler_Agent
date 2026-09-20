@@ -17,15 +17,22 @@ Nothing in this file touches audio, the model, the disk or the network.
 from dataclasses import dataclass
 
 # Why voice produced no transcript. One flat set of kinds, matching how the Executor names outcomes.
-NO_DEVICE = "no_device"                  # no microphone at all
+NO_DEVICE = "no_device"                  # enumeration worked and found no microphone we can use
 PERMISSION_DENIED = "permission_denied"  # Windows refused access to the microphone
+DEVICE_BUSY = "device_busy"              # a microphone is there but already in use - by this process'
+                                         # single-owner lock, or by the backend reporting the device
+                                         # as taken. Only used when that is actually identifiable.
 DEVICE_LOST = "device_lost"              # the microphone went away, or capture failed part-way
+CAPTURE_UNAVAILABLE = "capture_unavailable"  # the capture BACKEND itself is unusable (sounddevice or
+                                         # PortAudio missing or unimportable), so no enumeration could
+                                         # even happen. Deliberately not NO_DEVICE: "no microphone"
+                                         # and "no way to look for one" are different facts.
 NO_SPEECH = "no_speech"                  # silence or noise only - never treated as a command
 MODEL_UNAVAILABLE = "model_unavailable"  # the speech model is missing, or couldn't be loaded
 TRANSCRIPTION_FAILED = "transcription_failed"  # the model ran and failed
 
-FAILURE_KINDS = frozenset({NO_DEVICE, PERMISSION_DENIED, DEVICE_LOST, NO_SPEECH,
-                           MODEL_UNAVAILABLE, TRANSCRIPTION_FAILED})
+FAILURE_KINDS = frozenset({NO_DEVICE, PERMISSION_DENIED, DEVICE_BUSY, DEVICE_LOST,
+                           CAPTURE_UNAVAILABLE, NO_SPEECH, MODEL_UNAVAILABLE, TRANSCRIPTION_FAILED})
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,29 @@ class VoiceFailure:
         if self.kind not in FAILURE_KINDS:
             raise ValueError(f"Unknown voice failure kind {self.kind!r}; expected one of "
                              f"{', '.join(sorted(FAILURE_KINDS))}")
+
+
+@dataclass(frozen=True)
+class InputDevice:
+    """One microphone the capture backend can see right now.
+
+    `name` is the real name the driver reports, because the device list is meant to be shown to the
+    user - that is how they find out what to put in `listener.input_device`. It can be ugly: a name
+    may be truncated (MME cuts it at 31 characters), may repeat across host APIs for one physical
+    microphone, and may even contain line breaks (a WDM-KS driver resource string does). Anything
+    that displays a name should run it through logic.readable() first, and our own log lines never
+    carry one at all.
+
+    `index` is valid for THIS run only - the backend renumbers devices between boots and whenever
+    hardware appears or disappears.
+    """
+    index: int
+    name: str
+    host_api: str               # "MME", "Windows WASAPI", ... - the path, not the hardware
+    max_input_channels: int
+    default_samplerate: float
+    is_default: bool            # the backend's default input device
+    is_default_host_api: bool   # this device is reached through the backend's default host API
 
 
 @dataclass(frozen=True)

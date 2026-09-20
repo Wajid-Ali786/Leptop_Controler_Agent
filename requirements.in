@@ -7,6 +7,7 @@
 anthropic          # Claude API SDK (app/brain/adapter.py only)
 httpx2             # anthropic's HTTP layer; tests drive it directly (mock transport)
 faster-whisper     # local, offline speech-to-text (Phase 2)
+sounddevice        # microphone capture via PortAudio (app/listener/adapter.py only)
 pyautogui          # universal mouse/keyboard fallback (Phase 1)
 pywinauto          # native Windows app control via UI Automation (Phase 1)
 playwright         # browser automation via DOM (Phase 5)
