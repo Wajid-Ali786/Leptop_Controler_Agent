@@ -96,6 +96,40 @@ verifier:
     notepad: "Notepad$"
     calculator: "^Calculator$"
 
+# --- Listener (app/listener/) — Phase 2 voice input ---
+# Speech-to-text runs locally (faster-whisper). Nothing here downloads anything by itself:
+# local_files_only means a missing model fails with a clear message instead of reaching for the
+# network. Raw microphone audio is never written to disk, and transcripts are never logged.
+listener:
+  enabled: false                # Phase 2 is not built yet; voice input stays off until it is
+  model_size: small             # tiny, base, small, medium, large-v2, large-v3 (small is the
+                                # smallest that handles Urdu/Hindi acceptably)
+  model_dir: data/models        # where the downloaded model lives (git-ignored)
+  local_files_only: true        # true = never download; fetch the model deliberately instead
+  device: auto                  # auto, cpu or cuda - auto detects at runtime, assuming no hardware
+  compute_type: auto            # auto, int8, int8_float32, int16, float32, float16, int8_float16
+  language: auto                # auto-detect, or a code such as en, ur, hi (one language per utterance)
+  sample_rate: 16000            # the canonical rate the Listener and model consume; the only
+                                # accepted value (no resampling path is designed yet)
+  input_device: ""              # "" = the system default microphone; otherwise its name or index
+  vad_filter: true              # drop silence before transcribing (Silero, bundled with faster-whisper)
+  min_silence_ms: 800           # how much silence ends an utterance
+  max_utterance_seconds: 15     # hard cap on one recording
+  # Words the recognizer should expect, which measurably improves short command recognition.
+  initial_prompt_terms: [notepad, calculator, minimize, maximize, restore, scroll, refresh, click, type]
+  voice_stop_enabled: true      # say "stop" while an action runs; the Ctrl+Alt+Backspace hotkey
+                                # stays the authoritative emergency stop (voice is slower)
+
+# --- Speaker (app/speaker/) — Phase 2 voice output ---
+speaker:
+  enabled: false                # Phase 2 is not built yet
+  engine: auto                  # auto (online, falling back to offline), online (edge-tts) or
+                                # offline (pyttsx3, no network)
+  voice: ""                     # "" = the engine's default voice
+  rate: 0                       # relative speed in percent, -50..+50: 0 = the engine's normal
+                                # speed, +20 about 20% faster, -20 about 20% slower. The same
+                                # number means the same thing whichever engine speaks.
+
 # --- Brain (Claude API) ---
 brain:
   # MODEL SELECTION PENDING: claude-opus-5 is a placeholder until cost/performance
