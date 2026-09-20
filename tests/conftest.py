@@ -30,6 +30,7 @@ from config import settings
 REAL_API_OPT_IN = "RUN_REAL_CLAUDE_TEST"
 REAL_DESKTOP_OPT_IN = "RUN_REAL_DESKTOP_TEST"
 REAL_CLIPBOARD_OPT_IN = "RUN_REAL_CLIPBOARD_TEST"
+REAL_ELEVATED_OPT_IN = "RUN_ELEVATED_TEST"
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -56,6 +57,11 @@ def pytest_configure(config):
         f"real_clipboard: replaces the contents of this computer's clipboard; skipped unless {REAL_CLIPBOARD_OPT_IN}=1 "
         f"(and, being a desktop test, {REAL_DESKTOP_OPT_IN}=1)",
     )
+    config.addinivalue_line(
+        "markers",
+        f"real_elevated: needs a Notepad YOU started with 'Run as administrator' in front, so it can't run "
+        f"unattended; skipped unless {REAL_ELEVATED_OPT_IN}=1 (and, being a desktop test, {REAL_DESKTOP_OPT_IN}=1)",
+    )
 
 
 OPT_IN_GATES = {
@@ -65,6 +71,8 @@ OPT_IN_GATES = {
                      f"Opens real windows - set {REAL_DESKTOP_OPT_IN}=1 to run (closes only what it opened)"),
     "real_clipboard": (REAL_CLIPBOARD_OPT_IN,
                        f"Replaces your clipboard's contents - set {REAL_CLIPBOARD_OPT_IN}=1 to run"),
+    "real_elevated": (REAL_ELEVATED_OPT_IN,
+                      f"Needs an elevated Notepad you start and focus by hand - set {REAL_ELEVATED_OPT_IN}=1 to run"),
 }
 
 

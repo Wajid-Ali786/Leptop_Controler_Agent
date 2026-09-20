@@ -232,7 +232,15 @@ def _discard_test_text(field_handle):
     user32 = ctypes.WinDLL("user32")
     user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     user32.SendMessageW.restype = wintypes.LPARAM
-    user32.SendMessageW(field_handle, 0x000C, 0, ctypes.cast(ctypes.c_wchar_p(""), ctypes.c_void_p).value)  # WM_SETTEXT
+    # The buffer is kept alive in a local until SendMessage returns: a temporary c_wchar_p can be
+    # freed before Windows reads it, and the control then gets whatever is left in that memory.
+    buffer = ctypes.create_unicode_buffer("")
+    user32.SendMessageW(field_handle, 0x000C, 0, ctypes.cast(buffer, ctypes.c_void_p).value)  # WM_SETTEXT
+    # The cleanup contract, enforced on the test's OWN control: marking a field unmodified while text is
+    # still in it is what hid the freed-buffer bug (it left heap garbage behind and no test noticed).
+    remaining = verifier.field_text_length(field_handle)
+    assert remaining == 0, (f"cleanup didn't empty the test's own Notepad: field_text_length reports "
+                            f"{remaining!r}, so it was NOT marked unmodified")
     user32.SendMessageW(field_handle, 0x00B9, 0, 0)  # EM_SETMODIFY: unmodified
 
 
@@ -415,7 +423,9 @@ def _test_user32():
 def _fill_with_lines(field_handle, count):
     """Test setup, not an assistant action: put `count` short lines into the test's own Notepad."""
     text = "\r\n".join(f"scroll test line {n}" for n in range(1, count + 1))
-    _test_user32().SendMessageW(field_handle, 0x000C, 0, ctypes.cast(ctypes.c_wchar_p(text), ctypes.c_void_p).value)
+    # As in _discard_test_text: the buffer must stay alive in a local for the whole SendMessage call.
+    buffer = ctypes.create_unicode_buffer(text)
+    _test_user32().SendMessageW(field_handle, 0x000C, 0, ctypes.cast(buffer, ctypes.c_void_p).value)
 
 
 def _scroll_to_top(field_handle):
@@ -593,7 +603,12 @@ def test_window_controls_on_notepads_the_test_started():
         print(f"window-control A: maximize + restore + minimize took {time.monotonic() - started:.2f}s")
         closed_a = execute_with_recovery(ExecutorAction(CLOSE_APP, "notepad"), confirm=lambda action, assessment: True)
         print(f"window-control A: close_app on the minimized window -> {closed_a.outcome.value}: {closed_a.message}")
-        assert closed_a.outcome is Outcome.DONE and verifier_adapter.window_state(a.handle) is None
+        assert closed_a.outcome is Outcome.DONE, closed_a.message
+        # close_app's contract is the Verifier's enumeration (no longer a visible titled top-level
+        # window). A minimized Notepad's HWND outlives that by a few milliseconds while Windows
+        # destroys it (measured: 2.3-6.5 ms), so the window must really go - just not on the same tick.
+        assert _wait_for(lambda: verifier_adapter.window_state(a.handle) is None, 2), \
+            "the window close_app reported closed never actually went away"
 
         # --- B: opened by the assistant; window control close (MEDIUM, one confirmation) ---
         b, _ = _open_test_notepad(expectation, before_matching, "window-control B")
@@ -840,9 +855,13 @@ def test_ten_typed_commands_back_to_back_through_the_console():
         assert TYPED_TEXT not in "\n".join(session.written)
     finally:
         _test_user32().SetCursorPos(*original_pointer)  # always put the user's pointer back
+        discard_failures = []
         for field in (session_field, fixture_field):
-            if field:
-                _discard_test_text(field)  # test cleanup: its own Notepads then close without a save dialog
+            if field:  # test cleanup: its own Notepads then close without a save dialog
+                try:
+                    _discard_test_text(field)
+                except AssertionError as exc:  # reported below, so a failed clear can't skip closing windows
+                    discard_failures.append(str(exc))
         for w in _new_notepads(notepads_before):
             ctypes.windll.user32.PostMessageW(ctypes.c_void_p(w.handle), WM_CLOSE, 0, 0)
             leftovers.append(w)
@@ -860,6 +879,7 @@ def test_ten_typed_commands_back_to_back_through_the_console():
             print(f"typed: couldn't delete the temporary folder yet: {exc!r}")
         print(f"typed: cleanup closed {len(leftovers)} Notepad(s), {len(calc_left)} Calculator window(s), "
               f"{len(explorer_left)} Explorer window(s)")
+    assert discard_failures == [], "; ".join(discard_failures)
     assert _new_notepads(notepads_before) == [], "a Notepad the test started is still open"
     assert sorted(w.handle for w in leftovers) == sorted([fixture.handle, session_notepad.handle]), \
         "cleanup should have closed exactly the scroll fixture and the Notepad the assistant opened"

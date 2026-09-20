@@ -367,39 +367,63 @@ def press_after(world, seconds=0.05):
     threading.Timer(seconds, world.windows.press).start()
 
 
-def test_a_press_stops_typing_part_way_and_nothing_is_retried(world, desktop):
+def press_after_the_first(world, desktop, monkeypatch, function):
+    """Deliver the hotkey press once the fake adapter has really sent the FIRST piece of input.
+
+    A timer can't do this: under load it fires before the action starts, the stop is already active at
+    the first checkpoint, and the Executor raises the plain stop instead of interrupting mid-action.
+    Here the press happens INSIDE the adapter call that records input, so "input was sent" is a fact
+    before the press exists, and the call doesn't return until the listener thread has actually
+    triggered the stop. No timer, no helper thread, nothing left running afterwards."""
+    real = getattr(desktop.fake, function)
+    state = {"pressed": False}
+
+    def send_then_press(*args, **kwargs):
+        sent = real(*args, **kwargs)
+        if not state["pressed"]:
+            state["pressed"] = True
+            assert desktop.calls, "the fake adapter must record the input before the press is delivered"
+            world.windows.press()
+            assert wait_until(emergency_stop.is_stopped), "the listener never turned the press into a stop"
+        return sent
+
+    monkeypatch.setattr(adapter, function, send_then_press)
+    return state
+
+
+def test_a_press_stops_typing_part_way_and_nothing_is_retried(world, desktop, monkeypatch):
     hotkey.start()
     retries = []
-    press_after(world)
+    assert not emergency_stop.is_stopped(), "the stop must not be active before the action starts"
+    pressed = press_after_the_first(world, desktop, monkeypatch, "send_character")
     with pytest.raises(TypingInterruptedError) as raised:
         executor_logic.execute_with_recovery(ExecutorAction(TYPE_TEXT, "x" * 500),
                                              confirm=lambda action, assessment: True,
                                              offer_retry=lambda result: retries.append(result) or True)
     result = raised.value.result
+    assert pressed["pressed"], "the press was never delivered, so nothing was interrupted"
     assert result.outcome is Outcome.PARTIAL and 0 < result.progress[0] < 500
     assert result.progress[0] == len(desktop.calls), "more characters were sent than the result admits"
-    sent = len(desktop.calls)
-    time.sleep(0.1)
-    assert len(desktop.calls) == sent, "input continued after the stop"
+    # Nothing can add to desktop.calls now: the only sender is this thread, and it has already raised.
     assert retries == [], "a stopped action must never be retried"
     assert emergency_stop.status().source == "global-hotkey"
 
 
-def test_a_press_stops_scrolling_part_way_and_nothing_is_retried(world, desktop):
+def test_a_press_stops_scrolling_part_way_and_nothing_is_retried(world, desktop, monkeypatch):
     hotkey.start()
     retries = []
-    press_after(world)
+    assert not emergency_stop.is_stopped(), "the stop must not be active before the action starts"
+    pressed = press_after_the_first(world, desktop, monkeypatch, "send_wheel_notch")
     with pytest.raises(ActionInterruptedError) as raised:
         executor_logic.execute_with_recovery(ExecutorAction(SCROLL, "down 20"),
                                              confirm=lambda action, assessment: True,
                                              offer_retry=lambda result: retries.append(result) or True)
     result = raised.value.result
+    assert pressed["pressed"], "the press was never delivered, so nothing was interrupted"
     assert result.outcome is Outcome.PARTIAL and 0 < result.progress[0] < 20
-    assert result.progress[0] == len(desktop.calls)
-    sent = len(desktop.calls)
-    time.sleep(0.1)
-    assert len(desktop.calls) == sent, "notches continued after the stop"
+    assert result.progress[0] == len(desktop.calls), "more notches were sent than the result admits"
     assert retries == []
+    assert emergency_stop.status().source == "global-hotkey"
 
 
 def test_a_press_during_a_confirmation_stops_the_action(world, desktop):
