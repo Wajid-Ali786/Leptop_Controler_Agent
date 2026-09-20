@@ -81,6 +81,52 @@ These apply to every phase below, without exception:
 
 **Done when:** 10 different typed commands, covering every bullet above, run correctly back-to-back with no code changes between them, the emergency stop halts as quickly as technically possible on your machine and passes the emergency-stop test you define for it (measured, not assumed), and the Verifier correctly detects at least one deliberately-broken action (e.g. targeting a renamed button) instead of reporting false success.
 
+**PHASE 1 — COMPLETE (verified 20 September 2026).** Every Build bullet, every test-case row and every Done-when clause above is satisfied, by the two checklist runs recorded below. The deferred items at the end of this section were never Phase 1 requirements and stay deferred; closing Phase 1 does not complete them.
+
+- **How Phase 1 is verified — `scripts/phase1_checklist.py`.** It maps each Step 4 Phase 1 requirement to the pytest tests that are its evidence, runs pytest once per selected group, and reads results from JUnit XML. It parses no prose, counts no totals and contains no Executor, action or Verifier logic of its own. Statuses mean exactly:
+  - **PASS** — the mapped tests executed **in that invocation** and passed.
+  - **FAIL** — they executed and failed.
+  - **NOT RUN** — that group wasn't selected in this mode. It is *not* a historical failure, and it is never promoted to PASS from an earlier run.
+  - **DEFERRED** — a Step 4 line explicitly defers it (non-blocking).
+  - **DOCUMENTED** — a human observed it and it is recorded here with a date and a way to reproduce. Visually distinct from PASS, because nothing executed it.
+
+  A row's status comes **only from its own mapped tests**. A failing test that is no requirement's evidence is listed separately under `RELATED / UNMAPPED TEST FAILURES` and still forces a non-zero exit, without mislabelling any requirement. A mapped test that has been renamed or is no longer collected is a `MAPPING ERROR`, never a PASS. Exit codes: **0** every blocking row satisfied, **1** something executed failed (including a regression row, an unmapped failure or a broken mapping), **2** nothing failed but blocking evidence was NOT RUN.
+- **Phase 1 is verified by TWO explicit runs, and that is by design.**
+
+      python scripts/phase1_checklist.py --real-desktop     # the elevated Notepad MINIMIZED
+      python scripts/phase1_checklist.py --real-elevated    # the elevated Notepad IN FRONT
+
+  The two real groups need opposite foreground conditions: the ordinary real-desktop tests need their own Medium-integrity windows to take the foreground, while the permission-denied test needs a High-integrity Notepad in front — and a High-integrity foreground window prevents a Medium-integrity process from taking the foreground back. Measured here: with the elevated Notepad minimized, every real-desktop row passed; in a run where it ended up restored on screen, the one test that could not acquire the foreground failed. The checklist deliberately carries no evidence between invocations, so **neither run prints `FULL PHASE 1: PASS` and both exit 2 — that is not a failure.** The Phase 1 evidence set is the two runs together. A `--real-desktop --real-elevated` invocation is *not* a valid substitute: it was tried and was procedurally invalid.
+- **Final evidence (20 September 2026).**
+
+  | Group | Result |
+  |---|---|
+  | Offline suite | **1096 passed, 18 skipped**; 19/19 checklist rows PASS in both runs |
+  | Real desktop (`--real-desktop`) | **4/4 PASS**, no unmapped failures, 21/22 blocking satisfied in that invocation, exit 2 |
+  | Real elevated (`--real-elevated`) | **1/1 PASS**, no unmapped failures, exit 2 |
+  | Physical global-hotkey reachability | **DOCUMENTED** (18 September 2026 — see the emergency-stop notes) |
+  | Failures | **none** |
+
+- **The real acceptance evidence in brief.**
+  - **Emergency stop:** the global hotkey `Ctrl+Alt+Backspace` (RegisterHotKey → WM_HOTKEY, no keyboard hook), physically verified with PowerShell, Chrome and an elevated Notepad in front, and its 65-trial threshold acceptance passes against the approved limits.
+  - **Deliberately-broken action:** a test-owned window that receives `SC_MAXIMIZE` and deliberately swallows it is reported `failed` — never a false `done` — and the same window with the break removed reports `done`, proving the fixture was genuinely targetable.
+  - **Permission denied:** a Medium-integrity (RID 0x2000, not elevated) test process acting on a High-integrity (RID 0x3000, elevated) Notepad — both read directly from their own tokens — got `PostMessageW` **FALSE with ERROR_ACCESS_DENIED (5)**, which the adapter turned into "it runs with administrator rights, and the assistant doesn't run elevated": outcome `failed`, `ok=False`, `retryable=False`, no retry offered, and the target stayed **not maximized**.
+- **Deferred — recorded as deferred, not as failures, and NOT completed by Phase 1 closing.**
+  - Real browser refresh test — it would open the user's real browser profile.
+  - Click-effect verification — Phase 5 (screen understanding); a click stays honestly `unverified` in Phase 1.
+  - Refresh-effect verification — Phase 5; a refresh is never `done` in Phase 1.
+  - The optional real clipboard test — it replaces the machine's clipboard, so it stays behind `RUN_REAL_CLIPBOARD_TEST=1` and no Step 4 Phase 1 line requires it.
+- **Known limitations carried out of Phase 1** (each already recorded in the notes below; collected here so they aren't lost):
+  - The console's focus hand-over is clunky for a Medium command — switch, answer, switch back.
+  - Restoring a minimized window needs targeting beyond the active window (later phase).
+  - Windows' secure desktop (the UAC prompt itself, Ctrl+Alt+Delete) is out of scope for the hotkey: no ordinary program receives input there.
+  - The global hotkey reserves `Ctrl+Alt+Backspace` system-wide while the assistant runs, so no other program can use that combination then.
+  - Real-desktop tests need an idle mouse and keyboard; using the desk during a run makes them fail for environmental reasons, and the checklist labels such failures as interference rather than as broken requirements.
+  - `close_app`'s `done` means the target is no longer a **visible titled top-level window** in the Verifier's enumeration — not that its `HWND` has already been destroyed.
+  - A **minimized** Notepad's `HWND` destruction trails that `done` by a few milliseconds (measured 2.3–6.5 ms, median 3.3 ms); a normal window's was already destroyed at return in every measured close.
+  - Theoretical limit of that visibility-based oracle: an app that hid its window without destroying it would be reported closed while still alive. Not observed; recorded so the oracle isn't mistaken for proof of process exit.
+  - Real-desktop and real-elevated verification are intentionally separate, for the integrity/foreground reason above.
+
 **Implementation notes — open/close apps (recorded 16 September 2026).** These record how Phase 1 behaves on a real Windows desktop and what was measured. They don't reopen any Step 1–3 decision.
 
 - **close_app closes only windows this session opened.** `open_app` remembers the windows it verified (in memory only, so nothing carries over a restart). `close_app` closes the most recently opened of those that is still open. A window the user opened themselves is never closed; the assistant says so and leaves it alone. Closing is always a polite request (`WM_CLOSE`, like clicking the window's X), never ending a process. Outcomes are distinct: `done`, `already_closed`, `needs_user` (e.g. a "Save changes?" dialog), `still_open`, `failed`. `needs_user` and `still_open` are never retryable, so the recovery loop can't retry into an app that is waiting for the user. Closing is always at least MEDIUM risk, so it is always confirmed. Since the Window Controls task (17 September 2026) this is a code constant, not the configurable `close` keyword, so configuration can't lower it; other safety rules may still raise it. close_app and window control close share one close mechanism (see the Window Controls notes).
@@ -170,7 +216,7 @@ These apply to every phase below, without exception:
   - Ctrl+Z, Ctrl+S, Ctrl+V: always `unverified`, and anything that can't be confirmed is `unverified`.
   - **Never retryable.** An emergency stop while checking the effect raises `EmergencyStopError`; the keys were already sent and released.
 - **Clipboard.** Its **contents are never read** — nothing opens the clipboard or fetches its data (a rule test enforces it). Only its change counter and which kinds of data it holds (text, image, files) are read. The kinds appear only in the Ctrl+V prompt; nothing clipboard-related is logged.
-- **Tested.** 99 offline tests in `tests/test_executor_shortcut.py` cover:
+- **Tested.** 98 offline tests in `tests/test_executor_shortcut.py` cover:
   - parsing, aliases, refusals and reserved shortcuts; the full risk table; Ctrl+C MEDIUM in every window
   - LOW running without a prompt but through the gate; exact MEDIUM/HIGH prompts; decline and no confirmation method
   - no active window, held modifiers (before and after approval), empty clipboard, target changed after approval
@@ -695,7 +741,10 @@ This loop applies to every single bullet point in every phase above — not once
 
 ```
 Phase 0 — Foundation: COMPLETE (Done-when checklist passed; tagged v0.1)
-Current phase: 1 — Basic Computer Control (in progress)
+Phase 1 — Basic Computer Control: COMPLETE / CLOSED (Done-when verified 20 September 2026)
+  Evidence: the two checklist runs in Section 4 - phase1_checklist.py --real-desktop (4/4)
+  and --real-elevated (1/1), offline 1096 passed / 18 skipped, no failures.
+Current phase: 2 — Voice (next; see Section 5)
 Last updated: 16 September 2026
 ```
 

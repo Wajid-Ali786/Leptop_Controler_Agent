@@ -4,11 +4,14 @@ A personal Windows desktop AI assistant (Windows 11 primary, Windows 10 22H2 whe
 practical). You speak or type a command; it understands, plans, checks safety, acts,
 verifies the result, and remembers what matters.
 
-**Status:** Phase 0 (Foundation) complete — tagged `v0.1`. Phase 1 (Basic Computer Control)
-is in progress: typed commands (`python main.py --console`) drive opening and closing apps,
-clicking by screen coordinate, typing text, keyboard shortcuts, scrolling, refresh (browsers and
-File Explorer) and window controls.
-See `docs/step4-production-development.md` Section 4 (implementation notes) and Section 18.
+**Status:** Phase 0 (Foundation) complete — tagged `v0.1`. **Phase 1 (Basic Computer Control)
+complete**, verified 20 September 2026: typed commands (`python main.py --console`) drive opening
+and closing apps, clicking by screen coordinate, typing text, keyboard shortcuts, scrolling,
+refresh (browsers and File Explorer) and window controls — each through the safety gate and checked
+by the Verifier — with a global emergency-stop hotkey (`Ctrl+Alt+Backspace`) that halts an action
+mid-way. Next phase: **Phase 2 — Voice**.
+See `docs/step4-production-development.md` Section 4 (implementation notes and the Phase 1
+close-out evidence) and Section 18.
 
 ## Setup (fresh clone)
 
@@ -60,11 +63,20 @@ front, and never switches windows itself.
 ```powershell
 pytest                                                  # whole suite, offline, no API calls
 python scripts/phase0_checklist.py                      # Phase 0 pass/fail checklist
+python scripts/phase1_checklist.py                      # Phase 1 checklist (offline only; safe default)
+python scripts/phase1_checklist.py --real-desktop       # + real-desktop acceptance (elevated Notepad MINIMIZED)
+python scripts/phase1_checklist.py --real-elevated      # + permission denied (elevated Notepad IN FRONT)
 python scripts/fresh_clone_check.py                     # verify a fresh clone installs and passes
 $env:RUN_REAL_CLAUDE_TEST='1'; pytest -m real_api       # opt-in real API tests (cost a few tokens)
 $env:RUN_REAL_DESKTOP_TEST='1'; pytest -m real_desktop -s  # opt-in: really opens/closes Notepad and Calculator
 python scripts/trace_app_windows.py notepad calculator  # diagnostic: an app's windows over time while opened/closed
 ```
+
+Phase 1's full evidence needs **two** checklist runs, because the real-desktop tests need their own
+windows to reach the foreground while the permission-denied test needs an elevated Notepad in front,
+and Windows won't let a normal process take the foreground back from an elevated window. Each run
+therefore exits **2** — "nothing failed, but the other real group wasn't selected" — which is expected,
+not a failure. Real-desktop tests also need an idle mouse and keyboard.
 
 ## Architecture
 
@@ -99,7 +111,7 @@ docs/       project specification — the source of truth
 config/     config.yaml (non-secret settings) + settings.py (get_setting)
 data/       memory.db, claude_usage.db and local files (git-ignored)
 logs/       rotating log files (git-ignored)
-scripts/    repeatable checks (Phase 0 checklist, fresh-clone verification) and dev diagnostics
+scripts/    repeatable checks (Phase 0 and Phase 1 checklists, fresh-clone verification) and dev diagnostics
 main.py     thin entry point
 ```
 

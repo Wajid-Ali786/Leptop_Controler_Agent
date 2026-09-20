@@ -59,6 +59,12 @@ git log, git show) are fine. Stage files (git add) only when the owner explicitl
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 1 — Basic Computer Control. IN PROGRESS (started 2026-09-16) - one task at a time.
+Current phase: 2 — Voice. NEXT (not started).
 Phase 0 — Foundation: COMPLETE (Done-when checklist passed 2026-09-16; tagged v0.1).
+Phase 1 — Basic Computer Control: COMPLETE (Done-when verified 2026-09-20).
+  Verified by TWO runs of scripts/phase1_checklist.py, because the real-desktop and
+  real-elevated groups need opposite foreground conditions (see /docs/step4 Section 4):
+    python scripts/phase1_checklist.py --real-desktop     # elevated Notepad MINIMIZED
+    python scripts/phase1_checklist.py --real-elevated    # elevated Notepad IN FRONT
+  Each exits 2 because the other real group isn't selected; that is expected, not a failure.
 Model selection is still PENDING - deferred to Phase 3 (see brain.model in config/config.yaml).
