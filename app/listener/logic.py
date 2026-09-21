@@ -14,10 +14,15 @@ lowercased copy for matching. It never translates, transliterates, expands, gues
 meaning - Roman Urdu interpretation, synonyms and loosely-worded intent are Phase 3's (the Brain's)
 job, and the raw Transcript is always preserved alongside anything derived from it.
 """
+import math
 import re
+from pathlib import Path
+from typing import NamedTuple
 
-from app.listener.models import NO_DEVICE, InputDevice, ListenerSettings, VoiceFailure
-from config.settings import SettingsError, get_setting
+from app.listener.models import (DEVICE_BUSY, DEVICE_LOST, FORMAT_UNSUPPORTED, MODEL_UNAVAILABLE,
+                                 NO_DEVICE, PERMISSION_DENIED, SAMPLE_RATE, InputDevice,
+                                 ListenerSettings, VoiceFailure)
+from config.settings import PROJECT_ROOT, SettingsError, get_setting
 
 LISTENER = "listener"
 
@@ -46,7 +51,7 @@ def listener_settings() -> ListenerSettings:
         enabled=_flag("listener.enabled"),
         model_size=_choice("listener.model_size", MODEL_SIZES),
         model_dir=_text("listener.model_dir"),
-        local_files_only=_flag("listener.local_files_only"),
+        local_files_only=_local_files_only("listener.local_files_only"),
         device=_choice("listener.device", DEVICES),
         compute_type=_choice("listener.compute_type", COMPUTE_TYPES),
         language=_language("listener.language"),
@@ -164,10 +169,246 @@ def _listed(devices) -> str:
     return f"{shown}; and {extra} more" if extra > 0 else shown
 
 
+def uses_default(selector) -> bool:
+    """True when `listener.input_device` asks for the system default ("" or whitespace)."""
+    return isinstance(selector, str) and not selector.strip()
+
+
+# --- How long a capture may run ------------------------------------------------------------------
+
+def capture_limit(configured: float, requested=None) -> float:
+    """The maximum a capture may last: the caller may LOWER the configured cap, never raise it.
+
+    A bad request (zero, negative, not a number, infinite) is a programming error and raises
+    ValueError - it is not something to quietly replace with the cap."""
+    if requested is None:
+        return float(configured)
+    if (isinstance(requested, bool) or not isinstance(requested, (int, float))
+            or not math.isfinite(requested) or requested <= 0):
+        raise ValueError(f"max_seconds must be a positive number of seconds, got {requested!r}")
+    return min(float(requested), float(configured))
+
+
+def max_frames(seconds: float) -> int:
+    """How many samples `seconds` allows - rounded DOWN, so a capture never exceeds its maximum."""
+    frames = math.floor(seconds * SAMPLE_RATE)
+    if frames < 1:
+        raise ValueError(f"{seconds!r} seconds is shorter than one sample at {SAMPLE_RATE} Hz")
+    return frames
+
+
+# --- What a backend failure means ----------------------------------------------------------------
+# Only failures with evidence behind them are named. The adapter hands over the PortAudio error code
+# and, for a host error, the host API's name and its own code - never the error TEXT, which can
+# contain device names. A failure not listed here is not relabelled: backend_failure() returns None
+# and the adapter lets the original exception propagate after cleanup, so it is seen, not disguised.
+
+PA_UNANTICIPATED_HOST_ERROR = -9999
+PA_INVALID_CHANNEL_COUNT = -9998
+PA_INVALID_SAMPLE_RATE = -9997
+PA_INVALID_DEVICE = -9996
+PA_SAMPLE_FORMAT_NOT_SUPPORTED = -9994
+_FORMAT_CODES = frozenset({PA_INVALID_CHANNEL_COUNT, PA_INVALID_SAMPLE_RATE,
+                           PA_SAMPLE_FORMAT_NOT_SUPPORTED})
+
+MME, WASAPI = "MME", "Windows WASAPI"
+# (host API, host error code) -> kind. Documented Windows codes; the HRESULTs are compared unsigned.
+_HOST_ERRORS = {
+    (MME, 2): DEVICE_LOST,                      # MMSYSERR_BADDEVICEID - no longer there
+    (MME, 4): DEVICE_BUSY,                      # MMSYSERR_ALLOCATED - another program has it
+    (MME, 6): DEVICE_LOST,                      # MMSYSERR_NODRIVER - its driver went away
+    (WASAPI, 0x80070005): PERMISSION_DENIED,    # E_ACCESSDENIED - Windows privacy said no
+    (WASAPI, 0x8889000A): DEVICE_BUSY,          # AUDCLNT_E_DEVICE_IN_USE - held exclusively
+    (WASAPI, 0x88890004): DEVICE_LOST,          # AUDCLNT_E_DEVICE_INVALIDATED - unplugged/disabled
+}
+
+FAILURE_MESSAGES = {
+    DEVICE_BUSY: "The microphone is being used by another program, so it couldn't be opened. Close "
+                 "whatever is using it and try again.",
+    DEVICE_LOST: "The microphone went away while it was being opened or used (it may have been "
+                 "unplugged or disabled). Check it is connected and try again.",
+    PERMISSION_DENIED: "Windows refused access to the microphone. Allow desktop apps to use it in "
+                       "Settings > Privacy > Microphone, then try again.",
+}
+STALLED_MESSAGE = ("The microphone stopped delivering sound before the recording finished, so it was "
+                   "abandoned. Check it is connected and try again.")
+
+
+def backend_failure(code, host_api=None, host_code=None) -> VoiceFailure | None:
+    """The truthful VoiceFailure for a PortAudio error, or None when there is no evidence for one.
+
+    FORMAT_UNSUPPORTED comes back with a placeholder message: the adapter replaces it with
+    format_refusal(), which knows which device and path were involved."""
+    if code in _FORMAT_CODES:
+        return VoiceFailure(FORMAT_UNSUPPORTED, "canonical 16 kHz mono int16 was refused")
+    if code == PA_INVALID_DEVICE:  # it was in the device list a moment ago, then it wasn't
+        return VoiceFailure(DEVICE_LOST, FAILURE_MESSAGES[DEVICE_LOST])
+    if code == PA_UNANTICIPATED_HOST_ERROR and isinstance(host_code, int):
+        kind = _HOST_ERRORS.get((host_api, host_code & 0xFFFFFFFF))
+        if kind:
+            return VoiceFailure(kind, FAILURE_MESSAGES[kind])
+    return None
+
+
+def format_refusal(device: InputDevice, used_default: bool, devices) -> VoiceFailure:
+    """FORMAT_UNSUPPORTED with a message the user can act on. It says what refused and what else might
+    work - and that nothing was switched, because an explicit choice has to stay explicit."""
+    if used_default:
+        return VoiceFailure(FORMAT_UNSUPPORTED, (
+            f"Your default microphone ([{device.index}] {readable(device.name)} via {device.host_api}) "
+            f"refused to record 16 kHz mono, the format voice input needs. Nothing else was tried. "
+            f"Choose another microphone as the Windows default, or name one in listener.input_device."))
+    others = sorted({other.host_api for other in devices if other.host_api != device.host_api})
+    elsewhere = (f" The same hardware is often also reachable through another sound path on this "
+                 f"computer ({', '.join(others)}), which may accept it - choose that entry by name or "
+                 f"index in listener.input_device." if others else "")
+    return VoiceFailure(FORMAT_UNSUPPORTED, (
+        f"The microphone you selected, [{device.index}] {readable(device.name)} on {device.host_api}, "
+        f"refused to record 16 kHz mono (the format voice input needs) on that sound path."
+        f"{elsewhere} The assistant did not switch to anything automatically."))
+
+
+# --- The speech model: where it lives, what "complete" means, and where it runs -------------------
+# Pure policy for app/listener/adapter.ensure_model(). The adapter gathers the evidence - the files in
+# the snapshot folder, what ctranslate2 reports the machine supports - and these functions decide.
+# Nothing here assumes the development laptop: every choice is made from reported capabilities.
+
+FETCH_COMMAND = "python scripts/fetch_voice_model.py"
+CPU, CUDA = "cpu", "cuda"
+# Tried in order; the first one ctranslate2 REPORTS as supported on the device wins. A compatibility
+# and memory order, not a benchmark result: int8 keeps weights in 8 bits on CPU (which cannot run
+# float16 at all); CUDA prefers half precision, then the quantized forms, then full precision.
+COMPUTE_PREFERENCE = {CPU: ("int8", "float32"),
+                      CUDA: ("float16", "int8_float16", "int8", "float32")}
+
+# What the installed faster-whisper 1.2.1 + ctranslate2 4.8.2 read from a model folder. tokenizer.json
+# matters most: without it faster-whisper fetches a tokenizer from the internet, whatever
+# local_files_only says - so a folder missing it is refused BEFORE the model is ever constructed.
+REQUIRED_MODEL_FILES = ("config.json", "model.bin", "tokenizer.json")
+# Exactly one of these: ctranslate2's converter writes vocabulary.json, and its runtime also reads
+# the older vocabulary.txt, which the published Systran conversions use.
+VOCABULARY_FILES = ("vocabulary.json", "vocabulary.txt")
+OPTIONAL_MODEL_FILES = ("preprocessor_config.json",)  # faster-whisper checks it exists before reading
+
+# Why a model construction failed - a category, never the exception's text (which carries paths).
+LOAD_ERROR, OUT_OF_MEMORY, REJECTED_SETTINGS = "load_error", "out_of_memory", "rejected_settings"
+FALLBACK_CATEGORIES = frozenset({LOAD_ERROR, OUT_OF_MEMORY})  # resource failures, not bad settings
+CATEGORY_TEXT = {LOAD_ERROR: "the model or its runtime libraries couldn't be loaded",
+                 OUT_OF_MEMORY: "there wasn't enough memory",
+                 REJECTED_SETTINGS: "the device rejected the settings"}
+
+
+class LoadPlan(NamedTuple):
+    device: str
+    compute_type: str
+
+
+class Refusal(NamedTuple):
+    """Why no plan is possible: a MODEL_MESSAGES code, and the device it concerns."""
+    code: str
+    device: str
+
+
+def model_root(model_dir: str) -> Path:
+    """listener.model_dir as a folder: relative paths are relative to the project, not the shell."""
+    path = Path(model_dir)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def missing_model_files(sizes) -> tuple[str, ...]:
+    """Given {file name: size in bytes} for a model folder, what is missing or empty (sorted).
+    Every required file must be there and non-empty, plus exactly one vocabulary file."""
+    missing = [name for name in REQUIRED_MODEL_FILES if sizes.get(name, 0) <= 0]
+    vocabularies = [name for name in VOCABULARY_FILES if sizes.get(name, 0) > 0]
+    if len(vocabularies) != 1:
+        missing.append(" or ".join(VOCABULARY_FILES) if not vocabularies
+                       else "a single vocabulary file (found both)")
+    return tuple(missing)
+
+
+def choose_compute_type(device: str, requested: str, supported) -> str | None:
+    """The compute type to use on `device`, or None. `auto` walks COMPUTE_PREFERENCE; an explicit type
+    must itself be reported supported - it is never swapped for another. Never returns "auto" or
+    "default": ctranslate2 is always told exactly what to use."""
+    if requested == AUTO:
+        return next((kind for kind in COMPUTE_PREFERENCE[device] if kind in supported), None)
+    return requested if requested in supported else None
+
+
+def plan_model_load(device: str, compute_type: str, cpu_types, cuda_count: int,
+                    cuda_types) -> LoadPlan | Refusal:
+    """Where the model should run, decided only from what ctranslate2 reported on THIS machine.
+
+    cuda_types is None when CUDA inspection failed. `cuda` never becomes CPU and `cpu` never becomes
+    CUDA. `auto` takes CUDA only when a device exists AND a compute type can be chosen for it;
+    otherwise CPU."""
+    cuda_usable = cuda_count >= 1 and cuda_types is not None
+    if device == CUDA and not cuda_usable:
+        return Refusal("cuda_unavailable", CUDA)
+    if device in (CUDA, AUTO) and cuda_usable:
+        chosen = choose_compute_type(CUDA, compute_type, cuda_types)
+        if chosen:
+            return LoadPlan(CUDA, chosen)
+        if device == CUDA:
+            return Refusal(_compute_code(compute_type), CUDA)
+    chosen = choose_compute_type(CPU, compute_type, cpu_types)
+    return LoadPlan(CPU, chosen) if chosen else Refusal(_compute_code(compute_type), CPU)
+
+
+def may_fall_back(requested_device: str, plan: LoadPlan, category: str) -> bool:
+    """CUDA -> CPU only when the user said `auto`, CUDA was chosen from the evidence, and constructing
+    the model then failed for a resource reason. Never for `cuda`, never for rejected settings."""
+    return requested_device == AUTO and plan.device == CUDA and category in FALLBACK_CATEGORIES
+
+
+def _compute_code(requested: str) -> str:
+    return "no_compute_type" if requested == AUTO else "compute_unsupported"
+
+
+MODEL_MESSAGES = {
+    "not_downloaded": "The '{size}' speech model isn't downloaded yet. Voice input never downloads "
+                      "anything by itself - to get it, run: {fetch}",
+    "incomplete": "The downloaded '{size}' speech model is incomplete (missing or empty: {missing}). "
+                  "Run {fetch} again to finish it.",
+    "folder_unreadable": "The '{size}' speech model's folder couldn't be read. Run {fetch} again.",
+    "backend_missing": "Speech recognition isn't available on this computer: the faster-whisper "
+                       "library couldn't be loaded.",
+    "cuda_unavailable": "listener.device is 'cuda', but no usable CUDA GPU was found. Set it to 'auto' "
+                        "or 'cpu' - the assistant never switches to the CPU on its own.",
+    "no_compute_type": "None of the computation types voice input can use is supported on {device} "
+                       "(it supports: {supported}).",
+    "compute_unsupported": "listener.compute_type '{requested}' isn't supported on {device} (it "
+                           "supports: {supported}). It is never swapped for another type automatically.",
+    "load_failed": "The '{size}' speech model couldn't be loaded on {device}: {reason}.",
+    "fallback_failed": "The '{size}' speech model couldn't be loaded on CUDA ({cuda_reason}), nor "
+                       "afterwards on CPU ({reason}).",
+    "restart_required": "The speech model settings changed after the model was loaded. Restart the "
+                        "assistant to use the new settings.",
+    "download_refused": "listener.local_files_only must be true: voice input never downloads anything "
+                        "during normal use. To download the speech model, run: {fetch}",
+    "download_failed": "The '{size}' speech model couldn't be downloaded ({category}). Check the "
+                       "internet connection and run {fetch} again - what already arrived is kept.",
+}
+
+
+def model_unavailable(code: str, **values) -> VoiceFailure:
+    """MODEL_UNAVAILABLE with fixed wording for `code`. Values are settings and category words we
+    chose ourselves - never exception text or paths."""
+    return VoiceFailure(MODEL_UNAVAILABLE, MODEL_MESSAGES[code].format(fetch=FETCH_COMMAND, **values))
+
+
 # --- Validation helpers (the project's style: raise SettingsError naming the key) ----------------
 
 def _value(name: str):
     return get_setting(name)
+
+
+def _local_files_only(name: str) -> bool:
+    """Must be true: normal use never downloads. The fetch script is the one way to get a model."""
+    if _value(name) is not True:
+        raise SettingsError(f"Setting '{name}' must be true: voice input never downloads anything during "
+                            f"normal use. To download the speech model, run: {FETCH_COMMAND}")
+    return True
 
 
 def _flag(name: str) -> bool:

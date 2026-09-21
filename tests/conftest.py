@@ -25,6 +25,8 @@ import pytest
 from app import logging_setup
 from app.brain import adapter, cost_controls
 from app.executor import logic as executor_logic
+from app.listener import adapter as listener_adapter
+from app.listener import microphone
 from config import settings
 
 REAL_API_OPT_IN = "RUN_REAL_CLAUDE_TEST"
@@ -32,6 +34,8 @@ REAL_DESKTOP_OPT_IN = "RUN_REAL_DESKTOP_TEST"
 REAL_CLIPBOARD_OPT_IN = "RUN_REAL_CLIPBOARD_TEST"
 REAL_ELEVATED_OPT_IN = "RUN_ELEVATED_TEST"
 REAL_MICROPHONE_OPT_IN = "RUN_REAL_MICROPHONE_TEST"
+REAL_RECORDING_OPT_IN = "RUN_REAL_RECORDING_TEST"  # deliberately separate: probes never record
+REAL_MODEL_OPT_IN = "RUN_REAL_MODEL_TEST"
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -69,6 +73,17 @@ def pytest_configure(config):
         f"{REAL_MICROPHONE_OPT_IN}=1. Task 2a tests RECORD NOTHING - they enumerate devices and ask "
         f"whether a format would be accepted, and never open a stream",
     )
+    config.addinivalue_line(
+        "markers",
+        f"real_recording: RECORDS a few seconds from this computer's real microphone into memory (never "
+        f"saved, never played back); skipped unless {REAL_RECORDING_OPT_IN}=1. {REAL_MICROPHONE_OPT_IN} "
+        f"does NOT enable it",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"real_model: loads the speech model already in listener.model_dir (never downloads, no "
+        f"microphone); skipped unless {REAL_MODEL_OPT_IN}=1",
+    )
 
 
 OPT_IN_GATES = {
@@ -83,6 +98,12 @@ OPT_IN_GATES = {
     "real_microphone": (REAL_MICROPHONE_OPT_IN,
                         f"Asks this computer's real sound backend what it supports (records nothing) - "
                         f"set {REAL_MICROPHONE_OPT_IN}=1 to run"),
+    "real_recording": (REAL_RECORDING_OPT_IN,
+                       f"Records from your real microphone (in memory only) - set {REAL_RECORDING_OPT_IN}=1 "
+                       f"to run"),
+    "real_model": (REAL_MODEL_OPT_IN,
+                   f"Loads the real speech model from data/models (no download) - set {REAL_MODEL_OPT_IN}=1 "
+                   f"to run"),
 }
 
 
@@ -105,8 +126,12 @@ def isolated_logging(request, tmp_path, monkeypatch):
     if request.node.get_closest_marker("real_api") is None:
         monkeypatch.setattr(cost_controls, "PROJECT_ROOT", tmp_path)
     executor_logic.forget_session_windows()
+    microphone.reset()
+    listener_adapter.forget_model()
     yield
     executor_logic.forget_session_windows()
+    microphone.reset()
+    listener_adapter.forget_model()
     logging_setup.reset_logging()
 
 

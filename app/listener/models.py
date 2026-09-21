@@ -12,7 +12,8 @@ A VoiceFailure is the other outcome: the reason voice produced no transcript, in
 to show. Failures are distinguished by KIND so the console can react differently (a missing
 microphone is not a silent room), without a class per error.
 
-Nothing in this file touches audio, the model, the disk or the network.
+A Recording is what one bounded capture produced: canonical 16 kHz mono PCM, in memory. It can HOLD
+audio, but nothing in this file opens a device, loads the model, or touches the disk or the network.
 """
 from dataclasses import dataclass
 
@@ -31,8 +32,26 @@ NO_SPEECH = "no_speech"                  # silence or noise only - never treated
 MODEL_UNAVAILABLE = "model_unavailable"  # the speech model is missing, or couldn't be loaded
 TRANSCRIPTION_FAILED = "transcription_failed"  # the model ran and failed
 
+FORMAT_UNSUPPORTED = "format_unsupported"  # the chosen microphone exists and the backend works, but
+                                         # THAT device on THAT sound path refuses canonical mono 16 kHz
+                                         # int16. Never "fixed" by switching path, device or rate.
+
 FAILURE_KINDS = frozenset({NO_DEVICE, PERMISSION_DENIED, DEVICE_BUSY, DEVICE_LOST,
-                           CAPTURE_UNAVAILABLE, NO_SPEECH, MODEL_UNAVAILABLE, TRANSCRIPTION_FAILED})
+                           CAPTURE_UNAVAILABLE, FORMAT_UNSUPPORTED, NO_SPEECH, MODEL_UNAVAILABLE,
+                           TRANSCRIPTION_FAILED})
+
+# The only audio format a Recording ever holds (Feature 1 locked the rate; Task 2a showed the default
+# path accepts it). Raw little-endian signed 16-bit samples, one channel.
+SAMPLE_RATE = 16000
+CHANNELS = 1
+DTYPE = "int16"
+BYTES_PER_FRAME = 2
+
+# Why a capture stopped - only what the capture primitive itself knows. Silence, "speech complete" or
+# "no speech" are judgements about the sound, which belong to later Listener work, not to capture.
+LIMIT = "limit"          # the maximum length was reached
+CANCELLED = "cancelled"  # the caller's cancel event was set
+END_REASONS = frozenset({LIMIT, CANCELLED})
 
 
 @dataclass(frozen=True)
@@ -63,6 +82,91 @@ class VoiceFailure:
         if self.kind not in FAILURE_KINDS:
             raise ValueError(f"Unknown voice failure kind {self.kind!r}; expected one of "
                              f"{', '.join(sorted(FAILURE_KINDS))}")
+
+    def __repr__(self) -> str:
+        # The message is for the SCREEN: a device-selection failure legitimately lists real microphone
+        # names so the user can pick one. A repr lands in logs, tracebacks and debuggers, so it
+        # describes the message by length only - code that means to show it uses `.message`.
+        length = len(self.message) if isinstance(self.message, str) else 0
+        return f"VoiceFailure(kind={self.kind!r}, message=<{length} characters>)"
+
+    __str__ = __repr__  # so print()/f-strings/%s can't reach the message by an inherited route either
+
+
+@dataclass(frozen=True)
+class Recording:
+    """One bounded microphone capture, held in memory only.
+
+    `pcm` is little-endian signed 16-bit mono at 16000 Hz - exactly SAMPLE_RATE/CHANNELS/DTYPE, checked
+    on construction. The length is DERIVED from the bytes (frames, seconds), never measured by a clock,
+    so it can't disagree with the audio. Nothing here names the microphone. For an explicitly selected
+    device, `device_index` is the backend's number for it in THIS run. On the default path it is None:
+    the stream is opened as "whatever the default is now", and an index enumerated a moment earlier
+    could already be stale - so it isn't claimed.
+
+    The repr and str never contain a sample. There is no save method, and nothing keeps a copy: the
+    audio lives exactly as long as this object does."""
+    pcm: bytes
+    stopped_by: str          # LIMIT or CANCELLED
+    overflows: int = 0       # times the backend reported input overflow (audio it had to drop)
+    device_index: int | None = None
+    used_default: bool = True
+    sample_rate: int = SAMPLE_RATE
+    channels: int = CHANNELS
+    dtype: str = DTYPE
+
+    def __post_init__(self):
+        if not isinstance(self.pcm, bytes):
+            raise TypeError(f"Recording.pcm must be bytes, got {type(self.pcm).__name__}")
+        if len(self.pcm) % BYTES_PER_FRAME:
+            raise ValueError("Recording.pcm must hold whole 16-bit samples")
+        if (self.sample_rate, self.channels, self.dtype) != (SAMPLE_RATE, CHANNELS, DTYPE):
+            raise ValueError(f"A Recording is always {SAMPLE_RATE} Hz, {CHANNELS} channel, {DTYPE}")
+        if self.stopped_by not in END_REASONS:
+            raise ValueError(f"Unknown capture ending {self.stopped_by!r}; expected one of "
+                             f"{', '.join(sorted(END_REASONS))}")
+        if isinstance(self.overflows, bool) or not isinstance(self.overflows, int) or self.overflows < 0:
+            raise ValueError("Recording.overflows must be a count")
+
+    @property
+    def frames(self) -> int:
+        """Samples captured (one channel, so frames and samples are the same number)."""
+        return len(self.pcm) // BYTES_PER_FRAME
+
+    @property
+    def seconds(self) -> float:
+        return self.frames / self.sample_rate
+
+    def __repr__(self) -> str:
+        return (f"Recording(frames={self.frames}, seconds={self.seconds:.3f}, "
+                f"sample_rate={self.sample_rate}, channels={self.channels}, dtype={self.dtype!r}, "
+                f"stopped_by={self.stopped_by!r}, overflows={self.overflows}, "
+                f"device_index={self.device_index!r}, used_default={self.used_default!r})")
+
+    __str__ = __repr__
+
+
+@dataclass(frozen=True)
+class ModelStatus:
+    """What app.listener.adapter.ensure_model() made ready. Safe metadata only: no model object, no
+    path (paths carry the user name), no exception text.
+
+    load_seconds is the time to find, verify and construct the model on the call that actually loaded
+    it - excluding the one-off import of the speech library. A reused model did no loading, so its
+    load_seconds is None rather than a number that would pretend otherwise."""
+    model_size: str
+    device: str                        # what it really runs on: "cpu" or "cuda"
+    compute_type: str                  # what ctranslate2 was really told, never "auto"/"default"
+    reused: bool
+    load_seconds: float | None
+    fell_back_from: str | None = None  # "cuda" when device=auto fell back to CPU
+    fallback_reason: str | None = None  # the category of that CUDA failure
+
+    def __post_init__(self):
+        if self.reused != (self.load_seconds is None):
+            raise ValueError("load_seconds is measured for a real load, and None for a reused model")
+        if (self.fell_back_from is None) != (self.fallback_reason is None):
+            raise ValueError("a fallback names both what it fell back from and why")
 
 
 @dataclass(frozen=True)

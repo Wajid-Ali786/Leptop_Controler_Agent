@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 .env
 data/*.db
+data/models/
 logs/*.log
 .pytest_cache/

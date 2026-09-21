@@ -14,9 +14,9 @@ import ast
 import pytest
 
 from app.listener import logic, models
-from app.listener.models import (CAPTURE_UNAVAILABLE, DEVICE_BUSY, DEVICE_LOST, MODEL_UNAVAILABLE,
-                                 NO_DEVICE, NO_SPEECH, PERMISSION_DENIED, TRANSCRIPTION_FAILED,
-                                 Transcript, VoiceFailure)
+from app.listener.models import (CAPTURE_UNAVAILABLE, DEVICE_BUSY, DEVICE_LOST, FORMAT_UNSUPPORTED,
+                                 MODEL_UNAVAILABLE, NO_DEVICE, NO_SPEECH, PERMISSION_DENIED,
+                                 TRANSCRIPTION_FAILED, Transcript, VoiceFailure)
 from config import settings
 from config.settings import SettingsError
 
@@ -109,6 +109,8 @@ def test_sixteen_kilohertz_is_the_only_accepted_rate():
     ("initial_prompt_terms: [notepad, calculator]", 'initial_prompt_terms: [notepad, "  "]',
      "listener.initial_prompt_terms"),
     ("local_files_only: true", "local_files_only: yes please", "listener.local_files_only"),
+    # normal use never downloads: only the fetch script may, so false is refused outright
+    ("local_files_only: true", "local_files_only: false", "listener.local_files_only"),
     ("vad_filter: true", "vad_filter: 1", "listener.vad_filter"),
     ('input_device: ""', "input_device: -2", "listener.input_device"),
     ('input_device: ""', "input_device: true", "listener.input_device"),
@@ -117,6 +119,12 @@ def test_sixteen_kilohertz_is_the_only_accepted_rate():
 def test_invalid_settings_are_refused_by_name(config, old, new, part):
     config(old, new)
     with pytest.raises(SettingsError, match=part.replace(".", r"\.")):
+        logic.listener_settings()
+
+
+def test_turning_off_local_files_only_points_at_the_fetch_script(config):
+    config("local_files_only: true", "local_files_only: false")
+    with pytest.raises(SettingsError, match=r"never downloads.*scripts/fetch_voice_model\.py"):
         logic.listener_settings()
 
 
@@ -196,8 +204,8 @@ def test_a_transcript_needs_text():
 
 
 @pytest.mark.parametrize("kind", [NO_DEVICE, PERMISSION_DENIED, DEVICE_BUSY, DEVICE_LOST,
-                                  CAPTURE_UNAVAILABLE, NO_SPEECH, MODEL_UNAVAILABLE,
-                                  TRANSCRIPTION_FAILED])
+                                  CAPTURE_UNAVAILABLE, FORMAT_UNSUPPORTED, NO_SPEECH,
+                                  MODEL_UNAVAILABLE, TRANSCRIPTION_FAILED])
 def test_every_failure_kind_can_be_built_and_carries_a_message(kind):
     failure = VoiceFailure(kind=kind, message="something to show the user")
     assert failure.kind in models.FAILURE_KINDS and failure.message
@@ -212,12 +220,14 @@ def test_the_failure_kinds_are_exactly_the_ones_the_project_has_agreed():
     """A new kind is a contract change, so it is listed here deliberately rather than discovered."""
     assert models.FAILURE_KINDS == frozenset({
         "no_device", "permission_denied", "device_busy", "device_lost",
-        "capture_unavailable", "no_speech", "model_unavailable", "transcription_failed"})
+        "capture_unavailable", "format_unsupported", "no_speech", "model_unavailable",
+        "transcription_failed"})
 
 
 def test_a_missing_backend_and_a_missing_microphone_are_different_kinds():
     assert CAPTURE_UNAVAILABLE != NO_DEVICE
     assert DEVICE_BUSY not in (NO_DEVICE, DEVICE_LOST)
+    assert FORMAT_UNSUPPORTED not in (NO_DEVICE, DEVICE_BUSY, CAPTURE_UNAVAILABLE, DEVICE_LOST)
 
 
 # --- Architecture rules, pinned before the code that could break them exists ---------------------
@@ -241,6 +251,8 @@ def _python_files():
     ("sounddevice", "app/listener/adapter.py"),
     ("edge_tts", "app/speaker/adapter.py"),
     ("pyttsx3", "app/speaker/adapter.py"),
+    ("ctranslate2", "app/listener/adapter.py"),
+    ("huggingface_hub", "app/listener/adapter.py"),
 ])
 def test_only_the_owning_adapter_may_import_the_voice_libraries(library, allowed):
     root = settings.PROJECT_ROOT
@@ -308,6 +320,104 @@ def test_the_listener_can_never_write_audio_to_disk():
                         and "w" in arg.value for arg in node.args[1:]):
                     writers.append(f"{path.relative_to(root)}: open(..., write)")
     assert writers == [], f"app/listener must not write files: {writers}"
+
+
+@pytest.mark.parametrize("path", ["app/listener/adapter.py", "app/listener/microphone.py"])
+def test_the_capture_primitive_knows_nothing_of_the_executor(path):
+    """Capture takes a caller's cancel event; turning the emergency stop into that event is the voice
+    orchestration's job. The low-level audio code must not depend on the Executor at all - not even
+    on emergency_stop, which other modules may call."""
+    offenders = [f"{module} {name}".strip() for module, name in _imports(settings.PROJECT_ROOT / path)
+                 if module.startswith("app.executor") or (module == "app" and name == "executor")]
+    assert offenders == [], f"{path} must not import the Executor: {offenders}"
+
+
+def _adapter_tree():
+    return ast.parse((settings.PROJECT_ROOT / "app" / "listener" / "adapter.py").read_text(encoding="utf-8"))
+
+
+def _functions_using(tree, predicate):
+    """Names of the top-level adapter functions (or "<module>") whose code contains a matching node."""
+    places = []
+    for owner in tree.body:
+        scope = owner.name if isinstance(owner, (ast.FunctionDef, ast.ClassDef)) else "<module>"
+        if any(predicate(node) for node in ast.walk(owner)):
+            places.append(scope)
+    return sorted(set(places))
+
+
+@pytest.mark.parametrize("library, accessor", [
+    ("sounddevice", "_audio"), ("faster_whisper", "_whisper"), ("ctranslate2", "_ct2"),
+])
+def test_each_backend_is_imported_only_inside_its_one_lazy_place(library, accessor):
+    """Importing the adapter must never need a backend (faster-whisper alone takes ~9 s to import):
+    each library is imported in exactly one function, only when it is actually used."""
+    def imports_it(node):
+        if isinstance(node, ast.Import):
+            return any(alias.name.split(".")[0] == library for alias in node.names)
+        return isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == library
+    assert _functions_using(_adapter_tree(), imports_it) == [accessor]
+
+
+FETCH_SCRIPT = "scripts/fetch_voice_model.py"
+
+
+def test_only_the_fetch_script_can_reach_the_download_path():
+    """fetch_model() is the one function that downloads. No app module, no config code and no other
+    script may even mention it - so normal use has no route to the network for a model."""
+    root = settings.PROJECT_ROOT
+    offenders = []
+    for path in _python_files():
+        relative = path.relative_to(root).as_posix()
+        if relative == FETCH_SCRIPT:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            named = getattr(node, "id", None) or getattr(node, "attr", None) or (
+                node.name if isinstance(node, ast.alias) else None)
+            if named == "fetch_model" and not (relative == "app/listener/adapter.py"
+                                              and isinstance(node, ast.FunctionDef)):
+                offenders.append(relative)
+            if isinstance(node, ast.FunctionDef) and node.name == "fetch_model"                     and relative != "app/listener/adapter.py":
+                offenders.append(relative)
+    assert offenders == [], f"only {FETCH_SCRIPT} may use fetch_model(): {sorted(set(offenders))}"
+
+
+def test_the_fetch_script_itself_imports_no_model_library():
+    imported = {module.split(".")[0] for module, _ in _imports(settings.PROJECT_ROOT / FETCH_SCRIPT)}
+    assert not imported & {"faster_whisper", "ctranslate2", "huggingface_hub", "httpx"}, imported
+
+
+def test_the_listener_never_imports_the_brains_http_layer():
+    """httpx belongs to the Claude SDK (app/brain/adapter.py). Download errors are recognized by the
+    module their class lives in, never by importing it here."""
+    imported = [module for path in (settings.PROJECT_ROOT / "app" / "listener").rglob("*.py")
+                for module, _ in _imports(path) if module.split(".")[0] in ("httpx", "httpx2")]
+    assert imported == []
+
+
+def test_a_download_is_only_ever_requested_inside_fetch_model():
+    """local_files_only=False - the one argument that lets Hugging Face use the network - appears in
+    exactly one place in the project."""
+    def asks_for_network(node):
+        return isinstance(node, ast.keyword) and node.arg == "local_files_only" and             isinstance(node.value, ast.Constant) and node.value.value is False
+    assert _functions_using(_adapter_tree(), asks_for_network) == ["fetch_model"]
+    for path in _python_files():
+        if path.name != "adapter.py" or "listener" not in path.parts:
+            assert not any(asks_for_network(node) for node in ast.walk(ast.parse(path.read_text(
+                encoding="utf-8")))), f"{path} asks for a download"
+
+
+def test_the_model_is_constructed_in_one_place_and_looked_up_in_two():
+    tree = _adapter_tree()
+    named = lambda name: (lambda node: getattr(node, "attr", None) == name or getattr(node, "id", None) == name)
+    assert _functions_using(tree, named("WhisperModel")) == ["_construct"]
+    assert _functions_using(tree, named("download_model")) == ["_local_snapshot", "fetch_model"]
+
+
+def test_the_microphone_ownership_module_holds_no_audio_and_needs_no_library():
+    imported = {module.split(".")[0] for module, _ in
+                _imports(settings.PROJECT_ROOT / "app" / "listener" / "microphone.py")}
+    assert imported == {"threading"}, f"microphone.py must be only the ownership rule: {imported}"
 
 
 def test_a_future_voice_console_must_route_through_handle_command():
