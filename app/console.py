@@ -143,6 +143,64 @@ def handle_command(text: str, confirm=None, offer_retry=None, focus=None) -> Com
     return CommandReply(Status.RAN, result.message, action, result)
 
 
+# --- What a line WOULD be, without doing any of it (the voice console's one parser boundary) ------
+
+@dataclass(frozen=True)
+class Preview:
+    """What `text` would mean if it were run - parsed and nothing else.
+
+    It exists so another front end (app/voice_console.py) can compare two mechanical readings of one
+    spoken line WITHOUT importing the Executor's parser or ever holding an ExecutorAction. Nothing
+    here runs, asks, focuses a window or classifies risk.
+
+    `equivalence_key` is what makes "the same action" a fact rather than a guess: it compares the
+    parsed kind AND target, including a `type` payload, which `safe_description` deliberately hides.
+    It is compared, never shown - the repr leaves it out."""
+    is_command: bool
+    kind: str | None            # the ExecutorAction kind, or None when it isn't a command
+    free_form: bool             # the action carries text the USER wrote: never normalized or trimmed
+    refusal: str | None         # commands.CommandRefusal.kind when it isn't a command
+    safe_description: str       # safe to show: typed text is only ever described by its length
+    equivalence_key: tuple      # (kind, target) - for comparison only
+
+    def same_action_as(self, other: "Preview") -> bool:
+        """True when both readings would do exactly the same thing to the computer."""
+        return (self.is_command and other.is_command
+                and self.equivalence_key == other.equivalence_key)
+
+    def __repr__(self) -> str:
+        # equivalence_key holds the raw target, which for `type` is what the user said. Not shown.
+        return (f"Preview(is_command={self.is_command}, kind={self.kind!r}, "
+                f"free_form={self.free_form}, refusal={self.refusal!r})")
+
+    __str__ = __repr__
+
+
+def preview(text: str) -> Preview:
+    """Parse `text` and describe what it would do. NOTHING happens: no window is read or activated,
+    no safety classification runs, and no action is executed."""
+    parsed = commands.parse(text)
+    if isinstance(parsed, commands.CommandRefusal):
+        return Preview(is_command=False, kind=None, free_form=False, refusal=parsed.kind,
+                       safe_description=parsed.message, equivalence_key=())
+    return Preview(is_command=True, kind=parsed.kind, free_form=parsed.kind == TYPE_TEXT,
+                   refusal=None, safe_description=parsed.description,
+                   equivalence_key=(parsed.kind, parsed.target))
+
+
+def typed_confirmation(read=input, write=print):
+    """The console's own Medium-and-above confirmation, for another front end to reuse UNCHANGED.
+
+    It reads from the KEYBOARD and allows only the exact word "yes". Voice never answers it: a
+    spoken "yes" is a new utterance, not an authorization (docs/step4 Section 5)."""
+    return _confirm(read, write)
+
+
+def typed_retry_offer(read=input, write=print):
+    """The console's own retry question, reused the same way. Also keyboard-only."""
+    return _offer_retry(read, write)
+
+
 class FocusHandover:
     """Watches which window is in front. It NEVER activates a window or sends input: the user switches
     windows themselves, and the Executor's own checks decide what may happen in the window they chose."""

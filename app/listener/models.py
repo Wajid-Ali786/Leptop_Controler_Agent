@@ -93,6 +93,53 @@ class Transcript:
 
 
 @dataclass(frozen=True)
+class DerivedTranscript:
+    """One Transcript plus the mechanical forms computed FROM it (Feature 5).
+
+    Raw provenance and derived text are deliberately separate fields, and there is no `.text` here:
+    code that wants what was said reaches for `.transcript.text`, and code that wants a normalized
+    copy names which one it means. Nothing derived is ever written back into the Transcript, and
+    nothing here carries meaning - no intent, no action, no corrected or reinterpreted text. Whether
+    a mechanically normalized transcript matches the deterministic command grammar is decided above
+    this layer; this is only the text.
+
+    `stop_match` is the pure answer to one narrow question - was the whole utterance the single word
+    "stop" - and it is never authority to stop anything by itself (see logic.is_stop_phrase)."""
+    transcript: Transcript
+    tidy_text: str        # logic.tidy(transcript.text)
+    matching_text: str    # logic.for_matching(transcript.text)
+    stop_match: bool
+
+    def __post_init__(self):
+        if not isinstance(self.transcript, Transcript):
+            raise TypeError(f"DerivedTranscript.transcript must be a Transcript, got "
+                            f"{type(self.transcript).__name__}")
+        for name in ("tidy_text", "matching_text"):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(f"DerivedTranscript.{name} must be str, got "
+                                f"{type(getattr(self, name)).__name__}")
+        if not isinstance(self.stop_match, bool):
+            raise TypeError("DerivedTranscript.stop_match must be True or False")
+
+    @property
+    def differs_from_raw(self) -> bool:
+        """True when the mechanical clean-up changed anything at all."""
+        return self.tidy_text != self.transcript.text
+
+    def __repr__(self) -> str:
+        # Three strings here, and every one of them is speech. None of them appears: a repr lands in
+        # logs, tracebacks and debuggers. Code that means to show what was said names the field.
+        return (f"DerivedTranscript(characters={len(self.transcript.text)}, "
+                f"tidy_characters={len(self.tidy_text)}, "
+                f"matching_characters={len(self.matching_text)}, "
+                f"differs_from_raw={self.differs_from_raw}, "
+                f"language={self.transcript.language!r}, "
+                f"language_probability={self.transcript.language_probability!r}, "
+                f"stop_match={self.stop_match})")
+
+    __str__ = __repr__
+
+@dataclass(frozen=True)
 class VoiceFailure:
     """Why there is no transcript. `message` is safe to show and never contains what was said."""
     kind: str
@@ -112,6 +159,55 @@ class VoiceFailure:
 
     __str__ = __repr__  # so print()/f-strings/%s can't reach the message by an inherited route either
 
+
+@dataclass(frozen=True)
+class PendingCommand:
+    """One heard utterance waiting for the user to accept it as a command (Feature 6).
+
+    Three different things are deliberately kept apart here:
+
+        heard.transcript.text   what the recognizer emitted - raw provenance, never changed
+        heard.tidy_text/...     mechanical forms, for reading and matching
+        candidate               the EXACT text that will be handed to app.console.handle_command
+
+    `candidate` starts as the raw transcript text, not a tidied copy: the assistant must never show
+    one string, accept it, and then run a quietly normalized other one. A correction replaces the
+    candidate wholesale, and `corrections` counts how many times - the edits themselves are not kept,
+    because keeping them would mean keeping more copies of what was said."""
+    heard: DerivedTranscript
+    candidate: str
+    corrections: int = 0
+
+    def __post_init__(self):
+        if not isinstance(self.heard, DerivedTranscript):
+            raise TypeError(f"PendingCommand.heard must be a DerivedTranscript, got "
+                            f"{type(self.heard).__name__}")
+        if not isinstance(self.candidate, str):
+            raise TypeError(f"PendingCommand.candidate must be str, got "
+                            f"{type(self.candidate).__name__}")
+        if isinstance(self.corrections, bool) or not isinstance(self.corrections, int)                 or self.corrections < 0:
+            raise ValueError("PendingCommand.corrections must be a count")
+
+    @property
+    def changed(self) -> bool:
+        """True when the candidate is no longer exactly what the recognizer emitted."""
+        return self.candidate != self.heard.transcript.text
+
+    def corrected(self, candidate: str) -> "PendingCommand":
+        """The same utterance with a new candidate - a new object; nothing here is ever mutated."""
+        return PendingCommand(self.heard, candidate, self.corrections + 1)
+
+    def reconsidered(self, candidate: str) -> "PendingCommand":
+        """A mechanically proposed candidate the user chose. Not a correction, so the count stands."""
+        return PendingCommand(self.heard, candidate, self.corrections)
+
+    def __repr__(self) -> str:
+        # Every string in here is speech, including the candidate. None of them appears.
+        return (f"PendingCommand(heard_characters={len(self.heard.transcript.text)}, "
+                f"candidate_characters={len(self.candidate)}, corrections={self.corrections}, "
+                f"changed={self.changed}, language={self.heard.transcript.language!r})")
+
+    __str__ = __repr__
 
 @dataclass(frozen=True)
 class Recording:

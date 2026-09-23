@@ -21,8 +21,8 @@ from typing import NamedTuple
 
 from app.listener.models import (DEVICE_BUSY, DEVICE_LOST, FORMAT_UNSUPPORTED, LANGUAGE_UNSUPPORTED,
                                  MODEL_UNAVAILABLE, NO_DEVICE, NO_SPEECH, PERMISSION_DENIED,
-                                 SAMPLE_RATE, TRANSCRIPTION_FAILED, InputDevice, ListenerSettings,
-                                 VoiceFailure)
+                                 SAMPLE_RATE, TRANSCRIPTION_FAILED, DerivedTranscript, InputDevice,
+                                 ListenerSettings, Transcript, VoiceFailure)
 from config.settings import PROJECT_ROOT, SettingsError, get_setting
 
 LISTENER = "listener"
@@ -89,6 +89,138 @@ def is_silence(text: str) -> bool:
     """True when a transcript carries no words - silence or noise must never become a command."""
     return not any(character.isalnum() for character in tidy(text))
 
+
+# --- The derived layer above one transcript (Feature 5) ------------------------------------------
+# Raw provenance is Transcript.text and is never replaced. Everything here computes a SEPARATE value
+# from it, mechanically: whitespace, punctuation runs and case, exactly as tidy()/for_matching()
+# already did. Nothing here translates, transliterates, maps a synonym or guesses an intent -
+# "kholo" never becomes "open"; that is Phase 3 (the Brain).
+#
+# Deliberately NOT here: a general "command form" with speech-final punctuation removed. A verb-blind
+# rule cannot tell grammar noise from payload - the period in `type hello.` is what the user wants
+# typed, while the period in `close window.` is noise - so Feature 5 preserves the information
+# instead of deciding. See the measured evidence in FEATURE_6_PUNCTUATION below.
+
+STOP_PHRASE = "stop"          # fixed in code on purpose: a mistyped setting must not disable a stop
+_STOP_PUNCTUATION = ".!?,"    # ordinary speech-final marks, removed for THIS one comparison only
+
+
+def is_stop_phrase(text: str) -> bool:
+    """True when the WHOLE mechanically normalized utterance is the single English word "stop".
+
+    Accepts what speech recognition normally adds around it - outer spaces, case, one terminal
+    ".", "!", "?" or "," - and nothing else. "please stop", "stop please", "stop notepad",
+    "stopped", "don't stop" and every Urdu or Hindi equivalent are False. No substring search, no
+    fuzzy or phonetic matching, no edit distance.
+
+    This is a pure text answer and NEVER authority to stop anything on its own: the word can be here
+    because the user dictated it, because recognition erred, or because the recognizer was biased
+    towards it. Only the later StopGuard, inside its own tightly scoped listening window, may decide
+    that this boolean means the emergency stop. Nothing in the Listener triggers an action."""
+    return _stop_form(text) == STOP_PHRASE
+
+
+def _stop_form(text: str) -> str:
+    """for_matching() with terminal speech punctuation removed - for the stop comparison only. It is
+    deliberately private: turning it into a general command string is exactly the mistake described
+    above."""
+    return for_matching(text).rstrip(_STOP_PUNCTUATION).strip()
+
+
+def derive_transcript(transcript: Transcript) -> DerivedTranscript:
+    """The mechanical forms of one transcript, computed once, with the transcript kept beside them.
+
+    The Transcript itself is neither copied nor changed - the same object comes back inside the
+    result. No logging, no configuration, no I/O; this module has no logger at all."""
+    if not isinstance(transcript, Transcript):
+        raise TypeError(f"derive_transcript() takes a Transcript, got {type(transcript).__name__}")
+    raw = transcript.text
+    return DerivedTranscript(transcript=transcript, tidy_text=tidy(raw),
+                             matching_text=for_matching(raw), stop_match=is_stop_phrase(raw))
+
+
+# Language metadata is carried, not acted on. Transcript already holds `language` and
+# `language_probability`, and Phase 2 policy is to preserve both and decide nothing:
+#   - `auto` with a detected code: keep the code, take no automatic action on it;
+#   - no transcript is rejected here for the language that was detected (Feature 4 already refuses an
+#     unsupported CONFIGURED code before inference), and no second detector runs;
+#   - `language_probability` is diagnostic only. It is a LANGUAGE probability, never word confidence,
+#     and no threshold exists: the real acceptance runs produced correct transcripts at 0.506 and
+#     0.603, so any threshold worth the name would have refused good input;
+#   - None means "not measured" (an explicitly configured language), never "low";
+#   - code-switched speech is not pretended to be one language per word - one code describes the
+#     utterance the recognizer reported, and nothing here claims more.
+# There is no policy object, because there is no decision to represent.
+
+# What the Feature 4 acceptance and this audit MEASURED about speech-final punctuation, kept here so
+# Feature 6 starts from evidence instead of re-deriving it. Each line is app.executor.commands.parse()
+# run on a tidied transcript, in an audit - the Listener never calls the parser itself:
+#
+#     " Open Notepad."   -> open_app 'Notepad.'     the app name is corrupted
+#     " minimize."       -> unknown                 a clean refusal
+#     " close window."   -> close_app 'window.'     WRONG ACTION KIND, not a refusal
+#     " Scroll down 3."  -> scroll 'down 3.'        the target is corrupted
+#
+# The third line is the important one, and it is a correctness problem rather than a cosmetic one:
+# one period silently selects a DIFFERENT action (close an app named "window.") instead of the window
+# control the user asked for. Feature 6 must reconcile the accepted raw/tidy transcript with any
+# punctuation-normalized candidate using grammar and action context, without changing free-form
+# payloads such as the text after `type`; where two mechanical forms imply conflicting actions, it
+# must ask rather than execute.
+FEATURE_6_PUNCTUATION = ("Speech-final punctuation may prevent or alter deterministic grammar "
+                         "parsing. Feature 6 must reconcile the accepted raw/tidy transcript with "
+                         "any punctuation-normalized candidate using grammar/action context, "
+                         "without changing free-form payloads.")
+
+# --- Editing one pending command, without losing a single character (Feature 6) -------------------
+# The voice console shows the user a candidate command and must hand EXACTLY that string to
+# app.console.handle_command. So a correction may not rebuild the string: it replaces one token's
+# span and leaves every other character - runs of spaces, terminal punctuation, the payload after
+# `type` - exactly where it was. Tokens are non-whitespace runs, which works the same way for
+# English, Urdu, Hindi, Roman Urdu and mixed script, with no script-aware rules at all.
+
+_TOKEN = re.compile(r"\S+")
+TERMINAL_MARKS = ".!?,"   # the ordinary speech-final marks, for the ONE reconciliation candidate
+
+
+def token_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Where each token starts and ends in `text`, in order. Positions, not copies."""
+    if not isinstance(text, str):
+        raise TypeError(f"token_spans() takes str, got {type(text).__name__}")
+    return tuple((match.start(), match.end()) for match in _TOKEN.finditer(text))
+
+
+def tokens(text: str) -> tuple[str, ...]:
+    """The tokens themselves, for numbering them on screen. Punctuation stays attached to its word."""
+    return tuple(text[start:end] for start, end in token_spans(text))
+
+
+def replace_token(text: str, number: int, replacement: str) -> str:
+    """`text` with token `number` (1-based) replaced, and every character outside it untouched.
+
+    Deliberately not " ".join(...): rebuilding the line would quietly normalize the spacing the user
+    is about to accept."""
+    if not isinstance(replacement, str):
+        raise TypeError(f"replace_token() takes str, got {type(replacement).__name__}")
+    spans = token_spans(text)
+    if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= len(spans):
+        raise ValueError(f"there is no token {number!r} to replace")
+    start, end = spans[number - 1]
+    return text[:start] + replacement + text[end:]
+
+
+def without_terminal_punctuation(text: str) -> str:
+    """`text` with ONE trailing run of . ! ? , removed, plus the whitespace on either side of it.
+
+    The single mechanical alternative the voice console may PROPOSE when a spoken command ends in the
+    punctuation speech recognition adds ("close window." parses as an app named "window."). It is
+    never applied on its own, never applied to free-form payload, and changes nothing else - when
+    there is no trailing mark, the very same string comes back."""
+    if not isinstance(text, str):
+        raise TypeError(f"without_terminal_punctuation() takes str, got {type(text).__name__}")
+    trimmed = text.rstrip()
+    stripped = trimmed.rstrip(TERMINAL_MARKS)
+    return text if stripped == trimmed else stripped.rstrip()
 
 # --- Choosing which microphone `listener.input_device` means -------------------------------------
 # Pure on purpose: it is handed the device list and decides, so every matching rule below is
