@@ -285,17 +285,36 @@ COMPUTE_PREFERENCE = {CPU: ("int8", "float32"),
 # matters most: without it faster-whisper fetches a tokenizer from the internet, whatever
 # local_files_only says - so a folder missing it is refused BEFORE the model is ever constructed.
 REQUIRED_MODEL_FILES = ("config.json", "model.bin", "tokenizer.json")
-# Exactly one of these: ctranslate2's converter writes vocabulary.json, and its runtime also reads
-# the older vocabulary.txt, which the published Systran conversions use.
+# At least one of these: ctranslate2's converter writes vocabulary.json, and its runtime also reads
+# the older vocabulary.txt, which the published Systran conversions use. A snapshot carrying both is
+# fine - the loader picks the one it wants, and refusing it would reject a valid future model.
 VOCABULARY_FILES = ("vocabulary.json", "vocabulary.txt")
 OPTIONAL_MODEL_FILES = ("preprocessor_config.json",)  # faster-whisper checks it exists before reading
 
 # Why a model construction failed - a category, never the exception's text (which carries paths).
 LOAD_ERROR, OUT_OF_MEMORY, REJECTED_SETTINGS = "load_error", "out_of_memory", "rejected_settings"
-FALLBACK_CATEGORIES = frozenset({LOAD_ERROR, OUT_OF_MEMORY})  # resource failures, not bad settings
+CUDA_RUNTIME = "cuda_runtime"  # CUDA itself, or a CUDA runtime library, failed - not the model files
+# ONLY a cuda_runtime failure justifies trying the CPU afterwards. A model that cannot be read is not
+# a CUDA problem: a truncated model.bin passes the "exists and is not empty" check and then fails
+# construction with a plain "Unable to open file" - falling back would fail again for the same reason
+# and blame CUDA for it.
+FALLBACK_CATEGORIES = frozenset({CUDA_RUNTIME})
 CATEGORY_TEXT = {LOAD_ERROR: "the model or its runtime libraries couldn't be loaded",
                  OUT_OF_MEMORY: "there wasn't enough memory",
-                 REJECTED_SETTINGS: "the device rejected the settings"}
+                 REJECTED_SETTINGS: "the device rejected the settings",
+                 CUDA_RUNTIME: "CUDA or a CUDA runtime library failed"}
+
+# The only messages accepted as evidence that CUDA ITSELF failed. Every one of them is a message
+# template in the INSTALLED ctranslate2 4.8.2 binary, and the first was also seen on this machine
+# (asking for a CUDA device here raises "CUDA failed with error CUDA driver version is insufficient
+# for CUDA runtime version"). Nothing is matched from memory or expectation.
+#   "cuda failed with error"            - ctranslate2.dll, and observed on this machine
+#   "cublas failed with status"         - ctranslate2.dll
+#   "is not found or cannot be loaded"  - ctranslate2.dll, beside its cuBLAS/CUDA_PATH loader strings
+# Matching text is fragile: if ctranslate2 rewords these, nothing matches and the failure is treated
+# as a plain load error - which means NO fallback. That is the safe direction, on purpose.
+CUDA_FAILURE_PATTERNS = ("cuda failed with error", "cublas failed with status",
+                         "is not found or cannot be loaded")
 
 
 class LoadPlan(NamedTuple):
@@ -319,10 +338,8 @@ def missing_model_files(sizes) -> tuple[str, ...]:
     """Given {file name: size in bytes} for a model folder, what is missing or empty (sorted).
     Every required file must be there and non-empty, plus exactly one vocabulary file."""
     missing = [name for name in REQUIRED_MODEL_FILES if sizes.get(name, 0) <= 0]
-    vocabularies = [name for name in VOCABULARY_FILES if sizes.get(name, 0) > 0]
-    if len(vocabularies) != 1:
-        missing.append(" or ".join(VOCABULARY_FILES) if not vocabularies
-                       else "a single vocabulary file (found both)")
+    if not any(sizes.get(name, 0) > 0 for name in VOCABULARY_FILES):
+        missing.append(" or ".join(VOCABULARY_FILES))
     return tuple(missing)
 
 
@@ -355,9 +372,28 @@ def plan_model_load(device: str, compute_type: str, cpu_types, cuda_count: int,
     return LoadPlan(CPU, chosen) if chosen else Refusal(_compute_code(compute_type), CPU)
 
 
+def construction_failure(exception: BaseException, device: str) -> str:
+    """Why a WhisperModel construction failed, as a CATEGORY. The exception is examined here and goes
+    no further: only the category is ever shown or logged.
+
+    A CUDA construction is called a CUDA failure only when its message matches one of the templates
+    ctranslate2 really produces (CUDA_FAILURE_PATTERNS). Anything else - an unreadable model, a
+    filesystem error, an unfamiliar message - stays a plain load error, so it can never be blamed on
+    CUDA or "fixed" by falling back to the CPU. A MemoryError from the host is not a CUDA failure
+    either: loading on the CPU needs MORE host memory, not less."""
+    if isinstance(exception, ValueError):
+        return REJECTED_SETTINGS
+    if isinstance(exception, MemoryError):
+        return OUT_OF_MEMORY
+    text = str(exception).lower()
+    if device == CUDA and any(pattern in text for pattern in CUDA_FAILURE_PATTERNS):
+        return CUDA_RUNTIME
+    return LOAD_ERROR
+
+
 def may_fall_back(requested_device: str, plan: LoadPlan, category: str) -> bool:
-    """CUDA -> CPU only when the user said `auto`, CUDA was chosen from the evidence, and constructing
-    the model then failed for a resource reason. Never for `cuda`, never for rejected settings."""
+    """CUDA -> CPU only when the user said `auto`, CUDA was chosen from the evidence, and CUDA ITSELF
+    is what failed. Never for `cuda`, never for a model that cannot be read, never for bad settings."""
     return requested_device == AUTO and plan.device == CUDA and category in FALLBACK_CATEGORIES
 
 

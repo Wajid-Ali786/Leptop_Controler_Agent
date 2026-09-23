@@ -22,6 +22,12 @@ from app.listener import adapter, logic
 from app.listener.models import MODEL_UNAVAILABLE, ListenerSettings, ModelStatus, VoiceFailure
 
 SECRET_TEXT = "C:/Users/Someone/private/path/model.bin could not be opened"
+# The message texts below are NOT invented. Each is either observed on this machine during the
+# Feature 3 audit, or a message template found in the installed ctranslate2 4.8.2 binary.
+CUDA_DRIVER = "CUDA failed with error CUDA driver version is insufficient for CUDA runtime version"
+CUBLAS_STATUS = "cuBLAS failed with status CUBLAS_STATUS_NOT_INITIALIZED"
+CUBLAS_MISSING = "Library cublas64_12.dll is not found or cannot be loaded"
+UNREADABLE_MODEL = "Unable to open file 'model.bin' in model 'C:/Users/Someone/models/snapshot'"
 GOOD_FILES = {"config.json": b"{}", "model.bin": b"\x00" * 64, "tokenizer.json": b"{}",
               "vocabulary.txt": b"a\nb\n"}
 CPU_TYPES = frozenset({"float32", "int16", "int8", "int8_float32"})  # what this laptop reports
@@ -176,7 +182,6 @@ def test_a_missing_tokenizer_is_refused_before_the_model_is_ever_constructed(wor
     ({**GOOD_FILES, "model.bin": b""}, "model.bin"),                       # present but empty
     ({k: v for k, v in GOOD_FILES.items() if k != "config.json"}, "config.json"),
     ({k: v for k, v in GOOD_FILES.items() if k != "vocabulary.txt"}, "vocabulary.json or vocabulary.txt"),
-    ({**GOOD_FILES, "vocabulary.json": b"[]"}, "found both"),
 ])
 def test_an_incomplete_model_folder_is_refused(world, files, missing):
     cached(world, files=files)
@@ -184,11 +189,21 @@ def test_an_incomplete_model_folder_is_refused(world, files, missing):
     assert world.whisper.constructed == []
 
 
-@pytest.mark.parametrize("vocabulary", ["vocabulary.json", "vocabulary.txt"])
-def test_either_vocabulary_format_is_accepted_and_preprocessor_config_is_optional(world, vocabulary):
+@pytest.mark.parametrize("vocabularies", [
+    ["vocabulary.txt"], ["vocabulary.json"], ["vocabulary.json", "vocabulary.txt"],
+])
+def test_any_compatible_vocabulary_file_is_enough(world, vocabularies):
+    """One of them, or both - the loader picks the one it wants. preprocessor_config.json stays
+    optional, because the installed faster-whisper only reads it when it happens to be there."""
     files = {k: v for k, v in GOOD_FILES.items() if k != "vocabulary.txt"}
-    cached(world, files={**files, vocabulary: b"x"})
+    cached(world, files={**files, **{name: b"x" for name in vocabularies}})
     assert isinstance(adapter.ensure_model(listener(world.root)), ModelStatus)
+
+
+def test_no_vocabulary_file_at_all_is_incomplete(world):
+    cached(world, files={k: v for k, v in GOOD_FILES.items() if k != "vocabulary.txt"})
+    assert_unavailable(adapter.ensure_model(listener(world.root)), "vocabulary.json or vocabulary.txt")
+    assert world.whisper.constructed == []
 
 
 def test_a_settings_object_that_allows_downloads_is_refused_outright(world):
@@ -292,11 +307,11 @@ def test_auto_device_with_an_explicit_type_cuda_lacks_uses_the_cpu():
 # --- CUDA reported, CUDA load fails ---------------------------------------------------------------
 
 @pytest.mark.parametrize("error, category", [
-    (RuntimeError("Library cublas64_12.dll is not found or cannot be loaded"), logic.LOAD_ERROR),
-    (OSError("cudnn64_9.dll missing"), logic.LOAD_ERROR),
-    (MemoryError(), logic.OUT_OF_MEMORY),
+    (RuntimeError(CUDA_DRIVER), logic.CUDA_RUNTIME),     # observed on this machine
+    (RuntimeError(CUBLAS_STATUS), logic.CUDA_RUNTIME),   # template in the installed ctranslate2
+    (RuntimeError(CUBLAS_MISSING), logic.CUDA_RUNTIME),  # template in the installed ctranslate2
 ])
-def test_auto_falls_back_to_the_cpu_once_and_says_so(world, error, category, caplog):
+def test_auto_falls_back_to_the_cpu_once_when_cuda_itself_failed(world, error, category, caplog):
     cached(world)
     world.ct2 = FakeCT2(cuda_count=1, cuda=CUDA_TYPES)
     world.whisper.construct_errors["cuda"] = error
@@ -320,7 +335,7 @@ def test_no_fallback_when_cuda_rejects_the_settings(world):
 def test_explicit_cuda_never_falls_back(world):
     cached(world)
     world.ct2 = FakeCT2(cuda_count=1, cuda=CUDA_TYPES)
-    world.whisper.construct_errors["cuda"] = RuntimeError("cublas missing")
+    world.whisper.construct_errors["cuda"] = RuntimeError(CUDA_DRIVER)
     assert_unavailable(adapter.ensure_model(listener(world.root, device="cuda")), "on CUDA")
     assert [c["device"] for c in world.whisper.constructed] == ["cuda"]
 
@@ -338,7 +353,7 @@ def test_a_programming_error_during_construction_propagates_without_fallback(wor
 def test_the_fallback_failing_too_is_unavailable(world):
     cached(world)
     world.ct2 = FakeCT2(cuda_count=1, cuda=CUDA_TYPES)
-    world.whisper.construct_errors.update(cuda=RuntimeError("cublas"), cpu=MemoryError())
+    world.whisper.construct_errors.update(cuda=RuntimeError(CUBLAS_MISSING), cpu=MemoryError())
     assert_unavailable(adapter.ensure_model(listener(world.root)), "on CUDA", "nor afterwards on CPU")
     assert adapter._loaded is None
 
@@ -346,7 +361,7 @@ def test_the_fallback_failing_too_is_unavailable(world):
 def test_the_fallback_never_substitutes_an_explicit_compute_type(world):
     cached(world)
     world.ct2 = FakeCT2(cuda_count=1, cuda=CUDA_TYPES)
-    world.whisper.construct_errors["cuda"] = RuntimeError("cublas")
+    world.whisper.construct_errors["cuda"] = RuntimeError(CUBLAS_MISSING)
     result = adapter.ensure_model(listener(world.root, compute_type="float16"))
     assert_unavailable(result, "'float16' isn't supported on CPU")
     assert [c["device"] for c in world.whisper.constructed] == ["cuda"]
@@ -360,8 +375,9 @@ def test_an_incomplete_model_never_reaches_cuda_or_its_fallback(world):
 
 
 @pytest.mark.parametrize("requested, category, falls_back", [
-    ("auto", logic.LOAD_ERROR, True), ("auto", logic.OUT_OF_MEMORY, True),
-    ("auto", logic.REJECTED_SETTINGS, False), ("cuda", logic.LOAD_ERROR, False),
+    ("auto", logic.CUDA_RUNTIME, True), ("auto", logic.LOAD_ERROR, False),
+    ("auto", logic.OUT_OF_MEMORY, False), ("auto", logic.REJECTED_SETTINGS, False),
+    ("cuda", logic.CUDA_RUNTIME, False),
 ])
 def test_the_fallback_rule(requested, category, falls_back):
     assert logic.may_fall_back(requested, logic.LoadPlan("cuda", "float16"), category) is falls_back
@@ -594,3 +610,68 @@ def test_a_defect_during_a_download_propagates(world):
     world.whisper.download_error = TypeError("a defect in the download code")
     with pytest.raises(TypeError):
         adapter.fetch_model("small", str(world.root))
+
+
+# --- What counts as "CUDA itself failed" -------------------------------------------------------------
+# Every message below is either observed on this machine or a template in the installed ctranslate2
+# binary. None is invented: a classifier proved against a message the library never emits proves nothing.
+
+@pytest.mark.parametrize("message, source", [
+    (CUDA_DRIVER, "observed on this machine"),
+    (CUBLAS_STATUS, "template in the installed ctranslate2.dll"),
+    (CUBLAS_MISSING, "template in the installed ctranslate2.dll"),
+])
+def test_a_cuda_specific_failure_is_recognized(message, source):
+    assert logic.construction_failure(RuntimeError(message), "cuda") == logic.CUDA_RUNTIME, source
+
+
+@pytest.mark.parametrize("exception", [
+    RuntimeError(UNREADABLE_MODEL),                         # observed: a truncated or corrupt model.bin
+    RuntimeError("Invalid model format"),                   # a plain runtime error
+    OSError("[Errno 13] Permission denied"),                # a plain filesystem error
+    RuntimeError("GPU initialisation failed on device 0"),  # CUDA-looking, but no such template exists
+    RuntimeError("cuda failure"),                           # close to the real wording, but not it
+    MemoryError(),                                          # the HOST ran out of memory
+])
+def test_anything_not_provably_cuda_is_only_a_load_error(exception):
+    """If ctranslate2 ever rewords its CUDA messages nothing will match, and this conservative path is
+    what runs. A failure that cannot be proved to be CUDA's never justifies a CPU fallback."""
+    category = logic.construction_failure(exception, "cuda")
+    assert category != logic.CUDA_RUNTIME
+    assert logic.may_fall_back("auto", logic.LoadPlan("cuda", "float16"), category) is False
+
+
+def test_a_cuda_message_during_a_cpu_load_is_still_only_a_load_error():
+    assert logic.construction_failure(RuntimeError(CUDA_DRIVER), "cpu") == logic.LOAD_ERROR
+
+
+def test_an_unreadable_model_never_falls_back_to_the_cpu(world):
+    """A truncated model.bin passes the "exists and is not empty" check and then fails at construction.
+    Falling back would fail again for the same reason - and would blame CUDA for a broken file."""
+    cached(world)
+    world.ct2 = FakeCT2(cuda_count=1, cuda=CUDA_TYPES)
+    world.whisper.construct_errors["cuda"] = RuntimeError(UNREADABLE_MODEL)
+    result = adapter.ensure_model(listener(world.root))
+    assert_unavailable(result, "couldn't be loaded on CUDA", "runtime libraries couldn't be loaded")
+    assert [c["device"] for c in world.whisper.constructed] == ["cuda"], "no CPU attempt"
+    assert "CUDA or a CUDA runtime library failed" not in result.message, "CUDA is not blamed"
+
+
+@pytest.mark.parametrize("error", [RuntimeError("GPU initialisation failed on device 0"), MemoryError()])
+def test_an_unrecognized_or_host_failure_never_falls_back(world, error):
+    cached(world)
+    world.ct2 = FakeCT2(cuda_count=1, cuda=CUDA_TYPES)
+    world.whisper.construct_errors["cuda"] = error
+    assert_unavailable(adapter.ensure_model(listener(world.root)))
+    assert [c["device"] for c in world.whisper.constructed] == ["cuda"]
+
+
+def test_the_fallback_reason_is_a_safe_category_not_the_exception_text(world, caplog):
+    cached(world)
+    world.ct2 = FakeCT2(cuda_count=1, cuda=CUDA_TYPES)
+    world.whisper.construct_errors["cuda"] = RuntimeError(CUDA_DRIVER + " " + SECRET_TEXT)
+    with caplog.at_level(logging.DEBUG):
+        status = adapter.ensure_model(listener(world.root))
+    assert status.fallback_reason == "cuda_runtime" and status.fell_back_from == "cuda"
+    for shown in (repr(status), caplog.text):
+        assert "Someone" not in shown and "driver version" not in shown

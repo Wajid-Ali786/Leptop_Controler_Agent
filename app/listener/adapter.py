@@ -458,12 +458,8 @@ def _construct(whisper, directory: str, plan):
     try:
         return whisper.WhisperModel(directory, device=plan.device, compute_type=plan.compute_type,
                                     local_files_only=True), None
-    except MemoryError:
-        return None, logic.OUT_OF_MEMORY
-    except ValueError:
-        return None, logic.REJECTED_SETTINGS
-    except (RuntimeError, OSError):
-        return None, logic.LOAD_ERROR
+    except (RuntimeError, OSError, ValueError, MemoryError) as exc:
+        return None, logic.construction_failure(exc, plan.device)
 
 
 def _refused(refusal, settings: ListenerSettings, cpu_types, cuda_types) -> VoiceFailure:
