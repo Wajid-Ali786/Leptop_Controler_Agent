@@ -19,9 +19,10 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
-from app.listener.models import (DEVICE_BUSY, DEVICE_LOST, FORMAT_UNSUPPORTED, MODEL_UNAVAILABLE,
-                                 NO_DEVICE, PERMISSION_DENIED, SAMPLE_RATE, InputDevice,
-                                 ListenerSettings, VoiceFailure)
+from app.listener.models import (DEVICE_BUSY, DEVICE_LOST, FORMAT_UNSUPPORTED, LANGUAGE_UNSUPPORTED,
+                                 MODEL_UNAVAILABLE, NO_DEVICE, NO_SPEECH, PERMISSION_DENIED,
+                                 SAMPLE_RATE, TRANSCRIPTION_FAILED, InputDevice, ListenerSettings,
+                                 VoiceFailure)
 from config.settings import PROJECT_ROOT, SettingsError, get_setting
 
 LISTENER = "listener"
@@ -424,6 +425,8 @@ MODEL_MESSAGES = {
                         "during normal use. To download the speech model, run: {fetch}",
     "download_failed": "The '{size}' speech model couldn't be downloaded ({category}). Check the "
                        "internet connection and run {fetch} again - what already arrived is kept.",
+    "not_loaded": "The speech model isn't loaded any more, so that recording wasn't recognized. Try "
+                  "again; if it keeps happening, restart the assistant.",
 }
 
 
@@ -432,6 +435,76 @@ def model_unavailable(code: str, **values) -> VoiceFailure:
     chose ourselves - never exception text or paths."""
     return VoiceFailure(MODEL_UNAVAILABLE, MODEL_MESSAGES[code].format(fetch=FETCH_COMMAND, **values))
 
+
+# --- Turning what the recognizer emitted into a Transcript (Feature 4) ---------------------------
+# Pure policy for app/listener/adapter.transcribe(). The adapter runs the model and hands over what it
+# emitted; these functions decide what that means. Nothing here imports numpy or faster-whisper, and
+# no language list lives here - which languages exist is the loaded model's own evidence.
+
+NO_SPEECH_MESSAGE = ("Nothing was said, or the recording held only background noise, so there was "
+                     "nothing to act on. Try again, a little closer to the microphone.")
+TRANSCRIPTION_FAILED_MESSAGE = ("The speech model failed while turning that recording into text, so "
+                                "nothing was done with it. Try saying it again.")
+LANGUAGE_UNSUPPORTED_MESSAGE = ("listener.language is '{language}', which the speech model does not "
+                                "know, so nothing was recognized. Set it to 'auto', or to a language "
+                                "code the model supports (for example en, ur or hi).")
+
+
+def recognizer_language(settings: ListenerSettings) -> str | None:
+    """What to ask the recognizer for: None means 'detect it', which is what 'auto' means here."""
+    return None if settings.language == AUTO else settings.language
+
+
+def unsupported_language(language, supported) -> bool:
+    """True when an explicitly configured language is not one the loaded model knows.
+
+    `supported` is whatever the model itself reports, so this rule never carries a list of languages
+    that could drift from the installed library. With no evidence at all (an empty report) nothing is
+    refused here: inventing a refusal from no evidence would be a guess, and the model would raise on
+    its own anyway."""
+    return language is not None and bool(supported) and language not in set(supported)
+
+
+def detected_probability(requested, probability) -> float | None:
+    """How sure the recognizer was about the language - or None when it was never measured.
+
+    faster-whisper reports a probability of 1 whenever it was TOLD which language to use. That is a
+    placeholder, not confidence, so an explicitly configured language records None instead of a
+    number that would pretend the recognizer had agreed."""
+    if requested is not None or probability is None:
+        return None
+    return float(probability)
+
+
+def joined(texts) -> str:
+    """One utterance's segments, in the order the recognizer emitted them, joined EXACTLY.
+
+    No separator is added and nothing is stripped: faster-whisper's segment text carries its own
+    leading space, so adding or removing any would change what it said. Everything mechanical the
+    Listener may do to text (tidy, for_matching) builds a SEPARATE value from this one."""
+    return "".join(texts)
+
+
+def vad_parameters(settings: ListenerSettings) -> dict:
+    """What the recognizer's voice-activity filter is told: how much silence ends a speech chunk.
+
+    Only the one setting the project owns - Feature 4 adds no other recognizer tuning. This filter is
+    ASR preprocessing: it never stops the microphone and never decides when an utterance ended."""
+    return {"min_silence_duration_ms": settings.min_silence_ms}
+
+
+def no_speech() -> VoiceFailure:
+    return VoiceFailure(NO_SPEECH, NO_SPEECH_MESSAGE)
+
+
+def transcription_failed() -> VoiceFailure:
+    """Fixed wording. The exception behind it never reaches the user, the message or a log line: it
+    can carry file paths, and nothing in it would help."""
+    return VoiceFailure(TRANSCRIPTION_FAILED, TRANSCRIPTION_FAILED_MESSAGE)
+
+
+def language_unsupported(language: str) -> VoiceFailure:
+    return VoiceFailure(LANGUAGE_UNSUPPORTED, LANGUAGE_UNSUPPORTED_MESSAGE.format(language=language))
 
 # --- Validation helpers (the project's style: raise SettingsError naming the key) ----------------
 

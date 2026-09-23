@@ -42,8 +42,15 @@ The speech model (Feature 3)
     fetch_model() is the one function in the project allowed to download, and only
     scripts/fetch_voice_model.py may call it (a rule test enforces that).
 
+Transcription (Feature 4)
+    transcribe() turns ONE Recording into a Transcript with the model ensure_model() made ready: the
+    canonical PCM becomes the float32 array faster-whisper's own decoder would have produced, the
+    model runs offline, and what it emitted is returned unchanged. The real recognition is lazy - the
+    library returns a generator - so the one transcription lock is held across the call AND the whole
+    consumption of that generator. What was said never reaches a log line, here or anywhere.
+
 Pure decisions (which device a name means, the length limit, what a failure means, where the model
-runs) live in app/listener/logic.py, which must stay free of I/O and must not import this file.
+runs, what the recognizer's output means) live in app/listener/logic.py, which must stay free of I/O and must not import this file.
 """
 import dataclasses
 import logging
@@ -54,7 +61,8 @@ from pathlib import Path
 from app.listener import logic, microphone
 from app.listener.models import (BYTES_PER_FRAME, CANCELLED, CAPTURE_UNAVAILABLE, CHANNELS, DEVICE_BUSY,
                                  DEVICE_LOST, DTYPE, FORMAT_UNSUPPORTED, LIMIT, SAMPLE_RATE,
-                                 InputDevice, ListenerSettings, ModelStatus, Recording, VoiceFailure)
+                                 InputDevice, ListenerSettings, ModelStatus, Recording, Transcript,
+                                 VoiceFailure)
 
 log = logging.getLogger(__name__)
 
@@ -472,6 +480,143 @@ def _model_failed(code: str, **values) -> VoiceFailure:
     log.warning("Speech model unavailable (%s)", code)  # the code only: no paths, no exception text
     return logic.model_unavailable(code, **values)
 
+
+# --- Recording -> Transcript (Feature 4) -------------------------------------------------------------
+
+def _numpy():
+    """numpy, imported on first use - only to hand the recording's samples to the model as the array
+    faster-whisper's own decoder would have produced. Tests replace this function."""
+    import numpy
+    return numpy
+
+
+# One transcription at a time. The installed faster-whisper makes no thread-safety promise for a
+# shared WhisperModel, and the real work is LAZY: transcribe() returns a generator, and the model only
+# runs while that generator is consumed. So this lock is held across the call AND the whole
+# consumption, never released in between. It is never held while waiting for _model_lock.
+_transcribe_lock = threading.Lock()
+
+
+def transcribe(recording: Recording, settings: ListenerSettings) -> Transcript | VoiceFailure:
+    """Turn one Recording into a Transcript, offline, with the model ensure_model() makes ready.
+
+    Returns exactly what the recognizer emitted (see app.listener.models.Transcript), or a
+    VoiceFailure: the model's own failure unchanged when it couldn't be loaded, language_unsupported
+    when listener.language names a language the model doesn't know (refused before anything runs),
+    no_speech for an empty or wordless recording, transcription_failed when the model itself failed.
+    Our own defects are never relabelled - they propagate, after the lock is released.
+
+    Nothing is downloaded, nothing is written anywhere, and no log line here carries what was said."""
+    if recording.frames == 0:  # nothing was captured: an empty recording never loads a model
+        return _no_speech(recording)
+    ready = _ready_model(settings)
+    if isinstance(ready, VoiceFailure):
+        return ready
+    language = logic.recognizer_language(settings)
+    if logic.unsupported_language(language, _supported_languages(ready)):
+        return _language_refused(settings.language)
+    outcome = _run(ready, recording, language, settings)
+    if isinstance(outcome, VoiceFailure):
+        return outcome
+    texts, info, seconds = outcome
+    text = logic.joined(texts)
+    if logic.is_silence(text):  # a DERIVED judgement only - the Transcript keeps the raw text
+        return _no_speech(recording)
+    return _transcribed(Transcript(
+        text=text,
+        language=info.language or "",
+        language_probability=logic.detected_probability(language, info.language_probability),
+        audio_seconds=recording.seconds), len(texts), seconds)
+
+
+def _ready_model(settings: ListenerSettings):
+    """The loaded model itself, or the VoiceFailure that stopped it.
+
+    ensure_model() does any loading, and its lock is fully released before this returns - the
+    transcription lock is only ever taken afterwards, so the two can't wait on each other."""
+    status = ensure_model(settings)
+    if isinstance(status, VoiceFailure):
+        return status  # the model's own failure: a model that never loaded did not fail to transcribe
+    with _model_lock:
+        loaded = _loaded
+    if loaded is None:  # only reachable if forget_model() ran in between (tests and deliberate resets)
+        return _model_failed("not_loaded")
+    return loaded.model
+
+
+def _supported_languages(model):
+    """Which languages the loaded model says it knows - its own evidence, never a list of ours, which
+    could drift from the installed library."""
+    return tuple(getattr(model, "supported_languages", ()) or ())
+
+
+def _run(model, recording: Recording, language, settings: ListenerSettings):
+    """(segment texts, info, seconds), or a VoiceFailure: everything that uses the model, under the one
+    transcription lock. The lock covers the call AND the full consumption of its generator, because
+    that is where the recognizer actually runs."""
+    with _transcribe_lock:
+        audio = _samples(recording)  # our own code: a defect in it is a defect, and propagates
+        started = _clock()
+        try:
+            segments, info = model.transcribe(
+                audio, language=language, initial_prompt=settings.initial_prompt or None,
+                vad_filter=settings.vad_filter,
+                vad_parameters=logic.vad_parameters(settings) if settings.vad_filter else None)
+            texts = [segment.text for segment in segments]  # the recognizer runs HERE, not above
+        except Exception as exc:
+            if not _is_inference_trouble(exc):
+                raise  # our defect, or something nobody has seen: never disguised as a failed model
+            return _transcription_failed(exc)
+    return texts, info, _clock() - started
+
+
+def _is_inference_trouble(exc: Exception) -> bool:
+    """A failure the speech model itself can genuinely have. ctranslate2 raises RuntimeError and
+    ValueError, a model can run out of memory, and the bundled Silero voice-activity filter runs on
+    onnxruntime, whose exception classes derive straight from Exception rather than RuntimeError - so
+    they are recognized by where the class lives, the way fetch_model recognizes httpx. A TypeError,
+    an AttributeError or anything else is ours, and is left alone."""
+    return (isinstance(exc, (RuntimeError, ValueError, MemoryError, OSError))
+            or type(exc).__module__.split(".")[0] == "onnxruntime")
+
+
+def _samples(recording: Recording):
+    """The recording's PCM as the audio faster-whisper expects: a one-dimensional float32 array
+    between -1 and 1.
+
+    Exactly what the library's own decoder does to the samples it reads (faster_whisper/audio.py:
+    astype(float32) / 32768.0), so handing it an array instead of a file changes nothing about the
+    audio - and no file is ever involved. frombuffer does not copy and astype does, so the Recording's
+    bytes are only ever read."""
+    numpy = _numpy()
+    samples = numpy.frombuffer(recording.pcm, dtype="<i2")
+    return samples.astype(numpy.float32) / 32768.0
+
+
+def _transcribed(transcript: Transcript, segments: int, seconds: float) -> Transcript:
+    log.info("Transcribed %.2f s of audio in %.1f s: %d segment(s), %d characters, language %s",
+             transcript.audio_seconds, seconds, segments, len(transcript.text),
+             transcript.language or "undetected")  # metadata only - never a word of what was said
+    return transcript
+
+
+def _no_speech(recording: Recording) -> VoiceFailure:
+    log.info("Nothing to recognize: no speech in %.2f s of audio", recording.seconds)
+    return logic.no_speech()
+
+
+def _transcription_failed(exc: Exception) -> VoiceFailure:
+    log.warning("Speech transcription failed (%s)", type(exc).__name__)  # the type only, never its text
+    return logic.transcription_failed()
+
+
+def _language_refused(language: str) -> VoiceFailure:
+    log.warning("Speech transcription refused: listener.language %r is not one the model knows",
+                language)
+    return logic.language_unsupported(language)
+
+
+# --- Downloading the model (the fetch script only) ---------------------------------------------------
 
 def fetch_model(model_size: str, model_dir: str) -> str | VoiceFailure:
     """DOWNLOAD the speech model into the project cache - the ONLY code in the project allowed to.

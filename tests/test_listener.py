@@ -10,13 +10,14 @@ The architecture tests at the end are the important ones: they pin the boundary 
 could break it exists, in the same AST style as tests/test_executor_logic.py.
 """
 import ast
+import dataclasses
 
 import pytest
 
 from app.listener import logic, models
 from app.listener.models import (CAPTURE_UNAVAILABLE, DEVICE_BUSY, DEVICE_LOST, FORMAT_UNSUPPORTED,
-                                 MODEL_UNAVAILABLE, NO_DEVICE, NO_SPEECH, PERMISSION_DENIED,
-                                 TRANSCRIPTION_FAILED, Transcript, VoiceFailure)
+                                 LANGUAGE_UNSUPPORTED, MODEL_UNAVAILABLE, NO_DEVICE, NO_SPEECH,
+                                 PERMISSION_DENIED, TRANSCRIPTION_FAILED, Transcript, VoiceFailure)
 from config import settings
 from config.settings import SettingsError
 
@@ -205,7 +206,7 @@ def test_a_transcript_needs_text():
 
 @pytest.mark.parametrize("kind", [NO_DEVICE, PERMISSION_DENIED, DEVICE_BUSY, DEVICE_LOST,
                                   CAPTURE_UNAVAILABLE, FORMAT_UNSUPPORTED, NO_SPEECH,
-                                  MODEL_UNAVAILABLE, TRANSCRIPTION_FAILED])
+                                  MODEL_UNAVAILABLE, TRANSCRIPTION_FAILED, LANGUAGE_UNSUPPORTED])
 def test_every_failure_kind_can_be_built_and_carries_a_message(kind):
     failure = VoiceFailure(kind=kind, message="something to show the user")
     assert failure.kind in models.FAILURE_KINDS and failure.message
@@ -221,7 +222,99 @@ def test_the_failure_kinds_are_exactly_the_ones_the_project_has_agreed():
     assert models.FAILURE_KINDS == frozenset({
         "no_device", "permission_denied", "device_busy", "device_lost",
         "capture_unavailable", "format_unsupported", "no_speech", "model_unavailable",
-        "transcription_failed"})
+        "transcription_failed", "language_unsupported"})
+
+
+def test_a_refused_language_is_not_a_failed_transcription():
+    """listener.language naming a language the model doesn't know is refused BEFORE anything runs;
+    calling that a failed transcription would claim the model tried."""
+    assert LANGUAGE_UNSUPPORTED not in (TRANSCRIPTION_FAILED, NO_SPEECH, MODEL_UNAVAILABLE)
+
+
+def test_a_transcript_never_shows_what_was_said(capsys):
+    """repr and str reach logs, tracebacks and debuggers. What was said reaches none of them."""
+    heard = Transcript(text="open notepad phir type karo", language="ur", language_probability=0.97,
+                       audio_seconds=2.0)
+    for shown in (repr(heard), str(heard), f"{heard}", "%s" % (heard,)):
+        assert "notepad" not in shown and "karo" not in shown
+        assert "characters=27" in shown and "'ur'" in shown and "0.97" in shown
+    print(heard)
+    assert "notepad" not in capsys.readouterr().out
+    assert heard.text == "open notepad phir type karo", "the text is still there to be used"
+
+
+@pytest.mark.parametrize("probability", ["0.9", object()])
+def test_a_transcript_probability_is_a_number_or_nothing(probability):
+    with pytest.raises(TypeError):
+        Transcript(text="hi", language_probability=probability)
+
+
+def test_a_transcript_may_truthfully_have_no_probability():
+    heard = Transcript(text="hi", language="en", language_probability=None)
+    assert heard.language_probability is None
+
+
+REAL_NAME = "Microphone Array (Realtek(R) Audio)"
+DEVICE = models.InputDevice(index=3, name=REAL_NAME, host_api="MME", max_input_channels=2,
+                            default_samplerate=44100.0, is_default=True, is_default_host_api=True)
+
+
+def test_a_device_repr_describes_the_microphone_without_naming_it(capsys):
+    """The name is meant to be SHOWN in a device list; a repr is not that list - it lands in logs,
+    tracebacks and debuggers, where a driver name never belongs."""
+    for shown in (repr(DEVICE), str(DEVICE), f"{DEVICE}", "%s" % (DEVICE,)):
+        assert REAL_NAME not in shown and "Realtek" not in shown and "name=" not in shown
+        assert "index=3" in shown and "'MME'" in shown and "max_input_channels=2" in shown
+        assert "is_default=True" in shown and "is_default_host_api=True" in shown
+    print(DEVICE)
+    assert "Realtek" not in capsys.readouterr().out
+
+
+def test_a_devices_real_name_is_still_there_for_the_code_that_lists_it():
+    assert DEVICE.name == REAL_NAME
+    assert (DEVICE.index, DEVICE.host_api, DEVICE.max_input_channels) == (3, "MME", 2)
+    assert DEVICE.default_samplerate == 44100.0 and DEVICE.is_default is True
+
+
+def test_the_device_list_still_shows_names_where_it_is_meant_to():
+    """The user-facing messages that help you choose a microphone reach for .name explicitly (through
+    readable()), so the safe repr cannot silently turn a device list into a list of numbers."""
+    other = dataclasses.replace(DEVICE, index=4, name="USB Audio Device", is_default=False)
+    ambiguous = logic.choose_device("microphone", [DEVICE, dataclasses.replace(DEVICE, index=9)])
+    assert REAL_NAME in ambiguous.message and "[3]" in ambiguous.message and "[9]" in ambiguous.message
+    listed = logic._listed([DEVICE, other])
+    assert REAL_NAME in listed and "USB Audio Device" in listed
+    refused = logic.format_refusal(DEVICE, True, [DEVICE, other])
+    assert REAL_NAME in refused.message
+    assert logic.readable(DEVICE.name) == REAL_NAME
+
+
+def test_settings_repr_shows_configuration_without_prompt_terms_or_paths(capsys):
+    configured = models.ListenerSettings(
+        enabled=True, model_size="small", model_dir="C:/Users/Someone/Downloads/data/models",
+        local_files_only=True, device="auto", compute_type="auto", language="ur", sample_rate=16000,
+        input_device="Microphone Array (Realtek(R) Audio)", vad_filter=True, min_silence_ms=800,
+        max_utterance_seconds=15.0, initial_prompt_terms=("notepad", "calculator", "minimize"),
+        voice_stop_enabled=True)
+    for shown in (repr(configured), str(configured), f"{configured}", "%s" % (configured,)):
+        for forbidden in ("notepad", "calculator", "minimize", "Someone", "Realtek",
+                          "C:/Users", "initial_prompt_terms="):
+            assert forbidden not in shown, f"{forbidden!r} is in the repr"
+        assert "initial_prompt_term_count=3" in shown and "model_dir=<configured>" in shown
+        assert "input_device=<configured>" in shown
+        assert "model_size='small'" in shown and "language='ur'" in shown and "vad_filter=True" in shown
+        assert "min_silence_ms=800" in shown and "voice_stop_enabled=True" in shown
+    print(configured)
+    assert "notepad" not in capsys.readouterr().out
+
+
+def test_the_settings_fields_are_unchanged_and_still_usable():
+    configured = logic.listener_settings()
+    assert configured.initial_prompt_terms == ("notepad", "calculator", "minimize", "maximize",
+                                               "restore", "scroll", "refresh", "click", "type")
+    assert configured.initial_prompt == " ".join(configured.initial_prompt_terms)
+    assert configured.model_dir == "data/models" and configured.input_device == ""
+    assert repr(dataclasses.replace(configured, input_device="")).count("<default>") == 1
 
 
 def test_a_missing_backend_and_a_missing_microphone_are_different_kinds():
@@ -253,6 +346,7 @@ def _python_files():
     ("pyttsx3", "app/speaker/adapter.py"),
     ("ctranslate2", "app/listener/adapter.py"),
     ("huggingface_hub", "app/listener/adapter.py"),
+    ("numpy", "app/listener/adapter.py"),
 ])
 def test_only_the_owning_adapter_may_import_the_voice_libraries(library, allowed):
     root = settings.PROJECT_ROOT
@@ -348,6 +442,7 @@ def _functions_using(tree, predicate):
 
 @pytest.mark.parametrize("library, accessor", [
     ("sounddevice", "_audio"), ("faster_whisper", "_whisper"), ("ctranslate2", "_ct2"),
+    ("numpy", "_numpy"),
 ])
 def test_each_backend_is_imported_only_inside_its_one_lazy_place(library, accessor):
     """Importing the adapter must never need a backend (faster-whisper alone takes ~9 s to import):

@@ -31,6 +31,10 @@ CAPTURE_UNAVAILABLE = "capture_unavailable"  # the capture BACKEND itself is unu
 NO_SPEECH = "no_speech"                  # silence or noise only - never treated as a command
 MODEL_UNAVAILABLE = "model_unavailable"  # the speech model is missing, or couldn't be loaded
 TRANSCRIPTION_FAILED = "transcription_failed"  # the model ran and failed
+LANGUAGE_UNSUPPORTED = "language_unsupported"  # listener.language names a language the loaded
+                                         # model does not know. Refused BEFORE any recognition
+                                         # starts, so it is never confused with a model that ran
+                                         # and failed.
 
 FORMAT_UNSUPPORTED = "format_unsupported"  # the chosen microphone exists and the backend works, but
                                          # THAT device on THAT sound path refuses canonical mono 16 kHz
@@ -38,7 +42,7 @@ FORMAT_UNSUPPORTED = "format_unsupported"  # the chosen microphone exists and th
 
 FAILURE_KINDS = frozenset({NO_DEVICE, PERMISSION_DENIED, DEVICE_BUSY, DEVICE_LOST,
                            CAPTURE_UNAVAILABLE, FORMAT_UNSUPPORTED, NO_SPEECH, MODEL_UNAVAILABLE,
-                           TRANSCRIPTION_FAILED})
+                           TRANSCRIPTION_FAILED, LANGUAGE_UNSUPPORTED})
 
 # The only audio format a Recording ever holds (Feature 1 locked the rate; Task 2a showed the default
 # path accepts it). Raw little-endian signed 16-bit samples, one channel.
@@ -65,11 +69,27 @@ class Transcript:
     def __post_init__(self):
         if not isinstance(self.text, str):
             raise TypeError(f"Transcript.text must be str, got {type(self.text).__name__}")
+        probability = self.language_probability
+        if probability is not None and (isinstance(probability, bool)
+                                        or not isinstance(probability, (int, float))):
+            raise TypeError("Transcript.language_probability must be a number, or None when the "
+                            "recognizer did not measure one")
 
     @property
     def empty(self) -> bool:
         """True when the recognizer returned nothing usable (so it must never become a command)."""
         return not self.text.strip()
+
+    def __repr__(self) -> str:
+        # What was SAID is the most private thing this project holds. A repr lands in logs, tracebacks
+        # and debuggers - none of which should ever hold speech - so it describes the text by length
+        # only. Code that means to show or use what was said reaches for `.text` deliberately.
+        characters = len(self.text) if isinstance(self.text, str) else 0
+        return (f"Transcript(characters={characters}, language={self.language!r}, "
+                f"language_probability={self.language_probability!r}, "
+                f"audio_seconds={self.audio_seconds!r})")
+
+    __str__ = __repr__  # so print()/f-strings/%s can't reach the text by an inherited route either
 
 
 @dataclass(frozen=True)
@@ -191,6 +211,18 @@ class InputDevice:
     is_default: bool            # the backend's default input device
     is_default_host_api: bool   # this device is reached through the backend's default host API
 
+    def __repr__(self) -> str:
+        # The name is meant to be SHOWN - that is how the user finds out what to put in
+        # listener.input_device - but a repr lands in logs, tracebacks and debuggers, where a device
+        # name never belongs. So it is left out here, and code that displays a list reaches for
+        # `.name` (through logic.readable()) deliberately.
+        return (f"InputDevice(index={self.index}, host_api={self.host_api!r}, "
+                f"max_input_channels={self.max_input_channels}, "
+                f"default_samplerate={self.default_samplerate!r}, is_default={self.is_default!r}, "
+                f"is_default_host_api={self.is_default_host_api!r})")
+
+    __str__ = __repr__
+
 
 @dataclass(frozen=True)
 class ListenerSettings:
@@ -214,3 +246,20 @@ class ListenerSettings:
     def initial_prompt(self) -> str:
         """The recognizer hint built from the configured terms, or "" when there are none."""
         return " ".join(self.initial_prompt_terms)
+
+    def __repr__(self) -> str:
+        # Safe operational configuration only. The prompt terms are what the recognizer is told, and
+        # are never logged; model_dir and input_device can hold a real path (which carries the user's
+        # name) or a real device name, so both are described rather than printed. Every field is
+        # still there for code that needs it.
+        return (f"ListenerSettings(enabled={self.enabled!r}, model_size={self.model_size!r}, "
+                f"model_dir=<configured>, local_files_only={self.local_files_only!r}, "
+                f"device={self.device!r}, compute_type={self.compute_type!r}, "
+                f"language={self.language!r}, sample_rate={self.sample_rate!r}, "
+                f"input_device=<{'default' if self.input_device == '' else 'configured'}>, "
+                f"vad_filter={self.vad_filter!r}, min_silence_ms={self.min_silence_ms!r}, "
+                f"max_utterance_seconds={self.max_utterance_seconds!r}, "
+                f"initial_prompt_term_count={len(self.initial_prompt_terms)}, "
+                f"voice_stop_enabled={self.voice_stop_enabled!r})")
+
+    __str__ = __repr__

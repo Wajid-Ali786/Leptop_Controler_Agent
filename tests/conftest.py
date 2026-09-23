@@ -36,6 +36,7 @@ REAL_ELEVATED_OPT_IN = "RUN_ELEVATED_TEST"
 REAL_MICROPHONE_OPT_IN = "RUN_REAL_MICROPHONE_TEST"
 REAL_RECORDING_OPT_IN = "RUN_REAL_RECORDING_TEST"  # deliberately separate: probes never record
 REAL_MODEL_OPT_IN = "RUN_REAL_MODEL_TEST"
+REAL_TRANSCRIPTION_OPT_IN = "RUN_REAL_TRANSCRIPTION_TEST"  # records AND recognizes: its own switch
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -84,6 +85,13 @@ def pytest_configure(config):
         f"real_model: loads the speech model already in listener.model_dir (never downloads, no "
         f"microphone); skipped unless {REAL_MODEL_OPT_IN}=1",
     )
+    config.addinivalue_line(
+        "markers",
+        f"real_transcription: RECORDS a few seconds from the real microphone and recognizes it with the "
+        f"real speech model (nothing saved, nothing played back, nothing executed); skipped unless "
+        f"{REAL_TRANSCRIPTION_OPT_IN}=1. None of {REAL_MICROPHONE_OPT_IN}, {REAL_RECORDING_OPT_IN} or "
+        f"{REAL_MODEL_OPT_IN} enables it",
+    )
 
 
 OPT_IN_GATES = {
@@ -104,6 +112,9 @@ OPT_IN_GATES = {
     "real_model": (REAL_MODEL_OPT_IN,
                    f"Loads the real speech model from data/models (no download) - set {REAL_MODEL_OPT_IN}=1 "
                    f"to run"),
+    "real_transcription": (REAL_TRANSCRIPTION_OPT_IN,
+                           f"Records from your real microphone and recognizes it with the real model - "
+                           f"set {REAL_TRANSCRIPTION_OPT_IN}=1 to run"),
 }
 
 
