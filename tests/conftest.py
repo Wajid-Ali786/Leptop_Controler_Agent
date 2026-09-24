@@ -27,6 +27,7 @@ from app.brain import adapter, cost_controls
 from app.executor import logic as executor_logic
 from app.listener import adapter as listener_adapter
 from app.listener import microphone
+from app import voice_console
 from config import settings
 
 REAL_API_OPT_IN = "RUN_REAL_CLAUDE_TEST"
@@ -37,6 +38,7 @@ REAL_MICROPHONE_OPT_IN = "RUN_REAL_MICROPHONE_TEST"
 REAL_RECORDING_OPT_IN = "RUN_REAL_RECORDING_TEST"  # deliberately separate: probes never record
 REAL_MODEL_OPT_IN = "RUN_REAL_MODEL_TEST"
 REAL_TRANSCRIPTION_OPT_IN = "RUN_REAL_TRANSCRIPTION_TEST"  # records AND recognizes: its own switch
+REAL_VOICE_CONSOLE_OPT_IN = "RUN_REAL_VOICE_CONSOLE_TEST"  # records, recognizes AND acts: its own too
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -92,6 +94,12 @@ def pytest_configure(config):
         f"{REAL_TRANSCRIPTION_OPT_IN}=1. None of {REAL_MICROPHONE_OPT_IN}, {REAL_RECORDING_OPT_IN} or "
         f"{REAL_MODEL_OPT_IN} enables it",
     )
+    config.addinivalue_line(
+        "markers",
+        f"real_voice_console: the WHOLE spoken path on this computer - real microphone, real speech "
+        f"model, and a real action through the normal safe pipeline, accepted by you at the keyboard; "
+        f"skipped unless {REAL_VOICE_CONSOLE_OPT_IN}=1, which no other switch sets",
+    )
 
 
 OPT_IN_GATES = {
@@ -115,6 +123,9 @@ OPT_IN_GATES = {
     "real_transcription": (REAL_TRANSCRIPTION_OPT_IN,
                            f"Records from your real microphone and recognizes it with the real model - "
                            f"set {REAL_TRANSCRIPTION_OPT_IN}=1 to run"),
+    "real_voice_console": (REAL_VOICE_CONSOLE_OPT_IN,
+                           f"Records, recognizes AND runs a real command you accept by hand - set "
+                           f"{REAL_VOICE_CONSOLE_OPT_IN}=1 to run"),
 }
 
 
@@ -139,10 +150,12 @@ def isolated_logging(request, tmp_path, monkeypatch):
     executor_logic.forget_session_windows()
     microphone.reset()
     listener_adapter.forget_model()
+    voice_console.forget_worker()
     yield
     executor_logic.forget_session_windows()
     microphone.reset()
     listener_adapter.forget_model()
+    voice_console.forget_worker()
     logging_setup.reset_logging()
 
 

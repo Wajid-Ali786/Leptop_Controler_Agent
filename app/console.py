@@ -201,6 +201,12 @@ def typed_retry_offer(read=input, write=print):
     return _offer_retry(read, write)
 
 
+def hotkey_line() -> str:
+    """The emergency-stop line this console prints at startup, so another front end can print the
+    same one rather than reaching for the hotkey module itself."""
+    return _hotkey_line(hotkey.status())
+
+
 class FocusHandover:
     """Watches which window is in front. It NEVER activates a window or sends input: the user switches
     windows themselves, and the Executor's own checks decide what may happen in the window they chose."""

@@ -472,7 +472,10 @@ def test_the_voice_console_does_not_parse_or_act_by_itself():
                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                and isinstance(node.func.value, ast.Name)}
     assert reached & {"console.handle_command"}, "the one way anything runs"
-    assert not {name for name in reached if name.startswith("adapter.")}, reached
+    # The only adapter it may reach is the Listener's, and only for listening (D-6). Any Executor
+    # adapter is out of the question - the import rule above already forbids importing one.
+    assert {name for name in reached if name.startswith("adapter.")} <= {
+        "adapter.capture", "adapter.transcribe", "adapter.ensure_model"}, reached
 
 
 def test_preview_does_nothing_at_all(monkeypatch):

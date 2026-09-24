@@ -28,12 +28,195 @@ Privacy: what was said is shown to YOU on purpose - that is the whole point of t
 never logged. Log lines here carry counts and command kinds only.
 """
 import logging
+import threading
 
 from app import console
-from app.listener import logic
-from app.listener.models import PendingCommand, Transcript, VoiceFailure
+from app.listener import adapter, logic
+from app.listener.models import (DEVICE_BUSY, LANGUAGE_UNSUPPORTED, PendingCommand, Transcript,
+                                 VoiceFailure)
+from config.settings import SettingsError
 
 log = logging.getLogger(__name__)
+
+# --- Starting voice mode (Task 6b1) ---------------------------------------------------------------
+
+DISABLED = ("Voice input is switched off (listener.enabled is false in config/config.yaml), so "
+            "nothing was recorded and no speech model was loaded. Set it to true to use voice.")
+PREPARING = ("Preparing the speech model. The first load on a machine can take a while - nothing is "
+             "being recorded, and the microphone is not opened for this.")
+READY = "Speech model ready: {size} on {device} ({compute}), loaded in {seconds:.1f} s."
+REUSED = "Speech model ready: {size} on {device} ({compute})."
+LANGUAGE_ENDS = ("Every recording would fail the same way until listener.language is changed, so "
+                 "voice mode has ended rather than keep recording.")
+
+# --- One bounded recording -------------------------------------------------------------------------
+STARTED = "RECORDING STARTED"
+SPEAK_NOW = "Speak now. Press Enter when you are done."
+MAXIMUM = "Maximum recording time: {seconds:g} seconds."
+DONE_PROMPT = "(press Enter when you have finished speaking) "
+STOPPED = "RECORDING STOPPED"
+CAPPED = ("RECORDING STOPPED - the maximum of {seconds:g} seconds was reached and the microphone is "
+          "closed. Press Enter to continue.")
+ABANDONED = "Recording abandoned - nothing was recognized and nothing was run."
+LEAVING = "Recording abandoned; leaving voice mode."
+STUCK = ("The last recording did not finish cleanly, so the microphone may still be in use by this "
+         "assistant. Voice input is unavailable until you restart it; typed commands still work.")
+
+WORKER_NAME = "voice-capture"
+CLEANUP_SLACK_SECONDS = 1.0  # beyond the capture primitive's own bound, for process scheduling
+_worker = None               # the one capture worker this process may have running
+
+
+class LeaveVoiceMode(Exception):
+    """The user ended voice mode from inside a recording (end of input). Not an error."""
+
+
+class AttemptAbandoned(Exception):
+    """The user abandoned one spoken attempt (Ctrl+C). Whatever was recorded is thrown away."""
+
+
+def run_voice_mode(read=input, write=print, focus=None) -> int:
+    """Start voice mode: validate the settings, refuse if voice is off, make the model ready, and
+    only then take spoken commands. Returns an exit code.
+
+    This is what `python main.py --voice` runs, inside the same `hotkey.listening()` block the typed
+    console uses - so the physical emergency stop is registered before the model loads and stays
+    registered until voice mode ends."""
+    try:
+        settings = logic.listener_settings()
+    except SettingsError as exc:
+        write(str(exc))
+        return 1
+    if not settings.enabled:
+        write(DISABLED)
+        return 1
+    write(PREPARING)  # said before anything slow happens, and before any backend is imported
+    status = adapter.ensure_model(settings)
+    if isinstance(status, VoiceFailure):
+        write(status.message)
+        return 1
+    write(_ready_line(status))
+    write(console.hotkey_line())
+    return run_voice_console(_real_listen(settings, read, write), read=read, write=write, focus=focus)
+
+
+def _ready_line(status) -> str:
+    """What was actually loaded, on this machine, this time - never a promised duration."""
+    if status.load_seconds is None:
+        return REUSED.format(size=status.model_size, device=status.device,
+                             compute=status.compute_type)
+    return READY.format(size=status.model_size, device=status.device, compute=status.compute_type,
+                        seconds=status.load_seconds)
+
+
+def _real_listen(settings, read, write):
+    """The real `listen` seam: one bounded recording, then transcription. Nothing else.
+
+    It does not derive, accept, parse, authorize or execute - run_voice_console() owns all of that.
+    A Recording is handed to adapter.transcribe() even when it holds no frames at all: Feature 4
+    owns the one no_speech rule, and a second copy of it here could disagree with it."""
+    def listen():
+        recording = _record_once(settings, read, write)
+        if isinstance(recording, VoiceFailure):
+            return recording  # a capture failure is never transcribed
+        return adapter.transcribe(recording, settings)
+    return listen
+
+
+class _Recorder:
+    """One bounded capture, on its own non-daemon thread, so the terminal can wait for Enter.
+
+    The worker owns adapter.capture() and therefore the microphone: it acquires, opens, closes and
+    releases through the Feature 2 path, which is the only microphone ownership this project has."""
+
+    def __init__(self, settings, write):
+        self.settings = settings
+        self.write = write
+        self.cancel = threading.Event()
+        self.outcome = None      # Recording | VoiceFailure
+        self.error = None        # an unexpected exception from the capture primitive
+        self.capped = False      # it ended on its own: the maximum was reached
+        self.thread = threading.Thread(target=self._record, name=WORKER_NAME)  # never a daemon
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _record(self) -> None:
+        try:
+            self.outcome = adapter.capture(self.settings, cancel=self.cancel)
+        except BaseException as exc:  # re-raised on the caller's thread, after cleanup
+            self.error = exc
+        finally:
+            if not self.cancel.is_set():
+                # Nobody asked it to stop, so it reached its own maximum. The microphone is closed
+                # by now; only the terminal is still waiting for the user's Enter.
+                self.capped = True
+                self.write(CAPPED.format(
+                    seconds=logic.capture_limit(self.settings.max_utterance_seconds)))
+
+    def stop(self, deadline: float) -> bool:
+        """Ask it to end, wait, and say whether the thread REALLY finished. A join that timed out is
+        not cleanup: the microphone would still belong to a thread that is still using it."""
+        self.cancel.set()
+        self.thread.join(deadline)
+        return not self.thread.is_alive()
+
+    def __repr__(self) -> str:
+        return (f"_Recorder(finished={not self.thread.is_alive()}, capped={self.capped}, "
+                f"cancelled={self.cancel.is_set()}, outcome={type(self.outcome).__name__})")
+
+    __str__ = __repr__
+
+
+def _record_once(settings, read, write):
+    """One recording: a Recording, or a VoiceFailure. Raises AttemptAbandoned / LeaveVoiceMode."""
+    global _worker
+    if _worker is not None and _worker.thread.is_alive():
+        return _stuck()
+    limit = logic.capture_limit(settings.max_utterance_seconds)
+    # Said BEFORE the worker exists, so the microphone can never open before the user has been told.
+    write(STARTED)
+    write(SPEAK_NOW)
+    write(MAXIMUM.format(seconds=limit))
+    recorder = _Recorder(settings, write)
+    _worker = recorder
+    recorder.start()
+
+    abandoned = leaving = False
+    try:
+        read(DONE_PROMPT)
+    except KeyboardInterrupt:   # abandon this attempt, stay in voice mode
+        abandoned = True
+    except EOFError:            # abandon this attempt and leave voice mode
+        abandoned = leaving = True
+    finally:
+        ended = recorder.stop(limit + adapter.WATCHDOG_MARGIN_SECONDS + CLEANUP_SLACK_SECONDS)
+        if not recorder.capped:
+            write(STOPPED)
+    if not ended:
+        return _stuck()
+    _worker = None
+    if recorder.error is not None:
+        raise recorder.error  # our own defect, raised only now that the microphone is given back
+    if abandoned:
+        # The recording may already have finished at its maximum. The audio is thrown away either
+        # way, because the user said to abandon the attempt - a finished recording is not a reason
+        # to recognize something they asked not to.
+        write(LEAVING if leaving else ABANDONED)
+        raise LeaveVoiceMode() if leaving else AttemptAbandoned()
+    return recorder.outcome
+
+
+def _stuck() -> VoiceFailure:
+    """The capture thread outlived its cleanup window. Nothing may open the microphone after this."""
+    log.error("The voice capture worker did not finish; no further recording will be started")
+    return VoiceFailure(DEVICE_BUSY, STUCK)
+
+
+def forget_worker() -> None:
+    """Drop the record of the last capture worker. For the test suite's cleanup only."""
+    global _worker
+    _worker = None
 
 ACCEPT, CORRECT, REDICTATE, CANCEL = "accept", "correct", "redictate", "cancel"
 # Full words, plus one unique short key each. "c" is deliberately not a key: it would be ambiguous
@@ -83,16 +266,30 @@ def run_voice_console(listen, read=input, write=print, focus=None) -> int:
         if word != "listen":
             write(HELP)
             continue
-        _one_utterance(listen, read, write, focus, confirm, offer_retry)
+        try:
+            if not _one_utterance(listen, read, write, focus, confirm, offer_retry):
+                return 0
+        except LeaveVoiceMode:  # end of input while recording: abandon it and leave
+            return 0
 
 
-def _one_utterance(listen, read, write, focus, confirm, offer_retry) -> None:
-    """Listen, show, let the user accept/correct/redictate/cancel, and run at most one command."""
+def _one_utterance(listen, read, write, focus, confirm, offer_retry) -> bool:
+    """Listen, show, let the user accept/correct/redictate/cancel, and run at most one command.
+
+    True to carry on taking commands, False when voice mode should end."""
     while True:  # redictating comes back here; nothing from the old attempt survives it
-        heard = listen()
+        try:
+            heard = listen()
+        except AttemptAbandoned:  # Ctrl+C while recording: the message is already on screen
+            return True
         if isinstance(heard, VoiceFailure):
             write(heard.message)
-            return
+            if heard.kind == LANGUAGE_UNSUPPORTED:
+                # One settings object is bound for the whole session, so this would fail identically
+                # on every future recording. Ending beats recording under settings known to fail.
+                write(LANGUAGE_ENDS)
+                return False
+            return True
         if not isinstance(heard, Transcript):
             raise TypeError(f"listen() must return a Transcript or a VoiceFailure, got "
                             f"{type(heard).__name__}")
@@ -102,7 +299,7 @@ def _one_utterance(listen, read, write, focus, confirm, offer_retry) -> None:
             choice = _choice(read, write)
             if choice == CANCEL:
                 write(CANCELLED)
-                return
+                return True
             if choice == REDICTATE:
                 break  # the pending candidate is dropped here, and can never be run
             if choice == CORRECT:
@@ -111,11 +308,11 @@ def _one_utterance(listen, read, write, focus, confirm, offer_retry) -> None:
             decided, pending = _reconcile(pending, read, write)
             if decided == CANCEL:
                 write(CANCELLED)
-                return
+                return True
             if decided is None:  # stay pending: nothing runs, the user decides what to do next
                 continue
             _run(pending, write, focus, confirm, offer_retry)
-            return
+            return True
 
 
 # --- Showing the pending command ------------------------------------------------------------------
