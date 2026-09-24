@@ -39,6 +39,8 @@ REAL_RECORDING_OPT_IN = "RUN_REAL_RECORDING_TEST"  # deliberately separate: prob
 REAL_MODEL_OPT_IN = "RUN_REAL_MODEL_TEST"
 REAL_TRANSCRIPTION_OPT_IN = "RUN_REAL_TRANSCRIPTION_TEST"  # records AND recognizes: its own switch
 REAL_VOICE_CONSOLE_OPT_IN = "RUN_REAL_VOICE_CONSOLE_TEST"  # records, recognizes AND acts: its own too
+STOP_LATENCY_OPT_IN = "RUN_REAL_STOP_LATENCY_TEST"                    # real spoken "stop" trials
+STOP_SYNTHETIC_OPT_IN = "RUN_REAL_STOP_LATENCY_SYNTHETIC_TEST"        # model only, no microphone
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -100,6 +102,19 @@ def pytest_configure(config):
         f"model, and a real action through the normal safe pipeline, accepted by you at the keyboard; "
         f"skipped unless {REAL_VOICE_CONSOLE_OPT_IN}=1, which no other switch sets",
     )
+    config.addinivalue_line(
+        "markers",
+        f"real_stop_latency_synthetic: times the approved transcription path on one second of "
+        f"deterministic in-memory silence. Loads/reuses the local speech model, opens NO microphone "
+        f"and runs no command; skipped unless {STOP_SYNTHETIC_OPT_IN}=1, which nothing else sets - "
+        f"not {REAL_MODEL_OPT_IN} and not {STOP_LATENCY_OPT_IN}",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"real_stop_latency: RECORDS three short bounded clips of you saying \"stop\" and times how "
+        f"long recognition takes. Nothing is executed and the emergency stop is never triggered; "
+        f"skipped unless {STOP_LATENCY_OPT_IN}=1, which no other switch sets",
+    )
 
 
 OPT_IN_GATES = {
@@ -126,6 +141,12 @@ OPT_IN_GATES = {
     "real_voice_console": (REAL_VOICE_CONSOLE_OPT_IN,
                            f"Records, recognizes AND runs a real command you accept by hand - set "
                            f"{REAL_VOICE_CONSOLE_OPT_IN}=1 to run"),
+    "real_stop_latency_synthetic": (STOP_SYNTHETIC_OPT_IN,
+                                    f"Times the real model on synthetic silence (no microphone) - set "
+                                    f"{STOP_SYNTHETIC_OPT_IN}=1 to run"),
+    "real_stop_latency": (STOP_LATENCY_OPT_IN,
+                          f"Records you saying \"stop\" three times to measure detection latency - "
+                          f"set {STOP_LATENCY_OPT_IN}=1 to run"),
 }
 
 
