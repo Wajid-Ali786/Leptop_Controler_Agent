@@ -120,8 +120,15 @@ def test_the_synthetic_group_never_opens_a_microphone(monkeypatch):
                         lambda *args, **kwargs: pytest.fail("the synthetic group must not record"))
     recording = stop_latency.silence()
     assert recording.seconds == 1.0
-    assert "capture" not in open(stop_latency.__file__, encoding="utf-8").read().split(
-        "def measure_stop_trial")[0], "the synthetic path must not mention capture"
+    # Structural, not a substring search over prose: the two functions this group uses call no
+    # capture of any kind.
+    import ast
+    tree = ast.parse(open(stop_latency.__file__, encoding="utf-8").read())
+    used = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    for name in ("synthetic_measurements", "measure_transcription"):
+        called = {node.func.attr for node in ast.walk(used[name])
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        assert "capture" not in called, f"{name}() must not record"
 
 
 def test_the_measurement_excludes_the_model_preload():

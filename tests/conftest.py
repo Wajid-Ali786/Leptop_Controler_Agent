@@ -41,6 +41,7 @@ REAL_TRANSCRIPTION_OPT_IN = "RUN_REAL_TRANSCRIPTION_TEST"  # records AND recogni
 REAL_VOICE_CONSOLE_OPT_IN = "RUN_REAL_VOICE_CONSOLE_TEST"  # records, recognizes AND acts: its own too
 STOP_LATENCY_OPT_IN = "RUN_REAL_STOP_LATENCY_TEST"                    # real spoken "stop" trials
 STOP_SYNTHETIC_OPT_IN = "RUN_REAL_STOP_LATENCY_SYNTHETIC_TEST"        # model only, no microphone
+KWS_OPT_IN = "RUN_REAL_KWS_TEST"                                      # keyword-spotting prototype
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -115,6 +116,13 @@ def pytest_configure(config):
         f"long recognition takes. Nothing is executed and the emergency stop is never triggered; "
         f"skipped unless {STOP_LATENCY_OPT_IN}=1, which no other switch sets",
     )
+    config.addinivalue_line(
+        "markers",
+        f"real_kws_latency: STREAMS your microphone into the sherpa-onnx keyword-spotting PROTOTYPE to "
+        f"measure how quickly the single keyword is detected. Nothing is executed, no command is "
+        f"submitted and the emergency stop is never triggered; skipped unless {KWS_OPT_IN}=1, which no "
+        f"other switch sets",
+    )
 
 
 OPT_IN_GATES = {
@@ -147,6 +155,9 @@ OPT_IN_GATES = {
     "real_stop_latency": (STOP_LATENCY_OPT_IN,
                           f"Records you saying \"stop\" three times to measure detection latency - "
                           f"set {STOP_LATENCY_OPT_IN}=1 to run"),
+    "real_kws_latency": (KWS_OPT_IN,
+                         f"Streams your microphone into the keyword-spotting prototype - set "
+                         f"{KWS_OPT_IN}=1 to run"),
 }
 
 

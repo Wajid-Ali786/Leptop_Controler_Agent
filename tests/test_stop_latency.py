@@ -11,6 +11,7 @@ would look fine and mean something else.
 """
 import ast
 import dataclasses
+from pathlib import Path
 
 import pytest
 
@@ -350,6 +351,89 @@ def test_nothing_is_logged_by_the_harness(ears, caplog):
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert "Zarqonimbus" not in logged
     assert "logging" not in open(stop_latency.__file__, encoding="utf-8").read()
+
+
+# --- The encoder-pass instrumentation ------------------------------------------------------------------
+# It is the only thing that makes a floor number interpretable, and it touches the CACHED model, so it
+# must put that model back exactly as it found it - including when transcription raises.
+
+class FakeModel:
+    """A stand-in for the loaded WhisperModel. `encode` lives on the CLASS, so removing an instance
+    attribute really does restore the original, exactly as it would on the real object."""
+
+    def __init__(self):
+        self.encoded = 0
+
+    def encode(self, features):
+        self.encoded += 1
+        return f"encoded {features}"
+
+
+def loaded(monkeypatch, model):
+    monkeypatch.setattr(adapter, "_loaded", adapter._Loaded(("small",), model,
+                                                            ModelStatus("small", "cpu", "int8",
+                                                                        True, None)))
+    return model
+
+
+def test_the_counter_counts_encoder_passes_and_delegates(monkeypatch):
+    model = loaded(monkeypatch, FakeModel())
+    original = model.encode
+    with stop_latency.counted_encoder_passes() as counter:
+        assert model.encode("a") == "encoded a" and model.encode("b") == "encoded b"
+        assert counter.passes == 2
+    assert model.encoded == 2, "the real method really ran"
+    assert "encode" not in vars(model), "no instrumentation left on the object"
+    assert model.encode("c") == "encoded c" and model.encode.__func__ is original.__func__
+
+
+@pytest.mark.parametrize("outcome", [Transcript(" stop", language="en"),
+                                     VoiceFailure("no_speech", "nothing was said")])
+def test_the_instrumentation_is_removed_whatever_transcription_returns(monkeypatch, outcome):
+    model = loaded(monkeypatch, FakeModel())
+    monkeypatch.setattr(adapter, "transcribe", lambda recording, settings: outcome)
+    stop_latency.synthetic_measurements(SETTINGS, stop_latency.silence(),
+                                        passes=stop_latency.counted_encoder_passes)
+    assert "encode" not in vars(model), "nothing is left attached after any of the three cases"
+
+
+def test_the_instrumentation_is_removed_when_transcription_raises(monkeypatch):
+    """The case that matters most: a defect mid-measurement must not leave a wrapper on the cached
+    model for every later transcription in the process."""
+    model = loaded(monkeypatch, FakeModel())
+
+    def explode(recording, settings):
+        raise RuntimeError("something failed inside the recognizer")
+    monkeypatch.setattr(adapter, "transcribe", explode)
+    with pytest.raises(RuntimeError):
+        stop_latency.synthetic_measurements(SETTINGS, stop_latency.silence(),
+                                            passes=stop_latency.counted_encoder_passes)
+    assert "encode" not in vars(model), "the finally clause put the model back"
+    assert model.encode("a") == "encoded a", "and it still works"
+
+
+def test_the_counter_is_harmless_when_no_model_is_loaded(monkeypatch):
+    monkeypatch.setattr(adapter, "_loaded", None)
+    with stop_latency.counted_encoder_passes() as counter:
+        assert counter is None
+    measured = stop_latency.measure_transcription("probe", SETTINGS, stop_latency.silence(),
+                                                  clock=Clock(1.0, 2.0), counter=None)
+    assert measured.encoder_passes is None, "not zero - unknown"
+
+
+def test_the_installed_model_class_allows_this_instrumentation():
+    """If WhisperModel used __slots__, an instance attribute could not be set and this whole approach
+    would be invalid. Checked structurally, without loading a model."""
+    import ast
+    source = open(Path(adapter.__file__).parent.parent.parent / "venv" / "Lib" / "site-packages"
+                  / "faster_whisper" / "transcribe.py", encoding="utf-8").read()
+    tree = ast.parse(source)
+    whisper = [node for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name == "WhisperModel"][0]
+    assigned = {target.id for node in whisper.body if isinstance(node, ast.Assign)
+                for target in node.targets if isinstance(target, ast.Name)}
+    assert "__slots__" not in assigned, "instance attributes would be impossible"
+    assert any(isinstance(node, ast.FunctionDef) and node.name == "encode" for node in whisper.body)
 
 
 # --- Summaries ------------------------------------------------------------------------------------------
