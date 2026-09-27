@@ -17,6 +17,7 @@ import pytest
 import main
 from app import console, voice_console
 from app.listener import logic
+from app.speaker.models import SpeakerSettings
 from app.listener.models import (CAPTURE_UNAVAILABLE, DEVICE_BUSY, LANGUAGE_UNSUPPORTED, LIMIT,
                                  MODEL_UNAVAILABLE, NO_SPEECH, TRANSCRIPTION_FAILED,
                                  ListenerSettings, ModelStatus, Recording, Transcript, VoiceFailure)
@@ -116,6 +117,12 @@ def voice(monkeypatch):
     world.ran = []
 
     monkeypatch.setattr(logic, "listener_settings", lambda: world.settings)
+    # A deterministic speaker, never the real config file. This fixture used to leave the speaker
+    # alone, and when config/config.yaml turned speaker.enabled on, the tests below that ACCEPT a
+    # command went straight through voice_console._run into the real adapter - contacting Microsoft's
+    # speech service and playing audio out of the speaker during an ordinary pytest run. Silent by
+    # default; the speaker-specific tests further down override this on purpose.
+    monkeypatch.setattr(voice_console.speaker_logic, "speaker_settings", lambda: SILENT)
     monkeypatch.setattr(voice_console.adapter, "ensure_model", lambda settings: world.status)
     monkeypatch.setattr(voice_console.adapter, "capture", lambda *a, **k: world.mic(*a, **k))
 
@@ -130,6 +137,9 @@ def voice(monkeypatch):
     monkeypatch.setattr(console, "handle_command", handle_command)
     monkeypatch.setattr(console, "hotkey_line", lambda: "Emergency stop: pretend it is active.")
     return world
+
+
+SILENT = SpeakerSettings(enabled=False, engine="offline", voice="", rate=0)
 
 
 def start(voice, *answers):
@@ -615,3 +625,38 @@ def test_a_whole_spoken_session_speaks_each_reply_exactly_once(voice, monkeypatc
 
 def world_ran(voice) -> int:
     return len(voice.ran)
+
+
+# --- Regression: the leak that made the laptop speak during an ordinary test run -----------------------
+
+def test_the_voice_fixture_no_longer_reads_the_real_speaker_config(voice):
+    """The fixture must decide the speaker for itself. Reading config/config.yaml is what turned an
+    offline test into a real network TTS call the day speaker.enabled became true."""
+    assert voice_console.speaker_logic.speaker_settings() is SILENT, (
+        "the fixture decides the speaker, not config/config.yaml")
+    assert SILENT.enabled is False, "silent by default; the TTS tests below opt in deliberately"
+
+
+def test_the_original_leak_shape_is_now_stopped_before_it_reaches_hardware(voice, monkeypatch):
+    """The exact original shape: an ordinary test, an accepted command, and speaker settings that say
+    enabled/auto - which is what the real config says today. The conftest audio guard must stop it at
+    the import boundary, loudly, instead of letting it speak.
+
+    This fails if the fixture's speaker_settings patch is removed AND the guard is removed. With the
+    guard alone it fails loudly; with the patch alone it stays silent. Both are wanted."""
+    from tests.conftest import PhysicalAudioEscaped
+    monkeypatch.setattr(voice_console.speaker_logic, "speaker_settings",
+                        lambda: SpeakerSettings(enabled=True, engine="auto", voice="", rate=0))
+    with pytest.raises(PhysicalAudioEscaped, match="offline test attempted real speaker/network"):
+        speak(voice, "a")
+
+
+def test_no_synthesised_reply_file_survives_an_ordinary_voice_session(voice):
+    """Whatever happens in an ordinary session, no temporary MP3 may be left in the system temp folder.
+    Compared before and after: this folder is shared and the test owns only its own files."""
+    import tempfile
+    from pathlib import Path
+    pattern = "companion-reply-*.mp3"
+    before = set(Path(tempfile.gettempdir()).glob(pattern))
+    speak(voice, "a")
+    assert set(Path(tempfile.gettempdir()).glob(pattern)) - before == set()

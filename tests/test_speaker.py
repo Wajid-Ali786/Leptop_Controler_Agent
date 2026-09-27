@@ -722,12 +722,22 @@ def test_an_unexpected_failure_in_the_online_path_is_contained(online, voice):
     assert result.kind == SPEAKER_ERROR and local.inits == 0
 
 
-def test_the_online_failure_types_are_named_not_guessed():
-    """They come from the installed edge-tts and aiohttp, not from a bare except."""
-    named = {kind.__name__ for kind in adapter._online_failures()}
-    assert {"OSError", "TimeoutError", "EdgeTTSException", "ClientError"} <= named
-    assert "Exception" not in named and "BaseException" not in named
+def test_the_online_failure_types_are_looked_up_not_guessed(online):
+    """They are read from whatever `edge_tts.exceptions.EdgeTTSException` and `aiohttp.ClientError`
+    are bound to - not spelled out as strings and hoped for.
+
+    It runs with the FAKE edge_tts installed, which is what makes the point: the tuple contains the
+    fake's own exception class, so the code really does look the attribute up. Importing the real
+    library here would be pointless and is refused by the conftest audio guard anyway."""
+    module, mci = online()
+    found = adapter._online_failures()
+    assert module.exceptions.EdgeTTSException in found, "the lookup really goes through edge_tts"
+    import aiohttp
+    assert {OSError, TimeoutError, aiohttp.ClientError} <= set(found)
+    assert Exception not in found and BaseException not in found, "never a bare catch"
     assert issubclass(adapter.PlaybackError, OSError), "a playback failure is eligible as an OSError"
+    source = (settings.PROJECT_ROOT / "app/speaker/adapter.py").read_text(encoding="utf-8")
+    assert "edge_tts.exceptions.EdgeTTSException" in source and "aiohttp.ClientError" in source
 
 
 def test_no_text_reaches_the_log_on_any_online_path(online, voice, caplog):
