@@ -560,3 +560,58 @@ def test_no_stop_guard_exists_yet():
     source = open(voice_console.__file__, encoding="utf-8").read()
     assert "emergency_stop" not in source and "is_stop_phrase" not in source
     assert "trigger(" not in source
+
+
+# --- The session's speaker settings (Phase 2 TTS slice 2) ---------------------------------------------
+
+def test_voice_mode_builds_the_speaker_settings_once_and_hands_them_over(voice, monkeypatch):
+    """Built beside the listener's, once per session - not rebuilt for every reply."""
+    from app.speaker.models import SpeakerSettings
+    wanted = SpeakerSettings(enabled=True, engine="offline", voice="", rate=0)
+    builds = []
+
+    def speaker_settings():
+        builds.append(1)
+        return wanted
+    monkeypatch.setattr(voice_console.speaker_logic, "speaker_settings", speaker_settings)
+
+    handed = {}
+
+    def run_voice_console(listen, read=None, write=None, focus=None, speaker=None):
+        handed["speaker"] = speaker
+        return 0
+    monkeypatch.setattr(voice_console, "run_voice_console", run_voice_console)
+
+    assert voice_console.run_voice_mode(read=Keys("exit"), write=Screen()) == 0
+    assert handed["speaker"] is wanted, "the session's settings reach the loop"
+    assert len(builds) == 1, "exactly once per session"
+
+
+def test_an_invalid_speaker_section_stops_voice_mode_with_the_settings_message(voice, monkeypatch):
+    from config.settings import SettingsError
+    monkeypatch.setattr(voice_console.speaker_logic, "speaker_settings",
+                        lambda: (_ for _ in ()).throw(SettingsError("Setting 'speaker.rate' is wrong.")))
+    screen, _, code = start(voice, "exit")
+    assert code == 1 and "speaker.rate" in screen.text
+
+
+def test_a_whole_spoken_session_speaks_each_reply_exactly_once(voice, monkeypatch):
+    """End to end through run_voice_mode: two commands, two spoken replies, and never the transcript."""
+    from app.speaker.models import SpeakerSettings, Spoken
+    monkeypatch.setattr(voice_console.speaker_logic, "speaker_settings",
+                        lambda: SpeakerSettings(enabled=True, engine="offline", voice="", rate=0))
+    said = []
+
+    def speak(text, settings):
+        said.append(text)
+        return Spoken(engine="offline", seconds=0.1)
+    monkeypatch.setattr(voice_console.speaker_adapter, "speak", speak)
+
+    screen, _, code = start(voice, "listen", "", "a", "listen", "", "a", "exit")
+    assert code == 0 and world_ran(voice) == 2
+    assert said == ["pretend it ran", "pretend it ran"]
+    assert SPOKEN not in said, "the transcript is never spoken"
+
+
+def world_ran(voice) -> int:
+    return len(voice.ran)

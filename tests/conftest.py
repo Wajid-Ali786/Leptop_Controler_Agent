@@ -42,6 +42,14 @@ REAL_VOICE_CONSOLE_OPT_IN = "RUN_REAL_VOICE_CONSOLE_TEST"  # records, recognizes
 STOP_LATENCY_OPT_IN = "RUN_REAL_STOP_LATENCY_TEST"                    # real spoken "stop" trials
 STOP_SYNTHETIC_OPT_IN = "RUN_REAL_STOP_LATENCY_SYNTHETIC_TEST"        # model only, no microphone
 KWS_OPT_IN = "RUN_REAL_KWS_TEST"                                      # keyword-spotting prototype
+# Its own switch on purpose: the 6d1b baseline evidence was measured at one setting, and a comparison
+# run at two settings must not be able to masquerade as it.
+KWS_THRESHOLD_OPT_IN = "RUN_REAL_KWS_THRESHOLD_TEST"                  # threshold comparison (6d1c)
+# A different detector architecture, so a different switch: the sherpa runs are finished and their
+# evidence must keep meaning exactly what it meant.
+VOSK_STOP_OPT_IN = "RUN_REAL_VOSK_STOP_TEST"                          # Vosk constrained grammar (6d2a)
+VOSK_MODEL_OPT_IN = "RUN_REAL_VOSK_MODEL_TEST"   # loads the local Vosk model; opens NO microphone
+SPEAKER_OPT_IN = "RUN_REAL_SPEAKER_TEST"         # speaks one word ALOUD; opens NO microphone
 FAKE_KEY = "sk-ant-test-not-a-real-key-12345"
 START_TIME = datetime(2026, 9, 15, 12, 0, 0).timestamp()  # local noon, mid-month
 OK_BODY = {
@@ -123,6 +131,36 @@ def pytest_configure(config):
         f"submitted and the emergency stop is never triggered; skipped unless {KWS_OPT_IN}=1, which no "
         f"other switch sets",
     )
+    config.addinivalue_line(
+        "markers",
+        f"real_kws_threshold: STREAMS your microphone through the SAME keyword-spotting prototype twice, "
+        f"once at each of two keyword thresholds, to compare them - 30 trials in one sitting. It changes "
+        f"one detector setting and nothing else, executes nothing and never triggers the emergency stop; "
+        f"skipped unless {KWS_THRESHOLD_OPT_IN}=1, which no other switch sets - not {KWS_OPT_IN}",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"real_vosk_stop: STREAMS your microphone into the Vosk PROTOTYPE, whose entire vocabulary is "
+        f"\"stop\" and \"[unk]\", to see whether a final recognition of exactly \"stop\" is a cleaner "
+        f"standalone-word trigger than keyword spotting was. Recognition only: nothing is executed, no "
+        f"command is submitted, no transcript is kept and the emergency stop is never triggered; "
+        f"skipped unless {VOSK_STOP_OPT_IN}=1, which no other switch sets - not {KWS_OPT_IN} and not "
+        f"{KWS_THRESHOLD_OPT_IN}",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"real_vosk_model: loads the local Vosk model from data/models/vosk and feeds it in-memory "
+        f"silence with the network blocked. Opens NO microphone, records nothing and downloads "
+        f"nothing; skipped unless {VOSK_MODEL_OPT_IN}=1, which no other switch sets - and it does NOT "
+        f"enable the microphone benchmark {VOSK_STOP_OPT_IN}",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"real_speaker: SPEAKS ONE SHORT WORD ALOUD through this computer's built-in voice, to prove "
+        f"the offline speech engine works on real hardware. It opens no microphone, reaches no "
+        f"network, writes no audio and runs no command; skipped unless {SPEAKER_OPT_IN}=1, which no "
+        f"other switch sets",
+    )
 
 
 OPT_IN_GATES = {
@@ -158,6 +196,18 @@ OPT_IN_GATES = {
     "real_kws_latency": (KWS_OPT_IN,
                          f"Streams your microphone into the keyword-spotting prototype - set "
                          f"{KWS_OPT_IN}=1 to run"),
+    "real_kws_threshold": (KWS_THRESHOLD_OPT_IN,
+                           f"Compares two keyword thresholds over 30 spoken trials - set "
+                           f"{KWS_THRESHOLD_OPT_IN}=1 to run"),
+    "real_vosk_stop": (VOSK_STOP_OPT_IN,
+                       f"Streams your microphone into the Vosk constrained-grammar prototype - set "
+                       f"{VOSK_STOP_OPT_IN}=1 to run"),
+    "real_vosk_model": (VOSK_MODEL_OPT_IN,
+                        f"Loads the local Vosk model with the network blocked (no microphone) - set "
+                        f"{VOSK_MODEL_OPT_IN}=1 to run"),
+    "real_speaker": (SPEAKER_OPT_IN,
+                     f"Speaks one word aloud through this computer's built-in voice - set "
+                     f"{SPEAKER_OPT_IN}=1 to run"),
 }
 
 

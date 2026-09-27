@@ -412,11 +412,20 @@ def test_only_executor_adapter_controls_the_computer():
     assert offenders == [], f"Only app/executor/adapter.py may control the computer: {offenders}"
 
 
-def test_only_the_two_adapters_use_the_windows_api_through_ctypes():
-    """The Verifier adapter reads the desktop; the Executor adapter sends close requests."""
+def test_only_adapters_use_the_windows_api_through_ctypes():
+    """The Verifier adapter reads the desktop; the Executor adapter sends close requests; the Speaker
+    adapter plays the spoken reply through winmm (Phase 2 TTS: edge-tts returns MP3, and winsound is
+    WAV-only, so the alternative was another dependency).
+
+    The rule that matters is unchanged: only an adapter may reach the Windows API, and no logic.py
+    ever may. A fourth entry here should be argued for, not assumed."""
     root = settings.PROJECT_ROOT
-    allowed = {root / "app" / "verifier" / "adapter.py", root / "app" / "executor" / "adapter.py"}
+    allowed = {root / "app" / "verifier" / "adapter.py", root / "app" / "executor" / "adapter.py",
+               root / "app" / "speaker" / "adapter.py"}
     offenders = [f"{path.relative_to(root)}: {module}"
                  for path in (root / "app").rglob("*.py") if path not in allowed
                  for module, _ in _imports(path) if module.split(".")[0] == "ctypes"]
-    assert offenders == [], f"Only the verifier and executor adapters may use ctypes: {offenders}"
+    assert offenders == [], f"Only those three adapters may use ctypes: {offenders}"
+    for name in ("logic", "models"):
+        for path in (root / "app").rglob(f"{name}.py"):
+            assert "ctypes" not in {module.split(".")[0] for module, _ in _imports(path)}, path

@@ -40,6 +40,7 @@ from app import console, voice_console
 from app.executor import hotkey
 from app.executor.models import OPEN_APP, Outcome
 from app.listener import adapter, logic, microphone
+from app.speaker import adapter as speaker_adapter
 from app.listener.models import ModelStatus, VoiceFailure
 from config.settings import PROJECT_ROOT, SettingsError
 
@@ -101,6 +102,8 @@ class Evidence:
         self.hotkey_entered = False       # the real hotkey context was entered
         self.hotkey_active = None         # hotkey.status().active, read from INSIDE that context
         self.hotkey_left = False          # and left again
+        self.spoken = []                  # ALL speak() outcomes, in order: which voice said each
+                                          # reply, or why none did. Evidence column D.
 
     @property
     def opened_the_app(self):
@@ -118,6 +121,7 @@ def instrument(monkeypatch, clock=time.monotonic) -> Evidence:
     real_model, real_capture = adapter.ensure_model, adapter.capture
     real_transcribe, real_handle = adapter.transcribe, console.handle_command
     real_line, real_listening = voice_console.command_line, hotkey.listening
+    real_speak = speaker_adapter.speak
 
     def ensure_model(configured):
         status = real_model(configured)
@@ -144,6 +148,12 @@ def instrument(monkeypatch, clock=time.monotonic) -> Evidence:
         seen.displayed.append(candidate)   # the object itself, not a copy
         return real_line(candidate)
 
+    def speak(text, configured):
+        """Records WHICH voice spoke - never the text. Column D of the acceptance report."""
+        outcome = real_speak(text, configured)
+        seen.spoken.append(outcome)
+        return outcome
+
     def handle_command(text, **kwargs):
         handoff = Handoff(text)
         seen.handoffs.append(handoff)      # recorded BEFORE the call, so a raise can't lose the pair
@@ -168,6 +178,7 @@ def instrument(monkeypatch, clock=time.monotonic) -> Evidence:
     monkeypatch.setattr(adapter, "capture", capture)
     monkeypatch.setattr(adapter, "transcribe", transcribe)
     monkeypatch.setattr(voice_console, "command_line", command_line)
+    monkeypatch.setattr(speaker_adapter, "speak", speak)
     monkeypatch.setattr(console, "handle_command", handle_command)
     monkeypatch.setattr(main.hotkey, "listening", listening)
     return seen
@@ -252,6 +263,13 @@ def test_a_spoken_command_opens_notepad_through_the_normal_safe_pipeline(evidenc
     announce(f"recordings: {evidence.captures}, recognitions: {evidence.transcriptions}, "
              f"ensure_model calls: {evidence.ensure_model_calls}, "
              f"candidates shown: {len(evidence.displayed)}, accepted: {len(evidence.handoffs)}")
+    announce("")
+    announce("D. WHICH VOICE SPOKE EACH REPLY (categories only - never what was said):")
+    if evidence.spoken:
+        for number, outcome in enumerate(evidence.spoken, start=1):
+            announce(f"   reply {number}: {outcome!r}")
+    else:
+        announce("   nothing was spoken - speaker.enabled is false, or every attempt was cancelled")
 
     # The exact string shown is the exact string that ran - identity, not equality.
     assert any(candidate is opened.text for candidate in evidence.displayed), (

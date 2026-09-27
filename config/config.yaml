@@ -101,7 +101,7 @@ verifier:
 # local_files_only means a missing model fails with a clear message instead of reaching for the
 # network. Raw microphone audio is never written to disk, and transcripts are never logged.
 listener:
-  enabled: false                # Phase 2 is not built yet; voice input stays off until it is
+  enabled: false                # voice input is off by default; set true to use `python main.py --voice`
   model_size: small             # tiny, base, small, medium, large-v2, large-v3 (small is the
                                 # smallest that handles Urdu/Hindi acceptably)
   model_dir: data/models        # the project's own model cache (a Hugging Face cache folder, git-ignored)
@@ -130,14 +130,24 @@ listener:
   max_utterance_seconds: 15     # hard cap on one recording
   # Words the recognizer should expect, which measurably improves short command recognition.
   initial_prompt_terms: [notepad, calculator, minimize, maximize, restore, scroll, refresh, click, type]
-  voice_stop_enabled: true      # say "stop" while an action runs; the Ctrl+Alt+Backspace hotkey
-                                # stays the authoritative emergency stop (voice is slower)
+  voice_stop_enabled: false     # DEFERRED - spoken stop is NOT implemented. Ctrl+Alt+Backspace
+                                # remains the authoritative emergency stop (measured ~22 ms). Three
+                                # detectors were measured and none was good enough; nothing reads
+                                # this setting yet, so leaving it true would advertise a safety
+                                # feature that does not exist.
 
 # --- Speaker (app/speaker/) — Phase 2 voice output ---
 speaker:
-  enabled: false                # Phase 2 is not built yet
-  engine: auto                  # auto (online, falling back to offline), online (edge-tts) or
-                                # offline (pyttsx3, no network)
+  enabled: true                 # the assistant speaks its reply. Only `python main.py --voice`
+                                # reaches the speaker at all: the typed console (--console) and the
+                                # health check never call it, so this does not make typed mode talk.
+  engine: auto                  # auto (online, falling back to this computer's own voice), online
+                                # (edge-tts) or offline (pyttsx3).
+                                # PRIVACY: online - and auto while the online voice is working - SEND
+                                # THE REPLY TEXT to Microsoft's Edge speech service over the network.
+                                # That is the assistant's own reply only: never microphone audio,
+                                # never a transcript, never the command you spoke or any typed text.
+                                # offline sends nothing over the network at all.
   voice: ""                     # "" = the engine's default voice
   rate: 0                       # relative speed in percent, -50..+50: 0 = the engine's normal
                                 # speed, +20 about 20% faster, -20 about 20% slower. The same

@@ -16,6 +16,7 @@ import pytest
 from app import console, voice_console
 from app.listener import logic
 from app.listener.models import (NO_SPEECH, PendingCommand, Transcript, VoiceFailure)
+from config import settings
 
 URDU = "نوٹ پیڈ"
 MESSY = "  Open   Notepad and type hello.  "
@@ -495,3 +496,180 @@ def test_the_listener_package_still_knows_nothing_of_the_executor():
     for path in (settings.PROJECT_ROOT / "app" / "listener").rglob("*.py"):
         for module, name in _imports(ast.parse(path.read_text(encoding="utf-8"))):
             assert "executor" not in module and name != "emergency_stop", f"{path}: {module} {name}"
+
+
+# --- Speaking the reply (Phase 2 TTS slice 2) ---------------------------------------------------------
+# The speaker is the LAST thing that happens, after the parser, the typed safety confirmation, the
+# Executor and the Verifier. It can never change what the command did, and it never sees the
+# transcript, the accepted candidate or a typed payload - only the reply the console already printed.
+
+from app.speaker.models import SpeakerSettings, SpeechFailure, Spoken
+
+SPEAKING = SpeakerSettings(enabled=True, engine="offline", voice="", rate=0)
+
+
+class Mouth:
+    """Records every speak() call instead of making a sound."""
+
+    def __init__(self, result=None):
+        self.said = []
+        self.settings = []
+        self.result = result if result is not None else Spoken(engine="offline", seconds=0.1)
+
+    def __call__(self, text, settings):
+        self.said.append(text)
+        self.settings.append(settings)
+        return self.result
+
+
+@pytest.fixture
+def mouth(monkeypatch):
+    def install(result=None):
+        recorder = Mouth(result=result)
+        monkeypatch.setattr(voice_console.speaker_adapter, "speak", recorder)
+        return recorder
+    return install
+
+
+def spoken_run(heard, *answers, speaker=SPEAKING, focus=None):
+    """One session that has a speaker, the way run_voice_mode builds it."""
+    screen, script = Screen(), Script(*answers)
+    ear = heard if isinstance(heard, Ear) else Ear(heard)
+    code = voice_console.run_voice_console(ear, read=script, write=screen, focus=focus,
+                                          speaker=speaker)
+    return screen, script, ear, code
+
+
+def test_the_reply_is_spoken_after_the_command_has_run(ran, mouth):
+    recorder = mouth()
+    screen, _, _, code = spoken_run(say("open notepad"), "listen", "a", "exit")
+    assert ran, "the command still went through the normal pipeline"
+    assert recorder.said == ["pretend it ran"], "the reply message, once"
+    assert screen.lines.index("pretend it ran") < len(screen.lines), "and it was printed too"
+
+
+def test_only_the_reply_message_is_ever_spoken(ran, mouth):
+    """Never the transcript, never the accepted candidate, never a typed payload."""
+    recorder = mouth()
+    spoken_run(say("type hello world"), "listen", "a", "exit")
+    assert recorder.said == ["pretend it ran"]
+    for forbidden in ("type hello world", "hello world", "hello"):
+        assert forbidden not in recorder.said
+
+
+def test_the_transcript_never_reaches_the_speaker_even_after_a_correction(ran, mouth):
+    recorder = mouth()
+    spoken_run(say("open notepod"), "listen", "e", "2", "notepad", "a", "exit")
+    assert recorder.said == ["pretend it ran"], "one reply, and nothing about what was said"
+    assert all("notep" not in text for text in recorder.said)
+
+
+def test_a_session_without_a_speaker_stays_silent(ran, mouth):
+    recorder = mouth()
+    run(say("open notepad"), "listen", "a", "exit", ran=ran)      # no speaker= at all
+    assert recorder.said == [], "an injected session speaks only if it was given a speaker"
+
+
+def test_the_speaker_is_handed_the_session_settings_every_time(ran, mouth):
+    recorder = mouth()
+    spoken_run(Ear(say("open notepad"), say("open notepad")),
+               "listen", "a", "listen", "a", "exit")
+    assert len(recorder.settings) == 2
+    assert all(used is SPEAKING for used in recorder.settings), (
+        "the same settings object built once for the session, never rebuilt per reply")
+
+
+def test_a_speaker_failure_is_reported_and_changes_nothing_about_the_command(ran, mouth):
+    recorder = mouth(result=SpeechFailure("offline_unavailable", "The voice could not speak."))
+    screen, _, _, code = spoken_run(say("open notepad"), "listen", "a", "exit")
+    assert ran and len(ran) == 1, "the command ran once and was not retried"
+    assert "pretend it ran" in screen.lines, "the pipeline's own reply still stands"
+    assert "The voice could not speak." in screen.lines, "and the speaker's problem is mentioned"
+    assert screen.lines.index("pretend it ran") < screen.lines.index("The voice could not speak."), (
+        "the command outcome comes first; the speaker note is secondary")
+    assert code == 0
+
+
+def test_a_speaker_that_raises_cannot_happen_but_is_not_caught_here(ran, monkeypatch):
+    """The containment belongs to the speaker's own public boundary, which returns a value instead of
+    raising. This records the contract: the console does not add a second safety net."""
+    source = (settings.PROJECT_ROOT / "app/voice_console.py").read_text(encoding="utf-8")
+    speaking = source.split("def _speak(")[1]
+    assert "except" not in speaking, "the speaker boundary already contains its own failures"
+
+
+def test_nothing_is_spoken_after_the_emergency_stop(ran, mouth, monkeypatch):
+    """Someone who just hit Ctrl+Alt+Backspace wants quiet, not a spoken summary."""
+    recorder = mouth()
+
+    def stopped(text, confirm=None, offer_retry=None, focus=None):
+        ran.append(dict(text=text))
+        return console.CommandReply(console.Status.STOPPED, "Stopped. Nothing else was done.")
+
+    monkeypatch.setattr(console, "handle_command", stopped)
+    screen, _, _, _ = spoken_run(say("open notepad"), "listen", "a", "exit")
+    assert ran, "the command was still attempted"
+    assert "Stopped. Nothing else was done." in screen.lines, "and the outcome is still printed"
+    assert recorder.said == [], "but nothing was spoken"
+
+
+@pytest.mark.parametrize("status, message", [
+    (console.Status.REFUSED, "I don't know how to do that."),
+    (console.Status.DENIED, "Not confirmed, so nothing ran."),
+    (console.Status.NOT_HANDED_OVER, "Focus was not handed over."),
+])
+def test_every_other_outcome_is_spoken_including_the_failures(ran, mouth, monkeypatch, status,
+                                                              message):
+    """A failure reason is exactly what someone listening needs to hear."""
+    recorder = mouth()
+
+    def replied(text, confirm=None, offer_retry=None, focus=None):
+        ran.append(dict(text=text))
+        return console.CommandReply(status, message)
+
+    monkeypatch.setattr(console, "handle_command", replied)
+    spoken_run(say("open notepad"), "listen", "a", "exit")
+    assert recorder.said == [message]
+
+
+def test_speaking_happens_after_the_whole_pipeline_not_before_it():
+    """Structural: in _run, speak() comes after handle_command and after the reply is written."""
+    import ast
+    source = (settings.PROJECT_ROOT / "app/voice_console.py").read_text(encoding="utf-8")
+    body = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef) and node.name == "_run")
+    steps = [ast.unparse(statement) for statement in body.body]
+    handled = next(index for index, step in enumerate(steps) if "handle_command" in step)
+    written = next(index for index, step in enumerate(steps) if step.startswith("write(reply.message)"))
+    said = next(index for index, step in enumerate(steps) if step.startswith("_speak("))
+    assert handled < written < said, steps
+
+
+def test_the_typed_console_never_speaks(monkeypatch):
+    """`python main.py --console` must stay silent. Behavioural, not just an import check: the typed
+    console is driven end to end with the speaker replaced by something that fails the test if used."""
+    from app import console as typed
+
+    def must_not_speak(text, settings=None):
+        raise AssertionError("the typed console must never speak")
+
+    monkeypatch.setattr(voice_console.speaker_adapter, "speak", must_not_speak)
+    monkeypatch.setattr(typed, "handle_command",
+                        lambda text, **rest: typed.CommandReply(typed.Status.RAN, "pretend it ran"))
+    screen, script = Screen(), Script("open notepad", "exit")
+    assert typed.run_console(read=script, write=screen) == 0
+    assert "pretend it ran" in screen.lines, "the typed console still works"
+
+
+def test_the_typed_console_module_cannot_even_reach_the_speaker():
+    """Import-level backstop for the behavioural test above."""
+    import ast
+    source = (settings.PROJECT_ROOT / "app/console.py").read_text(encoding="utf-8")
+    imported = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert not any(name.startswith("app.speaker") for name in imported), imported
+    assert not any("voice_console" in name for name in imported), imported

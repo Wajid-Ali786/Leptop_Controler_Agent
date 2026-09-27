@@ -8,7 +8,9 @@ speaker.adapter and never edge-tts or pyttsx3. Speaking out loud happens in app/
 Only the settings layer exists so far - engine selection and the online -> offline fallback arrive
 with the implementation.
 """
-from app.speaker.models import SpeakerSettings
+from app.speaker.models import (BOTH_UNAVAILABLE, NOTHING_TO_SAY, OFFLINE, OFFLINE_UNAVAILABLE,
+                                ONLINE, ONLINE_UNAVAILABLE, SPEAKER_ERROR, SpeakerSettings,
+                                SpeechFailure)
 from config.settings import SettingsError, get_setting
 
 ENGINES = ("auto", "online", "offline")  # auto = online when reachable, otherwise offline
@@ -61,3 +63,85 @@ def _rate(name: str) -> int:
                             f"(slower) to {FASTEST_PERCENT} (faster), where 0 is the engine's normal "
                             f"speed, got {value!r}.")
     return value
+
+
+# --- Speaking decisions: pure, and deliberately small -------------------------------------------------
+# Nothing below imports pyttsx3, edge-tts, aiohttp, ctypes, tempfile, socket or any COM module. It
+# turns settings into plain numbers the adapter hands to whichever engine it is using, so no
+# engine-specific value ever reaches the rest of the application.
+
+# pyttsx3's own normal speed. Its `rate` property is words per minute, and the sapi5 driver starts at
+# exactly this value - so speaker.rate = 0 means "leave the engine at its normal speed" on both
+# engines, which is what the setting promises.
+BASE_WORDS_PER_MINUTE = 200
+
+
+def offline_words_per_minute(percent: int) -> int:
+    """speaker.rate as words per minute for the local voice: -50 -> 100, 0 -> 200, +50 -> 300.
+
+    Exact for whole percentages, because 200 * percent / 100 is 2 * percent."""
+    return round(BASE_WORDS_PER_MINUTE * (1 + percent / 100))
+
+
+def is_blank(text) -> bool:
+    """Nothing to say. Checked before any engine is touched, so blank text never reaches one."""
+    return not isinstance(text, str) or not text.strip()
+
+
+def nothing_to_say() -> SpeechFailure:
+    return SpeechFailure(NOTHING_TO_SAY, "There was nothing to say.")
+
+
+def offline_unavailable() -> SpeechFailure:
+    return SpeechFailure(OFFLINE_UNAVAILABLE,
+                         "This computer's built-in voice could not speak. Nothing else was affected.")
+
+
+def speaker_error() -> SpeechFailure:
+    return SpeechFailure(SPEAKER_ERROR,
+                         "The assistant could not speak that. Nothing else was affected.")
+
+
+def engine_order(settings: SpeakerSettings) -> tuple:
+    """Which voices to try, in order. The whole engine policy lives here, and it is pure.
+
+    ()                      speaking is switched off
+    ("online",)             engine: online  - the online voice or nothing; never a silent fallback
+    ("offline",)            engine: offline - the local voice only; the network is never touched
+    ("online", "offline")   engine: auto    - the online voice, and the local one if it cannot speak
+    """
+    if not settings.enabled:
+        return ()
+    if settings.engine == ONLINE:
+        return (ONLINE,)
+    if settings.engine == OFFLINE:
+        return (OFFLINE,)
+    return (ONLINE, OFFLINE)          # "auto": the only remaining validated value
+
+
+def online_rate(percent: int) -> str:
+    """speaker.rate as the percentage string edge-tts wants: -50 -> "-50%", 0 -> "+0%", +50 -> "+50%".
+
+    The sign is always written out, because edge-tts validates the format rather than the number."""
+    return f"{percent:+d}%"
+
+
+def online_unavailable() -> SpeechFailure:
+    return SpeechFailure(ONLINE_UNAVAILABLE,
+                         "The online voice could not speak. Nothing else was affected.")
+
+
+def both_unavailable() -> SpeechFailure:
+    return SpeechFailure(BOTH_UNAVAILABLE,
+                         "Neither the online voice nor this computer's built-in one could speak. "
+                         "Nothing else was affected.")
+
+
+def unavailable(tried) -> SpeechFailure:
+    """The right "it could not speak" answer for the voices that were actually tried."""
+    attempted = tuple(tried)
+    if attempted == (ONLINE, OFFLINE):
+        return both_unavailable()
+    if attempted == (ONLINE,):
+        return online_unavailable()
+    return offline_unavailable()

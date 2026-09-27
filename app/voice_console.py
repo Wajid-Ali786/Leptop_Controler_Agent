@@ -34,6 +34,9 @@ from app import console
 from app.listener import adapter, logic
 from app.listener.models import (DEVICE_BUSY, LANGUAGE_UNSUPPORTED, PendingCommand, Transcript,
                                  VoiceFailure)
+from app.speaker import adapter as speaker_adapter
+from app.speaker import logic as speaker_logic
+from app.speaker.models import SpeechFailure
 from config.settings import SettingsError
 
 log = logging.getLogger(__name__)
@@ -84,6 +87,7 @@ def run_voice_mode(read=input, write=print, focus=None) -> int:
     registered until voice mode ends."""
     try:
         settings = logic.listener_settings()
+        speaker = speaker_logic.speaker_settings()   # once per session, never per reply
     except SettingsError as exc:
         write(str(exc))
         return 1
@@ -97,7 +101,8 @@ def run_voice_mode(read=input, write=print, focus=None) -> int:
         return 1
     write(_ready_line(status))
     write(console.hotkey_line())
-    return run_voice_console(_real_listen(settings, read, write), read=read, write=write, focus=focus)
+    return run_voice_console(_real_listen(settings, read, write), read=read, write=write, focus=focus,
+                             speaker=speaker)
 
 
 def _ready_line(status) -> str:
@@ -243,12 +248,15 @@ AMBIGUOUS = ("Those two readings would do different things, so nothing was run. 
              "you meant (or cancel) - I won't choose for you.")
 
 
-def run_voice_console(listen, read=input, write=print, focus=None) -> int:
+def run_voice_console(listen, read=input, write=print, focus=None, speaker=None) -> int:
     """Take spoken commands one at a time until the user leaves. Returns an exit code.
 
     `listen` is the one injected seam: it returns a Transcript or a VoiceFailure for ONE bounded
     utterance, and owns the microphone, the model and the recording notices. Keeping it out of here
-    is what makes this whole loop testable with no microphone and no speech model."""
+    is what makes this whole loop testable with no microphone and no speech model.
+
+    `speaker` is the session's SpeakerSettings, built once by run_voice_mode. None means say nothing,
+    which is what an injected test session does."""
     write(WELCOME)
     confirm = console.typed_confirmation(read, write)
     offer_retry = console.typed_retry_offer(read, write)
@@ -267,13 +275,13 @@ def run_voice_console(listen, read=input, write=print, focus=None) -> int:
             write(HELP)
             continue
         try:
-            if not _one_utterance(listen, read, write, focus, confirm, offer_retry):
+            if not _one_utterance(listen, read, write, focus, confirm, offer_retry, speaker):
                 return 0
         except LeaveVoiceMode:  # end of input while recording: abandon it and leave
             return 0
 
 
-def _one_utterance(listen, read, write, focus, confirm, offer_retry) -> bool:
+def _one_utterance(listen, read, write, focus, confirm, offer_retry, speaker=None) -> bool:
     """Listen, show, let the user accept/correct/redictate/cancel, and run at most one command.
 
     True to carry on taking commands, False when voice mode should end."""
@@ -311,7 +319,7 @@ def _one_utterance(listen, read, write, focus, confirm, offer_retry) -> bool:
                 return True
             if decided is None:  # stay pending: nothing runs, the user decides what to do next
                 continue
-            _run(pending, write, focus, confirm, offer_retry)
+            _run(pending, write, focus, confirm, offer_retry, speaker)
             return True
 
 
@@ -438,7 +446,7 @@ def _reading(preview) -> str:
 
 # --- Handing it over, unchanged --------------------------------------------------------------------
 
-def _run(pending: PendingCommand, write, focus, confirm, offer_retry) -> None:
+def _run(pending: PendingCommand, write, focus, confirm, offer_retry, speaker=None) -> None:
     """The accepted candidate, byte for byte, into the same pipeline a typed command uses.
 
     `confirm` is the console's own KEYBOARD confirmation: a Medium-or-above action still asks the
@@ -447,3 +455,22 @@ def _run(pending: PendingCommand, write, focus, confirm, offer_retry) -> None:
     reply = console.handle_command(pending.candidate, confirm=confirm, offer_retry=offer_retry,
                                    focus=focus)
     write(reply.message)
+    _speak(reply, speaker, write)
+
+
+def _speak(reply, speaker, write) -> None:
+    """Say the reply that was just printed - the SAME safe message, and never the transcript or the
+    accepted command.
+
+    This runs only after the parser, the typed safety confirmation, the Executor and the Verifier have
+    all finished, so the command's outcome already exists and is authoritative. Nothing here may
+    change it: a speaker failure is one extra line of output and nothing else - no status change, no
+    retry, no second run.
+
+    Silent after the authoritative emergency stop: someone who just hit Ctrl+Alt+Backspace wants
+    quiet, not a spoken summary."""
+    if speaker is None or reply.status is console.Status.STOPPED:
+        return
+    outcome = speaker_adapter.speak(reply.message, speaker)
+    if isinstance(outcome, SpeechFailure):
+        write(outcome.message)
