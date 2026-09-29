@@ -59,7 +59,7 @@ git log, git show) are fine. Stage files (git add) only when the owner explicitl
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 2 — Voice. NEXT (not started).
+Current phase: 3 — Brain + Planner. DESIGN/AUDIT only; not started.
 Phase 0 — Foundation: COMPLETE (Done-when checklist passed 2026-09-16; tagged v0.1).
 Phase 1 — Basic Computer Control: COMPLETE (Done-when verified 2026-09-20).
   Verified by TWO runs of scripts/phase1_checklist.py, because the real-desktop and
@@ -67,4 +67,9 @@ Phase 1 — Basic Computer Control: COMPLETE (Done-when verified 2026-09-20).
     python scripts/phase1_checklist.py --real-desktop     # elevated Notepad MINIMIZED
     python scripts/phase1_checklist.py --real-elevated    # elevated Notepad IN FRONT
   Each exits 2 because the other real group isn't selected; that is expected, not a failure.
+Phase 2 — Voice: COMPLETE (Done-when verified 2026-09-29). Evidence, and the four limitations it
+  carries, are in /docs/phase2-closeout.md — read that before starting Phase 3. In short: spoken
+  emergency stop is NOT implemented (Ctrl+Alt+Backspace stays authoritative), TYPE_TEXT from voice
+  mode targets the console window, and Roman Urdu speech can come back in Devanagari or Urdu script,
+  so the Brain will need three scripts rather than one.
 Model selection is still PENDING - deferred to Phase 3 (see brain.model in config/config.yaml).

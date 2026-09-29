@@ -25,9 +25,33 @@ You do all the typing: `listen`, the Enter that ends the recording, the acceptan
 and any safety confirmation. The test never answers for you, because the manual gate is the thing
 being accepted.
 
-Privacy: no audio file, no playback, no PCM anywhere, and neither the transcript nor the accepted
-command is written to the log. Both appear on your screen on purpose - reading and accepting them is
-the point - and the test keeps the accepted string only in memory, to compare it.
+Privacy, and what it does and does not claim:
+  * Microphone PCM is never written to disk, and no audio file is created anywhere.
+  * Neither the transcript nor the accepted command is written to the log. Both appear on your SCREEN
+    on purpose - reading and accepting them is the point - and the accepted string is kept only in
+    memory, to compare it.
+  * TTS PLAYBACK IS EXPECTED. With speaker.enabled true, each reply is spoken aloud; that is part of
+    what this session accepts. The old "nothing is played back" claim was true only before the
+    speaker existed.
+
+Two PRODUCTION limitations this acceptance measured, recorded here so they cannot be lost before the
+Step 4 closeout is written (both are limitations of the app, not of this harness):
+
+  1. TYPE_TEXT from voice mode always targets the console window you are driving. app/console.py sets
+     `hands_over = focus is not None and needs_handover(action.kind)`, and run_voice_console/
+     run_voice_mode never pass a focus object - main.py calls run_voice_mode() with none. Only
+     run_console (typed mode, --console) builds a FocusHandover and prompts you to switch windows. So
+     in voice mode the active window at preparation time IS the target, the safety gate names it
+     truthfully ("type N characters into window 'Windows PowerShell'"), and there is no moment in a
+     voice session when another window could be focused. docs/step4 line 185 already places the fix in
+     the Phase 2/9 command window. DO NOT say `type ...` during this acceptance.
+
+  2. Spoken Roman Urdu is not reliably transcribed as Roman text. faster-whisper small returned
+     Devanagari for a Roman Urdu utterance, with the language reported as Hindi: "type mera naam Wajid
+     hai" came back as "type मेरा नेम वाजिजली" (hi, 0.62) - and the content was wrong too. docs/step4
+     assumes Roman Urdu is "English-script text the Brain interprets contextually"; with this model
+     that premise does not hold, so Phase 3's Brain will need to handle Urdu and Hindi script as well
+     as Roman Urdu.
 """
 import contextlib
 import sys
@@ -208,6 +232,11 @@ def nothing_left_running():
 def test_a_spoken_command_opens_notepad_through_the_normal_safe_pipeline(evidence, tmp_path):
     """The whole path, with you at the keyboard. Read the script below before you start."""
     started = time.time()
+    # BEFORE voice mode starts, the microphone opens, TTS speaks or you type anything: what audio
+    # already exists under data/. A local model may legitimately ship static audio fixtures - the
+    # sherpa keyword-spotting model carries test_wavs/*.wav with 2024 timestamps - so this folder can
+    # never be asserted empty. What must hold is that THIS SESSION neither created nor removed one.
+    audio_before = _audio_files(PROJECT_ROOT / "data")
     announce("")
     announce("=" * 78)
     announce("MANUAL VOICE ACCEPTANCE - you drive this; the test types nothing for you.")
@@ -220,9 +249,12 @@ def test_a_spoken_command_opens_notepad_through_the_normal_safe_pipeline(evidenc
     announce("    3. read the transcript, then type: accept")
     announce("       (if it was misheard, type correct or redictate first, and accept the")
     announce("        corrected command - that is a valid run)")
-    announce("    4. type:  exit    <- as soon as Notepad has opened; extra commands are not needed")
+    announce("    4. repeat 1-3 for any further utterances this acceptance calls for, then")
+    announce("       type:  exit")
     announce("")
-    announce("  Nothing is saved or played back. You do not need to press Ctrl+Alt+Backspace.")
+    announce("  Microphone audio is not saved. Replies may be spoken aloud. You do not need to")
+    announce("  press Ctrl+Alt+Backspace. Do not say any `type ...` command: in voice mode it would")
+    announce("  target this console window (see the limitations at the top of this file).")
     announce("=" * 78)
     announce("")
 
@@ -277,7 +309,13 @@ def test_a_spoken_command_opens_notepad_through_the_normal_safe_pipeline(evidenc
     assert exit_code == 0
 
     # 16-18: nothing was kept, and nothing private was written down.
-    assert _audio_files(tmp_path) == [] and _audio_files(PROJECT_ROOT / "data") == []
+    # tmp_path belongs to this test, so it must be empty of audio outright. data/ is compared with the
+    # snapshot taken before the session: equality catches a file this run CREATED and also one it
+    # REMOVED, without excluding any model asset by name.
+    assert _audio_files(tmp_path) == [], "this session wrote audio into its own temporary folder"
+    assert _audio_files(PROJECT_ROOT / "data") == audio_before, (
+        "this session created or removed a persistent audio file under data/ (compared with the "
+        "snapshot taken before voice mode started)")
     logged = _log_text(tmp_path)
     assert opened.text.strip() not in logged and PHRASE not in logged.lower(), (
         "the accepted command reached the log file")
@@ -288,9 +326,11 @@ def test_a_spoken_command_opens_notepad_through_the_normal_safe_pipeline(evidenc
 
 
 def _audio_files(folder):
+    """Every audio-suffixed file under `folder`, sorted - so two snapshots compare deterministically
+    however the filesystem happened to order them."""
     if not folder.is_dir():
         return []
-    return [str(path) for path in folder.rglob("*") if path.suffix.lower() in AUDIO_SUFFIXES]
+    return sorted(str(path) for path in folder.rglob("*") if path.suffix.lower() in AUDIO_SUFFIXES)
 
 
 def _log_text(tmp_path) -> str:
