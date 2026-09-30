@@ -155,12 +155,35 @@ speaker:
 
 # --- Brain (Claude API) ---
 brain:
-  # MODEL SELECTION PENDING: claude-opus-5 is a placeholder until cost/performance
-  # is evaluated. Whatever model is set here must also have a price below.
-  model: claude-opus-5
+  # MODEL SELECTED 2026-09-30 (Phase 3 Slice 2). The approved role is capable-fast / mid-tier, and this
+  # is that tier. It is NOT the cheapest model that supports structured outputs - Haiku 4.5 is cheaper
+  # ($1/$5) and also supports them. The mid tier is chosen deliberately over the cheapest for stronger
+  # semantic and multilingual reliability, which this project needs because commands arrive in English,
+  # Roman Urdu, Urdu script and Hindi, while keeping latency and cost sensible for interactive desktop
+  # use. One primary model, no fallback in Phase 3.
+  # VERIFIED against https://platform.claude.com/docs/en/docs/about-claude/models/overview on
+  # 2026-09-30: "Claude API ID: claude-sonnet-5-5", Active, retirement not sooner than 2027-09-28,
+  # max output 128K tokens, and listed as supporting structured outputs.
+  # Whatever model is set here must also have a price below, or it is blocked.
+  model: claude-sonnet-5-5
   timeout_seconds: 30        # per-request timeout, so a network problem fails fast
   max_retries: 2             # SDK retries for connection errors, 429 and 5xx
   ping_max_tokens: 256       # output cap for the minimal health/test request
+  # THINKING POLICY (Phase 3 starting setting, not a quality benchmark - acceptance may revise it).
+  # VERIFIED on 2026-09-30 at https://platform.claude.com/docs/en/build-with-claude/thinking:
+  # Sonnet 5.5 has thinking ON by default (adaptive) at default effort `high`; thinking tokens "are
+  # billed as output tokens ... and they count toward max_tokens"; it REJECTS thinking `disabled` with a
+  # 400; its lowest setting is `between_tools`, which "turns off up-front thinking", is accepted at
+  # effort `high` or below, needs no beta header, and - with no tools sent, as here - "the response
+  # contains only text". That is what keeps the output cap below derivable from the schema alone.
+  # This applies to every request this adapter makes, including the health ping, whose 256-token cap
+  # would otherwise have to share max_tokens with adaptive thinking.
+  thinking: between_tools    # `adaptive` restores the default; Sonnet 5.5 rejects `disabled`
+  effort: medium             # between_tools is rejected at `xhigh`/`max`; `high` or below is required
+  # Billable input we cannot see as text: when a structured output format is requested, the API injects
+  # its own system prompt describing it. Its size is not published, so this is a deliberate over-count -
+  # the closest published figure is the tool-use system prompt, 286 tokens on Claude Sonnet 5.5.
+  structured_output_overhead_tokens: 512
 
 # --- Cost controls (docs/build-plan Section 5.5) ---
 # Enforced by app/brain/cost_controls.py before every Claude request.
@@ -169,14 +192,37 @@ brain:
 cost:
   rate_limit_per_minute: 30             # Rate limit: max Claude requests in any rolling 60 seconds
   max_input_tokens_per_request: 20000   # Token limit: estimated input tokens per request
-  max_output_tokens_per_request: 4096   # Token limit: max_tokens a single request may ask for
+  # DERIVED 2026-09-30, re-derived after the provider-schema compatibility fix, and again after wire
+  # canonicalization. The bound is the largest raw reply app/brain/logic.validate_interpretation() would
+  # ACCEPT - not the largest the provider's schema permits, because Anthropic's structured outputs
+  # support neither string maxLength nor array maxItems, so the schema cannot express our sizes at all.
+  # In canonical form (irrelevant fields at their neutral values, since a non-neutral one is now
+  # refused): 5 intents, every `why` at its 120-character bound, a 200-character restatement, and one
+  # 1000-character type_text payload - the Executor's own limit - in Urdu script, which costs the most
+  # bytes. 3709 UTF-8 bytes, which the project's conservative estimator (2 bytes/token) counts as
+  # 1855 tokens. 3072 covers it with 1217 tokens (39.6%) of headroom.
+  #
+  # ONE KNOWN CASE IS DELIBERATELY NOT BUDGETED FOR. Five intents each carrying a maximal 1000-character
+  # Urdu payload is also application-valid and needs about 5855 tokens. That is 5000 characters dictated
+  # in a single command; covering it would double the output reservation on every request for something
+  # desktop use does not produce. It fails safely: generation reaches this cap, stop_reason is
+  # max_tokens, and the existing handling refuses the reply, so nothing half-understood is acted on.
+  #
+  # A reply that is larger for any other reason is refused too - by our own bounds if it arrives whole,
+  # by the max_tokens stop reason if it does not. Neither can reach the Planner. This figure also assumes
+  # brain.thinking stays `between_tools`, since thinking tokens would otherwise share the same budget.
+  # Purpose: bounded latency, bounded runaway output, bounded reservation size - never a quality target.
+  max_output_tokens_per_request: 3072   # Token limit: max_tokens a single request may ask for
   daily_budget_usd: 1.00                # Money budget: hard stop per calendar day (local time)
   monthly_budget_usd: 10.00             # Money budget: hard stop per calendar month
   usage_db_path: data/claude_usage.db   # usage ledger - git-ignored by data/*.db
-  # USD per million tokens. PRICES STATUS: VERIFIED against https://claude.com/pricing on 2026-09-16
-  # (Opus 5 $5/$25, Sonnet 5 $2/$10, Haiku 4.5 $1/$5 per million tokens). Re-check when models change.
-  # A model with no entry here is blocked, because its cost can't be budgeted.
+  # USD per million tokens. PRICES STATUS: VERIFIED against
+  # https://platform.claude.com/docs/en/docs/about-claude/pricing on 2026-09-30, base (non-batch,
+  # non-cache, global) rates: Sonnet 5.5 $2/$10, Opus 5 $5/$25, Sonnet 5 $2/$10, Haiku 4.5 $1/$5.
+  # Re-check when models change. A model with no entry here is blocked, because its cost can't be
+  # budgeted - that fail-closed behaviour is the reason a wrong entry is worse than a missing one.
   prices_usd_per_million_tokens:
-    claude-opus-5:    {input: 5.00, output: 25.00}
-    claude-sonnet-5:  {input: 2.00, output: 10.00}
-    claude-haiku-4-5: {input: 1.00, output: 5.00}
+    claude-sonnet-5-5: {input: 2.00, output: 10.00}
+    claude-opus-5:     {input: 5.00, output: 25.00}
+    claude-sonnet-5:   {input: 2.00, output: 10.00}
+    claude-haiku-4-5:  {input: 1.00, output: 5.00}

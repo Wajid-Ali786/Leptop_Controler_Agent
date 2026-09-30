@@ -22,6 +22,10 @@ REAL_API_TESTS = {
     "tests/test_brain.py::test_real_claude_ping",
     "tests/test_health.py::test_real_claude_health_check",
     "tests/test_test_isolation.py::test_real_api_tests_use_the_real_ledger",
+    # Prepared in Phase 3 Slice 2 and not yet run: one harmless interpretation of "please open notepad".
+    # It is listed here because this registry is the allowlist - a paid test that is not named here
+    # fails the isolation suite, which is how a new one cannot slip in unnoticed.
+    "tests/test_brain_provider.py::test_a_real_sonnet_call_returns_a_planable_interpretation",
 }
 
 

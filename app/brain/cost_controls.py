@@ -82,10 +82,18 @@ def estimate_input_tokens(prompt: str) -> int:
     return math.ceil(len(prompt.encode("utf-8")) / BYTES_PER_TOKEN_ESTIMATE)
 
 
-def authorize(*, model: str, prompt: str, max_tokens: int) -> int:
+def authorize(*, model: str, prompt: str, max_tokens: int, overhead_tokens: int = 0) -> int:
     """Run all three controls; record the request with its worst-case cost reserved and
-    return its id, or raise CostLimitError."""
-    estimated_input = estimate_input_tokens(prompt)
+    return its id, or raise CostLimitError.
+
+    `prompt` must be EVERY piece of input text the request will send and be billed for - the system
+    prompt, the user content and any structured-output schema, concatenated - not just the user's own
+    words. `overhead_tokens` covers billable input we do not hold as text, such as the system prompt the
+    API injects when a structured output format is requested; it is added on top of the estimate.
+    Both are the caller's responsibility because only the caller knows what the request will contain;
+    app/brain/adapter.py is that caller.
+    """
+    estimated_input = estimate_input_tokens(prompt) + max(0, int(overhead_tokens))
     _check_token_limit(estimated_input, max_tokens)
     worst_case_usd = _cost(model, estimated_input, max_tokens)
     now = _now()

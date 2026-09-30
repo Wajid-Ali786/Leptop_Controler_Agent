@@ -307,7 +307,8 @@ def isolated_logging(request, tmp_path, monkeypatch):
 
 
 def config_text(ledger_path, *, model="test-model", rate_limit=5, max_input_tokens=1000,
-                max_output_tokens=100, daily_usd=1.0, monthly_usd=5.0) -> str:
+                max_output_tokens=100, daily_usd=1.0, monthly_usd=5.0,
+                structured_overhead=8, thinking="between_tools", effort="medium") -> str:
     """Test config.yaml. model=None omits brain.model. The cost section comes last."""
     model_line = f"  model: {model}\n" if model else ""
     return (
@@ -321,6 +322,9 @@ def config_text(ledger_path, *, model="test-model", rate_limit=5, max_input_toke
         "  timeout_seconds: 5\n"
         "  max_retries: 0\n"
         "  ping_max_tokens: 16\n"
+        f"  structured_output_overhead_tokens: {structured_overhead}\n"
+        f"  thinking: {thinking}\n"
+        f"  effort: {effort}\n"
         "safety:\n"
         '  risky_keywords: [delete, shutdown, "shut down", send]\n'
         "  safe_words: [sender, senders]\n"

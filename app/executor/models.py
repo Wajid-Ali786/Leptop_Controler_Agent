@@ -29,6 +29,45 @@ _SUCCESS_OUTCOMES = {Outcome.DONE, Outcome.ALREADY_CLOSED, Outcome.UNVERIFIED}  
 _VERIFIED_OUTCOMES = {Outcome.DONE, Outcome.ALREADY_CLOSED}  # the end state was actually observed
 
 
+# --- Target resolution results (Phase 3) --------------------------------------------------------------
+# The RULES live in app/executor/logic.resolve(), beside the other target rules. These two shapes live
+# here, with the other data shapes, so a pure consumer - the Phase 3 router - can name them without
+# importing the Executor's logic module and, through it, its OS adapter.
+
+RESOLVE_NO_TARGET = "no_target"               # the action needs a target and none was given
+RESOLVE_UNKNOWN_APP = "unknown_app"           # not a configured app name
+RESOLVE_BAD_FORMAT = "bad_format"             # not written in a form this kind accepts
+RESOLVE_OUT_OF_RANGE = "out_of_range"         # readable, but beyond a configured limit
+RESOLVE_UNWANTED_TARGET = "unwanted_target"   # this kind takes no target, and one was given
+RESOLVE_SETTINGS = "settings"                 # the configuration needed to judge the target is invalid
+RESOLVE_UNKNOWN_KIND = "unknown_kind"         # no such Executor capability
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """The target is usable. `value` is the canonical parsed form the preparer goes on to use:
+
+      open_app / close_app  the configured app name, lower-cased
+      click                 (x, y) as whole numbers
+      scroll                (direction, notches)
+      shortcut              the parsed Shortcut
+      window_control        the operation name
+      type_text             the text with CRLF normalised to LF
+      refresh               None - it has no target
+    """
+    value: object = None
+
+
+@dataclass(frozen=True)
+class Unresolved:
+    """The target cannot be used, and why.
+
+    `message` is what the user sees, and it is deliberately the SAME sentence the preparer produced
+    before this seam existed - those sentences were tuned during Phase 1 acceptance."""
+    reason: str
+    message: str
+
+
 @dataclass(frozen=True, repr=False)
 class ExecutorAction:
     """One thing the Executor should do, e.g. ExecutorAction(OPEN_APP, "notepad")."""

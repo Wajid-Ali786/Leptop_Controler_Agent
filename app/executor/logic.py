@@ -134,8 +134,11 @@ from typing import Callable
 
 from app.executor import adapter, emergency_stop, shortcuts
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError, TypingInterruptedError
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL,
-                                 ActionResult, ExecutorAction, Outcome)
+from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, RESOLVE_BAD_FORMAT,
+                                 RESOLVE_NO_TARGET, RESOLVE_OUT_OF_RANGE, RESOLVE_SETTINGS,
+                                 RESOLVE_UNKNOWN_APP, RESOLVE_UNKNOWN_KIND, RESOLVE_UNWANTED_TARGET,
+                                 SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL, ActionResult,
+                                 ExecutorAction, Outcome, Resolved, Unresolved)
 from app.safety.logic import Confirm, authorize
 from app.safety.models import Action, RiskLevel
 from app.verifier import logic as verifier
@@ -174,6 +177,130 @@ class _Prepared:
     """A validated action, ready to run once the safety gate allows it."""
     run: Callable[[], ActionResult]
     safety_action: Action | None = None  # what the gate classifies and the user approves; default: the description
+
+
+# --- Target resolution: the one place that answers "is this target usable?" --------------------------
+# Every preparer used to open with its own target check. Those checks are now here, unchanged, so the
+# same question has one answer whether it is asked by a preparer about to act or by the Phase 3 router
+# deciding whether a line needs the Brain.
+#
+# SIDE-EFFECT FREE, and it must stay that way: no verifier call, no active window, no snapshot, no OS
+# adapter, nothing executed. Config reads are allowed, because some targets are only valid relative to
+# configuration (which apps exist, how many notches are allowed, how long typed text may be).
+#
+# It is NOT a promise that the action will succeed. It answers only the config-and-grammar half. The
+# desktop half - is a window there, is the right one in front - still happens in the preparer, where
+# reading the screen belongs.
+
+def resolve(action: ExecutorAction) -> Resolved | Unresolved:
+    """Can this action's target be used? No side effects; see the note above."""
+    resolver = _RESOLVERS.get(action.kind)
+    if resolver is None:
+        return Unresolved(RESOLVE_UNKNOWN_KIND, f"I don't know how to do '{action.kind}' yet.")
+    return resolver(action)
+
+
+def _resolve_open_app(action: ExecutorAction) -> Resolved | Unresolved:
+    return _resolve_app(action, "open")
+
+
+def _resolve_close_app(action: ExecutorAction) -> Resolved | Unresolved:
+    return _resolve_app(action, "close")
+
+
+def _resolve_app(action: ExecutorAction, verb: str) -> Resolved | Unresolved:
+    """The app-name rule for open and close. The two verbs word their messages differently, and both
+    wordings are preserved exactly."""
+    name = action.target.strip().lower() if isinstance(action.target, str) else ""
+    if not name:
+        return Unresolved(RESOLVE_NO_TARGET, f"Which app should I {verb}?")
+    try:
+        apps = _configured_apps()
+    except SettingsError as exc:
+        return Unresolved(RESOLVE_SETTINGS, str(exc))
+    if name not in apps:
+        return Unresolved(RESOLVE_UNKNOWN_APP,
+                          f"I don't know an app called '{action.target.strip()}'. "
+                          f"Apps I can {verb}: {', '.join(sorted(apps))}.")
+    return Resolved(name)
+
+
+def _resolve_click(action: ExecutorAction) -> Resolved | Unresolved:
+    target = action.target.strip() if isinstance(action.target, str) else ""
+    if not target:
+        return Unresolved(RESOLVE_NO_TARGET,
+                          "Where should I click? Give screen coordinates as x, y (e.g. 500, 300).")
+    inner = target[1:-1].strip() if target.startswith("(") and target.endswith(")") else target
+    match = _POINT.fullmatch(inner)
+    if not match:
+        return Unresolved(RESOLVE_BAD_FORMAT,
+                          f"I can't click at '{target}': give whole-number screen coordinates "
+                          f"as x, y (e.g. 500, 300).")
+    return Resolved((int(match.group(1)), int(match.group(2))))
+
+
+def _resolve_scroll(action: ExecutorAction) -> Resolved | Unresolved:
+    target = " ".join(action.target.split()) if isinstance(action.target, str) else ""
+    parsed = _parse_scroll(target)
+    if isinstance(parsed, str):
+        return Unresolved(RESOLVE_BAD_FORMAT, parsed)
+    direction, requested = parsed
+    try:
+        limit, _unclassified_limit, _interval = _scroll_settings()
+    except SettingsError as exc:
+        return Unresolved(RESOLVE_SETTINGS, str(exc))
+    if requested > limit:
+        return Unresolved(RESOLVE_OUT_OF_RANGE,
+                          f"That's {requested} notches; I scroll at most {limit} at once.")
+    return Resolved((direction, requested))
+
+
+def _resolve_shortcut(action: ExecutorAction) -> Resolved | Unresolved:
+    parsed = shortcuts.parse(action.target)
+    if isinstance(parsed, shortcuts.ShortcutRefusal):
+        return Unresolved(RESOLVE_BAD_FORMAT, parsed.message)
+    return Resolved(parsed)
+
+
+def _resolve_window_control(action: ExecutorAction) -> Resolved | Unresolved:
+    target = " ".join(action.target.lower().split()) if isinstance(action.target, str) else ""
+    if not target:
+        return Unresolved(RESOLVE_NO_TARGET,
+                          "Which window control? minimize, maximize, restore or close.")
+    if target not in _WINDOW_OPERATIONS:
+        return Unresolved(RESOLVE_BAD_FORMAT,
+                          f"I can't do '{action.target.strip()}' to a window. Window controls: minimize, "
+                          f"maximize, restore or close.")
+    return Resolved(target)
+
+
+def _resolve_type_text(action: ExecutorAction) -> Resolved | Unresolved:
+    raw = action.target if isinstance(action.target, str) else ""
+    if not raw:
+        return Unresolved(RESOLVE_NO_TARGET, "What should I type?")
+    text = raw.replace("\r\n", "\n")
+    try:
+        limit = _max_type_characters()
+    except SettingsError as exc:
+        return Unresolved(RESOLVE_SETTINGS, str(exc))
+    if len(text) > limit:
+        return Unresolved(RESOLVE_OUT_OF_RANGE,
+                          f"That's {len(text)} characters; I can type at most {limit} at once.")
+    categories = {unicodedata.category(c) for c in text if c != "\n"}
+    if "Cs" in categories:
+        return Unresolved(RESOLVE_BAD_FORMAT, "I can't type that: it contains an invalid character.")
+    if "Cc" in categories:
+        return Unresolved(RESOLVE_BAD_FORMAT,
+                          "I can't type that: it contains Tab or another control key, which isn't "
+                          "text (keyboard shortcuts come later).")
+    return Resolved(text)
+
+
+def _resolve_refresh(action: ExecutorAction) -> Resolved | Unresolved:
+    if isinstance(action.target, str) and action.target.strip():
+        return Unresolved(RESOLVE_UNWANTED_TARGET,
+                          "Refresh doesn't take a target; it refreshes the active window.")
+    return Resolved(None)
 
 
 def execute(action: ExecutorAction, confirm: Confirm | None = None) -> ActionResult:
@@ -219,17 +346,11 @@ def execute_with_recovery(action: ExecutorAction, confirm: Confirm | None = None
 # --- open_app ---------------------------------------------------------------------------
 
 def _prepare_open_app(action: ExecutorAction):
-    name = action.target.strip().lower()
-    if not name:
-        return _result(action, False, "Which app should I open?")
-    try:
-        apps = _configured_apps()
-    except SettingsError as exc:
-        return _result(action, False, str(exc))
-    executable = apps.get(name)
-    if executable is None:
-        return _result(action, False, f"I don't know an app called '{action.target.strip()}'. "
-                                      f"Apps I can open: {', '.join(sorted(apps))}.")
+    resolution = resolve(action)          # the one target rule; see the note above resolve()
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    name = resolution.value
+    executable = _configured_apps()[name]
     try:
         expectation = verifier.expect_window(name)
     except SettingsError as exc:
@@ -280,16 +401,10 @@ class _SessionGroup:
 
 
 def _prepare_close_app(action: ExecutorAction):
-    name = action.target.strip().lower()
-    if not name:
-        return _result(action, False, "Which app should I close?")
-    try:
-        apps = _configured_apps()
-    except SettingsError as exc:
-        return _result(action, False, str(exc))
-    if name not in apps:
-        return _result(action, False, f"I don't know an app called '{action.target.strip()}'. "
-                                      f"Apps I can close: {', '.join(sorted(apps))}.")
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    name = resolution.value
     try:
         expectation = verifier.expect_window(name)
     except SettingsError as exc:
@@ -418,15 +533,10 @@ def forget_session_windows() -> None:
 # --- click ------------------------------------------------------------------------------
 
 def _prepare_click(action: ExecutorAction):
-    target = action.target.strip()
-    if not target:
-        return _result(action, False, "Where should I click? Give screen coordinates as x, y (e.g. 500, 300).")
-    inner = target[1:-1].strip() if target.startswith("(") and target.endswith(")") else target
-    match = _POINT.fullmatch(inner)
-    if not match:
-        return _result(action, False, f"I can't click at '{target}': give whole-number screen coordinates "
-                                      f"as x, y (e.g. 500, 300).")
-    x, y = int(match.group(1)), int(match.group(2))
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    x, y = resolution.value
     try:
         all_screens = verifier.screens()
         if not verifier.on_screen(all_screens, x, y):
@@ -495,22 +605,14 @@ def _describe_screens(all_screens: list[Screen]) -> str:
 # --- type_text --------------------------------------------------------------------------
 
 def _prepare_type_text(action: ExecutorAction):
-    raw = action.target if isinstance(action.target, str) else ""
-    if not raw:
-        return _result(action, False, "What should I type?")
-    text = raw.replace("\r\n", "\n")
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    text = resolution.value
     try:
-        limit, interval = _max_type_characters(), _typing_interval()
+        interval = _typing_interval()
     except SettingsError as exc:
         return _result(action, False, str(exc))
-    if len(text) > limit:
-        return _result(action, False, f"That's {len(text)} characters; I can type at most {limit} at once.")
-    categories = {unicodedata.category(c) for c in text if c != "\n"}
-    if "Cs" in categories:
-        return _result(action, False, "I can't type that: it contains an invalid character.")
-    if "Cc" in categories:
-        return _result(action, False, "I can't type that: it contains Tab or another control key, which isn't "
-                                      "text (keyboard shortcuts come later).")
     try:
         approved = verifier.active_target()
     except verifier.VerifierUnavailableError as exc:
@@ -641,10 +743,10 @@ _DESKTOP_CLASSES = ("Progman", "WorkerW")
 
 
 def _prepare_shortcut(action: ExecutorAction):
-    parsed = shortcuts.parse(action.target)
-    if isinstance(parsed, shortcuts.ShortcutRefusal):
-        return _result(action, False, parsed.message)
-    shortcut = parsed
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    shortcut = resolution.value
     name = shortcut.name
     try:
         approved = verifier.active_target()
@@ -809,17 +911,11 @@ _UNCLASSIFIED_RISK_REASON = "scrolling a surface whose scroll area can't be iden
 
 
 def _prepare_scroll(action: ExecutorAction):
-    target = " ".join(action.target.split()) if isinstance(action.target, str) else ""
-    parsed = _parse_scroll(target)
-    if isinstance(parsed, str):
-        return _result(action, False, parsed)
-    direction, requested = parsed
-    try:
-        limit, unclassified_limit, interval = _scroll_settings()
-    except SettingsError as exc:
-        return _result(action, False, str(exc))
-    if requested > limit:
-        return _result(action, False, f"That's {requested} notches; I scroll at most {limit} at once.")
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    direction, requested = resolution.value
+    limit, unclassified_limit, interval = _scroll_settings()
     try:
         approved = verifier.active_target()
         _, chain = verifier.control_chain_at_pointer()
@@ -1006,8 +1102,9 @@ _EDITING_REFRESH_REASON = "refreshing File Explorer while a text box is being ed
 
 
 def _prepare_refresh(action: ExecutorAction):
-    if isinstance(action.target, str) and action.target.strip():
-        return _result(action, False, "Refresh doesn't take a target; it refreshes the active window.")
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
     try:
         approved = verifier.active_target()
         held = verifier.modifiers_held()
@@ -1079,13 +1176,10 @@ _PAST = {"minimize": "minimized", "maximize": "maximized", "restore": "restored"
 
 
 def _prepare_window_control(action: ExecutorAction):
-    target = " ".join(action.target.lower().split()) if isinstance(action.target, str) else ""
-    if not target:
-        return _result(action, False, "Which window control? minimize, maximize, restore or close.")
-    if target not in _WINDOW_OPERATIONS:
-        return _result(action, False, f"I can't do '{action.target.strip()}' to a window. Window controls: minimize, "
-                                      f"maximize, restore or close.")
-    operation = target
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    operation = resolution.value
     try:
         approved = verifier.active_target()
         state = verifier.window_state(approved.window.handle) if approved.window else None
@@ -1225,6 +1319,10 @@ def _session_group_containing(handle: int) -> _SessionGroup | None:
 
 
 # --- Helpers ----------------------------------------------------------------------------
+
+_RESOLVERS = {OPEN_APP: _resolve_open_app, CLOSE_APP: _resolve_close_app, CLICK: _resolve_click,
+              SCROLL: _resolve_scroll, SHORTCUT: _resolve_shortcut, REFRESH: _resolve_refresh,
+              WINDOW_CONTROL: _resolve_window_control, TYPE_TEXT: _resolve_type_text}
 
 _PREPARERS = {OPEN_APP: _prepare_open_app, CLOSE_APP: _prepare_close_app, CLICK: _prepare_click,
               TYPE_TEXT: _prepare_type_text, SHORTCUT: _prepare_shortcut, SCROLL: _prepare_scroll,
