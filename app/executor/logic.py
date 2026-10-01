@@ -129,7 +129,7 @@ import logging
 import re
 import threading
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from app.executor import adapter, emergency_stop, shortcuts
@@ -303,8 +303,18 @@ def _resolve_refresh(action: ExecutorAction) -> Resolved | Unresolved:
     return Resolved(None)
 
 
-def execute(action: ExecutorAction, confirm: Confirm | None = None) -> ActionResult:
-    """Carry out one action once, or explain why not. See the module docstring for the order."""
+ADVISORY_FLOOR_REASON = "the reasoning step asked for extra care"
+
+
+def execute(action: ExecutorAction, confirm: Confirm | None = None, *,
+            risk_floor: RiskLevel = RiskLevel.LOW) -> ActionResult:
+    """Carry out one action once, or explain why not. See the module docstring for the order.
+
+    `risk_floor` is an ADVISORY minimum from the caller - Phase 3 passes the Brain's opinion about how
+    careful to be. It can only ever RAISE the floor this module's own preparer already chose: see
+    _with_advisory_floor(). It is deliberately not part of ExecutorAction, because it is not something
+    the assistant does, only something somebody thinks about it.
+    """
     emergency_stop.check()
     prepare = _PREPARERS.get(action.kind)
     if prepare is None:
@@ -314,23 +324,46 @@ def execute(action: ExecutorAction, confirm: Confirm | None = None) -> ActionRes
         return prepared
     if not isinstance(prepared, _Prepared):
         prepared = _Prepared(prepared)
-    authorize(prepared.safety_action or Action(action.description), confirm)  # raises ActionDeniedError
+    safety_action = prepared.safety_action or Action(action.description)
+    authorize(_with_advisory_floor(safety_action, risk_floor), confirm)  # raises ActionDeniedError
     emergency_stop.check()
     return prepared.run()
 
 
+def _with_advisory_floor(safety_action: Action, risk_floor: RiskLevel) -> Action:
+    """Combine the preparer's own floor with an advisory one: the higher of the two wins.
+
+    RiskLevel is an IntEnum, so the comparison is the same one app/safety/logic.assess() already uses
+    to decide between the words and the floor. An advisory floor that is not higher changes NOTHING -
+    not the level, and not the preparer's own minimum_reason, which says something true about why this
+    particular action is risky and must not be replaced by a generic sentence.
+    """
+    try:
+        advisory = RiskLevel(risk_floor)
+    except ValueError:
+        advisory = RiskLevel.CRITICAL      # an unreadable floor fails closed, like assess() does
+    if advisory <= RiskLevel(safety_action.minimum_level):
+        return safety_action
+    return replace(safety_action, minimum_level=advisory, minimum_reason=ADVISORY_FLOOR_REASON)
+
+
 def execute_with_recovery(action: ExecutorAction, confirm: Confirm | None = None,
-                          offer_retry: OfferRetry | None = None) -> ActionResult:
+                          offer_retry: OfferRetry | None = None, *,
+                          risk_floor: RiskLevel = RiskLevel.LOW) -> ActionResult:
     """Action -> Result -> Recovery. A retryable failure is offered via offer_retry(result), which
     must return exactly True to retry; without it, nothing is retried. Stops after
-    executor.max_attempts attempts."""
+    executor.max_attempts attempts.
+
+    `risk_floor` is passed to EVERY attempt: a retry runs the whole pipeline again, safety gate
+    included, so it must be asked for with the same care as the first try.
+    """
     try:
         max_attempts = _max_attempts()
     except SettingsError as exc:
         return _result(action, False, str(exc))
     attempt = 1
     while True:
-        result = execute(action, confirm)
+        result = execute(action, confirm, risk_floor=risk_floor)
         if result.ok or not result.retryable:
             return result
         if attempt >= max_attempts:

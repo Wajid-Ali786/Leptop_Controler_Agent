@@ -399,25 +399,25 @@ def fake_pyautogui(monkeypatch):
     return module
 
 
-def test_adapter_clicks_once_with_the_fail_safe_on_and_no_pause(fake_pyautogui):
+def test_adapter_clicks_once_with_the_fail_safe_on_and_no_pause(os_primitives_faked, fake_pyautogui):
     adapter.click(-1000, 500)
     assert fake_pyautogui.calls == [((-1000, 500), {"button": "left", "_pause": False}, True)]
     assert fake_pyautogui.physical == [True]  # DPI awareness set before pyautogui was used
 
 
-def test_adapter_turns_the_fail_safe_into_its_own_error(fake_pyautogui):
+def test_adapter_turns_the_fail_safe_into_its_own_error(os_primitives_faked, fake_pyautogui):
     fake_pyautogui.error = fake_pyautogui.FailSafeException("corner")
     with pytest.raises(adapter.MouseFailSafeError, match="corner of the main screen"):
         adapter.click(500, 300)
 
 
-def test_adapter_turns_other_failures_into_a_clear_error(fake_pyautogui):
+def test_adapter_turns_other_failures_into_a_clear_error(os_primitives_faked, fake_pyautogui):
     fake_pyautogui.error = OSError("input blocked")
     with pytest.raises(adapter.ClickError, match=r"Windows didn't accept the click \(OSError\)"):
         adapter.click(500, 300)
 
 
-def test_adapter_reports_a_missing_mouse_library(monkeypatch):
+def test_adapter_reports_a_missing_mouse_library(os_primitives_faked, monkeypatch):
     monkeypatch.setitem(sys.modules, "pyautogui", None)
     monkeypatch.setattr(adapter.sys, "platform", "win32")
     monkeypatch.setattr(adapter, "_use_physical_pixels", lambda: None)
@@ -425,7 +425,7 @@ def test_adapter_reports_a_missing_mouse_library(monkeypatch):
         adapter.click(500, 300)
 
 
-def test_adapter_refuses_off_windows(monkeypatch):
+def test_adapter_refuses_off_windows(os_primitives_faked, monkeypatch):
     monkeypatch.setattr(adapter.sys, "platform", "linux")
     with pytest.raises(adapter.ClickError, match="only supported on Windows"):
         adapter.click(500, 300)

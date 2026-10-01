@@ -131,10 +131,10 @@ def voice(monkeypatch):
         return world.heard
     monkeypatch.setattr(voice_console.adapter, "transcribe", transcribe)
 
-    def handle_command(text, confirm=None, offer_retry=None, focus=None):
+    def handle_typed_line(text, context, prompts, focus=None, interpret=None, *, frontend=None):
         world.ran.append(text)
-        return console.CommandReply(console.Status.RAN, "pretend it ran")
-    monkeypatch.setattr(console, "handle_command", handle_command)
+        return console.CommandReply(console.Status.RAN, "pretend it ran"), context
+    monkeypatch.setattr(console, "handle_typed_line", handle_typed_line)
     monkeypatch.setattr(console, "hotkey_line", lambda: "Emergency stop: pretend it is active.")
     return world
 

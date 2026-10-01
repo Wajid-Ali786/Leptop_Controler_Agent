@@ -1,0 +1,228 @@
+# AI Desktop Companion - non-secret settings (safe to commit).
+# Secrets (ANTHROPIC_API_KEY) live in .env, never here.
+# Read ONLY through config/settings.py -> get_setting(name) (docs/step3 Section 3).
+#
+# Values are added as each Phase 0 feature needs them (docs/step4 Section 3).
+
+# --- Language preferences ---
+
+# --- Confirmation rules (app/safety/logic.py) ---
+# Minimal Phase 0 Permission & Safety gate. An action containing a risky keyword - as a
+# whole word or common verb form (delete/deletes/deleted/deleting) - is Medium risk and
+# needs confirmation ("close" too, because closing can lose unsaved work). Any other word that
+# merely contains a keyword (e.g. "resend") is treated as risky too, unless listed in safe_words. Missing/invalid settings here make
+# EVERY action require confirmation (fail closed).
+# The Roman Urdu verbs (mita = erase, hata = remove, band = shut/close, bhej = send,
+# khatam = finish/end, saaf = clean/wipe) and their common forms are a STOPGAP until Phase 3's
+# reasoning-aware classification. Phrases come before their single word so the rule names
+# the more specific match.
+safety:
+  risky_keywords: [
+    delete, shutdown, "shut down", send,
+    close,
+    mita, mitao, mitana, mitado,
+    hata, hatao, hatana, hatado,
+    band,
+    bhej, bhejo, bhejna, bheja, bhejdo,
+    "khatam karo", "khatam kar do", "khatam kardo", khatam, khatm,
+    "saaf karo", "saaf kar do", "saaf kardo", saaf,
+  ]
+  # Unrelated words that merely CONTAIN a keyword. safe_words can't exempt a keyword itself or
+  # its verb forms (e.g. English "band", or "saaf"/"khatam" used as adjectives) - those stay
+  # risky until Phase 3. Likewise "close" as an adjective ("close by", "closer") stays risky.
+  safe_words: [
+    sender, senders,
+    closet, closets, disclose, discloses, disclosed, disclosure, enclose, encloses, enclosed, enclosure,
+    husband, husbands, bandwidth, broadband, bandage, bandages, bandana, bandar,
+    khata,
+  ]
+
+# --- Folder paths ---
+
+# --- Logging (app/logging_setup.py) ---
+logging:
+  file: logs/companion.log   # rotated copies: companion.1.log, companion.2.log, ... (git-ignored by logs/*.log)
+  level: INFO                # DEBUG, INFO, WARNING, ERROR or CRITICAL
+  max_bytes: 1000000         # rotate when the file reaches ~1 MB
+  backup_count: 5            # rotated files to keep
+
+# --- Executor (app/executor/) ---
+executor:
+  # Apps the assistant may open: name -> Windows executable. Anything not listed is refused,
+  # never guessed (Phase 4 memory adds user aliases). Every open still passes the safety gate.
+  apps:
+    notepad: notepad.exe
+    calculator: calc.exe
+  # Action -> Result -> Recovery: attempts per action, including the first. A failed, retryable
+  # attempt is offered to the user for retry - never silently continued.
+  max_attempts: 3
+  # Type text: the most characters one action may type, and the pause between characters (the
+  # emergency stop and a change of active window are checked before every character).
+  max_type_characters: 1000
+  typing_interval_seconds: 0.01
+  # Emergency stop: one system-wide key combination that stops whatever the assistant is doing, from
+  # any window (app/executor/hotkey.py). Ctrl, Alt, Shift and Win may be combined with one key that
+  # types nothing: Backspace, Esc, Insert, Pause or F1-F24. Combinations Windows keeps for itself
+  # (Ctrl+Alt+Delete, Ctrl+Shift+Esc, Win+L) are refused. Changing it needs a restart.
+  emergency_stop_hotkey: "Ctrl+Alt+Backspace"
+  # Scroll: most wheel notches per command; fewer where no standard scroll bar can be identified
+  # (browsers, WPF, Store apps), so a mis-scrolled unknown control moves only a little; pause between notches.
+  max_scroll_notches: 20
+  max_unclassified_notches: 3
+  scroll_interval_seconds: 0.05
+
+# --- Typed-command console (app/console.py) ---
+console:
+  # A typed command that lands wherever the desktop's focus or pointer is (typing, shortcuts, scroll,
+  # refresh, window controls, clicks) waits for YOU to put the window you mean in front - the console
+  # is the active window while you type, and it never switches windows itself.
+  focus_handover_seconds: 15    # how long to wait for you to switch windows before giving up
+  focus_settle_seconds: 0.5     # how long that window must stay in front (so Alt+Tab isn't mistaken for it)
+  poll_interval_seconds: 0.1    # how often to look (the emergency stop interrupts the wait)
+
+# --- Verifier (app/verifier/) ---
+verifier:
+  window_timeout_seconds: 15    # how long a newly opened app gets to show its window, or a closed one to go
+  poll_interval_seconds: 0.25   # how often to look (the emergency stop interrupts the wait)
+  text_settle_seconds: 1.0      # after typing, how long to look for the text in the field
+  shortcut_settle_seconds: 1.0  # after a keyboard shortcut, how long to look for its effect
+  scroll_settle_seconds: 1.0    # after scrolling, how long to look for the scroll position to move
+  window_state_settle_seconds: 2.0  # after minimize/maximize/restore, how long to wait for the window's state
+  max_read_characters: 100000   # a field with more text than this isn't read back (typing stays unverified)
+  # Title of each app's window (case-insensitive regular expression). Opening an app only counts
+  # as done when a NEW window matching it appears; windows already open never count. Closing an app
+  # only closes windows the assistant opened in this session, and counts as done when they're gone.
+  app_windows:
+    notepad: "Notepad$"
+    calculator: "^Calculator$"
+
+# --- Listener (app/listener/) — Phase 2 voice input ---
+# Speech-to-text runs locally (faster-whisper). Nothing here downloads anything by itself:
+# local_files_only means a missing model fails with a clear message instead of reaching for the
+# network. Raw microphone audio is never written to disk, and transcripts are never logged.
+listener:
+  enabled: false                # voice input is off by default; set true to use `python main.py --voice`
+  model_size: small             # tiny, base, small, medium, large-v2, large-v3 (small is the
+                                # smallest that handles Urdu/Hindi acceptably)
+  model_dir: data/models        # the project's own model cache (a Hugging Face cache folder, git-ignored)
+  local_files_only: true        # MUST be true: normal use never downloads. Get the model once with
+                                #   python scripts/fetch_voice_model.py
+  device: auto                  # auto, cpu or cuda. auto = CUDA only if this machine reports a usable
+                                # GPU, else CPU; if CUDA then fails to load, auto tries the CPU once and
+                                # says so. cuda = CUDA or a clear failure - never a silent switch to CPU
+  compute_type: auto            # auto, int8, int8_float32, int16, float32, float16, int8_float16.
+                                # auto = CPU: int8, else float32; CUDA: float16, int8_float16, int8,
+                                # float32 - the first one this machine reports supported. An explicit
+                                # type the device doesn't support fails; it is never swapped. A change
+                                # to the model settings takes effect after restarting the assistant.
+  language: auto                # auto-detect, or a code such as en, ur, hi (one language per utterance)
+  sample_rate: 16000            # the canonical rate the Listener and model consume; the only
+                                # accepted value (no resampling path is designed yet)
+  input_device: ""              # "" = the system default microphone. Otherwise PREFER A NAME: device
+                                # indexes are assigned fresh every run and move when hardware or
+                                # Bluetooth comes and goes, so an index that worked yesterday can
+                                # point at another microphone today. A name is matched exactly first,
+                                # then as a substring; one microphone appears once per sound path
+                                # (MME, DirectSound, WASAPI, WDM-KS) and the default path wins that
+                                # tie. Anything still ambiguous is refused, never guessed.
+  vad_filter: true              # drop silence before transcribing (Silero, bundled with faster-whisper)
+  min_silence_ms: 800           # how much silence ends an utterance
+  max_utterance_seconds: 15     # hard cap on one recording
+  # Words the recognizer should expect, which measurably improves short command recognition.
+  initial_prompt_terms: [notepad, calculator, minimize, maximize, restore, scroll, refresh, click, type]
+  voice_stop_enabled: false     # DEFERRED - spoken stop is NOT implemented. Ctrl+Alt+Backspace
+                                # remains the authoritative emergency stop (measured ~22 ms). Three
+                                # detectors were measured and none was good enough; nothing reads
+                                # this setting yet, so leaving it true would advertise a safety
+                                # feature that does not exist.
+
+# --- Speaker (app/speaker/) — Phase 2 voice output ---
+speaker:
+  enabled: true                 # the assistant speaks its reply. Only `python main.py --voice`
+                                # reaches the speaker at all: the typed console (--console) and the
+                                # health check never call it, so this does not make typed mode talk.
+  engine: auto                  # auto (online, falling back to this computer's own voice), online
+                                # (edge-tts) or offline (pyttsx3).
+                                # PRIVACY: online - and auto while the online voice is working - SEND
+                                # THE REPLY TEXT to Microsoft's Edge speech service over the network.
+                                # That is the assistant's own reply only: never microphone audio,
+                                # never a transcript, never the command you spoke or any typed text.
+                                # offline sends nothing over the network at all.
+  voice: ""                     # "" = the engine's default voice
+  rate: 0                       # relative speed in percent, -50..+50: 0 = the engine's normal
+                                # speed, +20 about 20% faster, -20 about 20% slower. The same
+                                # number means the same thing whichever engine speaks.
+
+# --- Brain (Claude API) ---
+brain:
+  # MODEL SELECTED 2026-09-30 (Phase 3 Slice 2). The approved role is capable-fast / mid-tier, and this
+  # is that tier. It is NOT the cheapest model that supports structured outputs - Haiku 4.5 is cheaper
+  # ($1/$5) and also supports them. The mid tier is chosen deliberately over the cheapest for stronger
+  # semantic and multilingual reliability, which this project needs because commands arrive in English,
+  # Roman Urdu, Urdu script and Hindi, while keeping latency and cost sensible for interactive desktop
+  # use. One primary model, no fallback in Phase 3.
+  # VERIFIED against https://platform.claude.com/docs/en/docs/about-claude/models/overview on
+  # 2026-09-30: "Claude API ID: claude-sonnet-5-5", Active, retirement not sooner than 2027-09-28,
+  # max output 128K tokens, and listed as supporting structured outputs.
+  # Whatever model is set here must also have a price below, or it is blocked.
+  model: claude-sonnet-5-5
+  timeout_seconds: 30        # per-request timeout, so a network problem fails fast
+  max_retries: 2             # SDK retries for connection errors, 429 and 5xx
+  ping_max_tokens: 256       # output cap for the minimal health/test request
+  # THINKING POLICY (Phase 3 starting setting, not a quality benchmark - acceptance may revise it).
+  # VERIFIED on 2026-09-30 at https://platform.claude.com/docs/en/build-with-claude/thinking:
+  # Sonnet 5.5 has thinking ON by default (adaptive) at default effort `high`; thinking tokens "are
+  # billed as output tokens ... and they count toward max_tokens"; it REJECTS thinking `disabled` with a
+  # 400; its lowest setting is `between_tools`, which "turns off up-front thinking", is accepted at
+  # effort `high` or below, needs no beta header, and - with no tools sent, as here - "the response
+  # contains only text". That is what keeps the output cap below derivable from the schema alone.
+  # This applies to every request this adapter makes, including the health ping, whose 256-token cap
+  # would otherwise have to share max_tokens with adaptive thinking.
+  thinking: between_tools    # `adaptive` restores the default; Sonnet 5.5 rejects `disabled`
+  effort: medium             # between_tools is rejected at `xhigh`/`max`; `high` or below is required
+  # Billable input we cannot see as text: when a structured output format is requested, the API injects
+  # its own system prompt describing it. Its size is not published, so this is a deliberate over-count -
+  # the closest published figure is the tool-use system prompt, 286 tokens on Claude Sonnet 5.5.
+  structured_output_overhead_tokens: 512
+
+# --- Cost controls (docs/build-plan Section 5.5) ---
+# Enforced by app/brain/cost_controls.py before every Claude request.
+# LIMITS STATUS: VERIFIED - confirmed by the project owner on 2026-09-16
+# (30 requests/min, 20000 input and 4096 output tokens per request, $1/day, $10/month).
+cost:
+  rate_limit_per_minute: 30             # Rate limit: max Claude requests in any rolling 60 seconds
+  max_input_tokens_per_request: 20000   # Token limit: estimated input tokens per request
+  # DERIVED 2026-09-30, re-derived after the provider-schema compatibility fix, and again after wire
+  # canonicalization. The bound is the largest raw reply app/brain/logic.validate_interpretation() would
+  # ACCEPT - not the largest the provider's schema permits, because Anthropic's structured outputs
+  # support neither string maxLength nor array maxItems, so the schema cannot express our sizes at all.
+  # In canonical form (irrelevant fields at their neutral values, since a non-neutral one is now
+  # refused): 5 intents, every `why` at its 120-character bound, a 200-character restatement, and one
+  # 1000-character type_text payload - the Executor's own limit - in Urdu script, which costs the most
+  # bytes. 3709 UTF-8 bytes, which the project's conservative estimator (2 bytes/token) counts as
+  # 1855 tokens. 3072 covers it with 1217 tokens (39.6%) of headroom.
+  #
+  # ONE KNOWN CASE IS DELIBERATELY NOT BUDGETED FOR. Five intents each carrying a maximal 1000-character
+  # Urdu payload is also application-valid and needs about 5855 tokens. That is 5000 characters dictated
+  # in a single command; covering it would double the output reservation on every request for something
+  # desktop use does not produce. It fails safely: generation reaches this cap, stop_reason is
+  # max_tokens, and the existing handling refuses the reply, so nothing half-understood is acted on.
+  #
+  # A reply that is larger for any other reason is refused too - by our own bounds if it arrives whole,
+  # by the max_tokens stop reason if it does not. Neither can reach the Planner. This figure also assumes
+  # brain.thinking stays `between_tools`, since thinking tokens would otherwise share the same budget.
+  # Purpose: bounded latency, bounded runaway output, bounded reservation size - never a quality target.
+  max_output_tokens_per_request: 3072   # Token limit: max_tokens a single request may ask for
+  daily_budget_usd: 1.00                # Money budget: hard stop per calendar day (local time)
+  monthly_budget_usd: 10.00             # Money budget: hard stop per calendar month
+  usage_db_path: data/claude_usage.db   # usage ledger - git-ignored by data/*.db
+  # USD per million tokens. PRICES STATUS: VERIFIED against
+  # https://platform.claude.com/docs/en/docs/about-claude/pricing on 2026-09-30, base (non-batch,
+  # non-cache, global) rates: Sonnet 5.5 $2/$10, Opus 5 $5/$25, Sonnet 5 $2/$10, Haiku 4.5 $1/$5.
+  # Re-check when models change. A model with no entry here is blocked, because its cost can't be
+  # budgeted - that fail-closed behaviour is the reason a wrong entry is worse than a missing one.
+  prices_usd_per_million_tokens:
+    claude-sonnet-5-5: {input: 2.00, output: 10.00}
+    claude-opus-5:     {input: 5.00, output: 25.00}
+    claude-sonnet-5:   {input: 2.00, output: 10.00}
+    claude-haiku-4-5:  {input: 1.00, output: 5.00}

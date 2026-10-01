@@ -23,8 +23,11 @@ import anthropic
 import httpx2
 import pytest
 
+import safety_guards
+
 from app import logging_setup
 from app.brain import adapter, cost_controls
+from app.executor import adapter as executor_adapter
 from app.executor import logic as executor_logic
 from app.listener import adapter as listener_adapter
 from app.listener import microphone
@@ -232,59 +235,23 @@ def pytest_collection_modifyitems(config, items):
 # flag set. Unit-test fakes are still the first line of defence; this is the barrier for the case nobody
 # thought of.
 
-class PhysicalAudioEscaped(BaseException):
-    """An ordinary test reached a real speech boundary.
+# THE GUARDS NOW LIVE AT THE REPOSITORY ROOT: conftest.py + safety_guards.py. pytest loads those for
+# EVERY test under this repository, including a file that is not under tests/ - which this file could
+# never protect, and which is how two real Notepad windows were opened during the Slice 3B
+# investigation. The names below are re-exported so the tests that import them from here keep working.
 
-    A BaseException on purpose. app/speaker/adapter.py deliberately contains ordinary exceptions so a
-    speaker defect cannot spoil a completed command - which means an Exception raised here would be
-    swallowed and reported as a quiet SpeechFailure, and the test would pass while the guard was being
-    hit. Only something outside `except Exception` can fail the run loudly."""
+PhysicalBoundaryEscaped = safety_guards.PhysicalBoundaryEscaped
+PhysicalDesktopEscaped = safety_guards.PhysicalDesktopEscaped
+PhysicalAudioEscaped = safety_guards.PhysicalAudioEscaped
+PhysicalListenerEscaped = safety_guards.PhysicalListenerEscaped
+ProviderEscaped = safety_guards.ProviderEscaped
 
-
-# The ONLY markers whose tests genuinely need physical speech. Every other real_* marker drives the
-# microphone, a model, the desktop or the API, none of which makes a sound - so none of them is exempt.
-SPEAKING_MARKERS = ("real_speaker", "real_voice_console")
-
-# Refused by import, not replaced in sys.modules: a test that installs its own fake is found in
-# sys.modules first and never consults the finder, and tests asserting these are absent from
-# sys.modules keep working.
-SPEECH_LIBRARIES = ("edge_tts", "pyttsx3")
-
-
-class _RefuseSpeechLibraries:
-    """A sys.meta_path finder that refuses to load the speech libraries.
-
-    Refusing at import time means the barrier is reached BEFORE aiohttp opens a socket and before
-    comtypes builds a SAPI object - not after."""
-
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname.split(".")[0] in SPEECH_LIBRARIES:
-            raise PhysicalAudioEscaped(
-                f"offline test attempted real speaker/network access: it tried to import "
-                f"{fullname!r}. Install a fake (see the `online`/`voice` fixtures in "
-                f"tests/test_speaker.py), or mark the test {' or '.join(SPEAKING_MARKERS)} if it is "
-                f"genuinely meant to speak.")
-        return None
-
-
-def _refuse_playback(command):
-    raise PhysicalAudioEscaped(
-        f"offline test attempted real speaker/network access: it reached winmm/MCI playback "
-        f"({command.split()[0]!r} command). Replace app.speaker.adapter._mci with a fake, or mark the "
-        f"test {' or '.join(SPEAKING_MARKERS)} if it is genuinely meant to speak.")
-
-
-@pytest.fixture(autouse=True)
-def no_physical_audio(request, monkeypatch):
-    """Guard the three boundaries that can make a real sound or a real network TTS call.
-
-    Applied to every test except the two that are meant to speak. It runs BEFORE a test's own
-    fixtures, so a fake installed by `online`, `voice` or a direct monkeypatch still wins - this is a
-    last-resort barrier, not a substitute for those fakes."""
-    if any(request.node.get_closest_marker(name) for name in SPEAKING_MARKERS):
-        return
-    monkeypatch.setattr(sys, "meta_path", [_RefuseSpeechLibraries(), *sys.meta_path])
-    monkeypatch.setattr(speaker_adapter, "_mci", _refuse_playback)
+DESKTOP_BOUNDARIES = safety_guards.DESKTOP_BOUNDARIES
+DESKTOP_MARKERS = tuple(safety_guards.DESKTOP_EXEMPT)
+SPEAKING_MARKERS = tuple(safety_guards.AUDIO_EXEMPT)
+SPEECH_LIBRARIES = safety_guards.SPEECH_LIBRARIES
+MICROPHONE_LIBRARIES = safety_guards.MICROPHONE_LIBRARIES
+MODEL_LIBRARIES = safety_guards.MODEL_LIBRARIES
 
 
 @pytest.fixture(autouse=True)

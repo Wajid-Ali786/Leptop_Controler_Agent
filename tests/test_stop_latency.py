@@ -413,7 +413,13 @@ def test_the_instrumentation_is_removed_when_transcription_raises(monkeypatch):
 
 
 def test_the_counter_is_harmless_when_no_model_is_loaded(monkeypatch):
+    # No model is loaded, so transcribe() would try to MAKE one ready - which imports faster_whisper and
+    # reads a model from disk. The project-wide listener guard refuses that import, and rightly: this
+    # test is about the COUNTER, not about loading anything. So the readiness answer is faked to the
+    # no-model outcome, and the behavioural assertion below is unchanged.
     monkeypatch.setattr(adapter, "_loaded", None)
+    monkeypatch.setattr(adapter, "_ready_model",
+                        lambda settings: adapter._unavailable(RuntimeError("no model in this test")))
     with stop_latency.counted_encoder_passes() as counter:
         assert counter is None
     measured = stop_latency.measure_transcription("probe", SETTINGS, stop_latency.silence(),

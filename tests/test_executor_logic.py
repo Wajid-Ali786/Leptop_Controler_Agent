@@ -321,12 +321,12 @@ def no_popen(monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", forbidden)
 
 
-def test_adapter_reports_a_missing_executable_without_starting_anything(no_popen):
+def test_adapter_reports_a_missing_executable_without_starting_anything(os_primitives_faked, no_popen):
     with pytest.raises(adapter.AppNotFoundError, match="nonexistentapp123.exe"):
         adapter.launch_app("nonexistentapp123.exe")
 
 
-def test_adapter_starts_the_resolved_path_without_a_shell(monkeypatch):
+def test_adapter_starts_the_resolved_path_without_a_shell(os_primitives_faked, monkeypatch):
     seen = {}
 
     class FakeProcess:
@@ -347,7 +347,7 @@ def test_adapter_starts_the_resolved_path_without_a_shell(monkeypatch):
     (OSError(22, "The requested operation requires elevation", None, 740), "needs administrator rights"),
     (PermissionError(13, "Access is denied"), "could not be started (PermissionError)"),
 ])
-def test_adapter_turns_launch_errors_into_clear_messages(monkeypatch, error, message):
+def test_adapter_turns_launch_errors_into_clear_messages(os_primitives_faked, monkeypatch, error, message):
     def failing_popen(*args, **kwargs):
         raise error
     monkeypatch.setattr(adapter.shutil, "which", lambda name: r"C:\Tools\app.exe")

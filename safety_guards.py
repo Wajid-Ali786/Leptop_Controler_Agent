@@ -1,0 +1,292 @@
+"""
+Project-wide test safety guards: the boundaries an ordinary test must never cross.
+
+WHY THIS FILE IS AT THE REPOSITORY ROOT. It is imported by the root conftest.py, which pytest loads for
+EVERY test file under this repository - not only files under tests/. That matters because a test file
+placed anywhere else bypasses tests/conftest.py entirely, and that is exactly how two real Notepad
+windows were opened during the Slice 3B investigation: a scratch pytest file outside tests/ meant none
+of the guards existed for that run.
+
+WHAT IT GUARDS, and the rule for all of them: a test may exercise as much application logic as it
+likes, and may never reach the real machine or the real network.
+
+    desktop     app/executor/adapter.py - launching, closing, pointer, keyboard, wheel, window state,
+                and the global hotkey
+    speaker     the text-to-speech libraries and the winmm/MCI playback call
+    microphone  sounddevice, which app/listener/adapter.py imports to open a stream
+    model       faster_whisper, which is heavy and can load or fetch a model
+    provider    httpx2's real HTTP transport, which is how the Anthropic client reaches the network
+
+THE SENTINELS ARE BaseException SUBCLASSES, deliberately. app/executor/logic.py and
+app/speaker/adapter.py both contain broad `except Exception` handlers by design, so a guard raising an
+ordinary Exception would be swallowed into a tidy failure message and the test would PASS while the
+boundary was being hit. That is precisely how the desktop leak went unnoticed for three test runs.
+
+EXEMPTION RULE, uniform for every guard: a test bypasses a guard only when BOTH its registered marker
+is present AND that marker's RUN_REAL_* environment gate is set. A marker alone is not enough, an
+environment variable alone is not enough, and a file name, class name or function-name prefix is NEVER
+enough - the desktop guard's first version used a `test_adapter_` prefix and that was rejected for this
+reason.
+"""
+import os
+import subprocess
+import sys
+
+
+# --- Sentinels ----------------------------------------------------------------------------------------
+
+class PhysicalBoundaryEscaped(BaseException):
+    """A test reached something real. See the module docstring for why this is not an Exception."""
+
+
+class PhysicalDesktopEscaped(PhysicalBoundaryEscaped):
+    """It would have launched, closed, clicked, typed, scrolled or re-stated a window on this computer,
+    or registered the global hotkey."""
+
+
+class PhysicalAudioEscaped(PhysicalBoundaryEscaped):
+    """It would have made a real sound, or called a network text-to-speech service."""
+
+
+class PhysicalListenerEscaped(PhysicalBoundaryEscaped):
+    """It would have opened the real microphone, or loaded the real speech model."""
+
+
+class ProviderEscaped(PhysicalBoundaryEscaped):
+    """It would have sent a real HTTP request - the path the Anthropic client uses."""
+
+
+# --- Which markers may bypass which guard, and the gate each one needs ---------------------------------
+# Mirrored from tests/conftest.OPT_IN_GATES rather than imported, so this module keeps working for a test
+# file that cannot see tests/. A test asserts the two agree, so they cannot drift apart silently.
+
+DESKTOP_EXEMPT = {
+    "real_desktop": "RUN_REAL_DESKTOP_TEST",
+    "real_elevated": "RUN_ELEVATED_TEST",
+    "real_clipboard": "RUN_REAL_CLIPBOARD_TEST",
+    "real_voice_console": "RUN_REAL_VOICE_CONSOLE_TEST",
+}
+
+AUDIO_EXEMPT = {
+    "real_speaker": "RUN_REAL_SPEAKER_TEST",
+    "real_voice_console": "RUN_REAL_VOICE_CONSOLE_TEST",
+}
+
+MICROPHONE_EXEMPT = {
+    "real_microphone": "RUN_REAL_MICROPHONE_TEST",
+    "real_recording": "RUN_REAL_RECORDING_TEST",
+    "real_transcription": "RUN_REAL_TRANSCRIPTION_TEST",
+    "real_voice_console": "RUN_REAL_VOICE_CONSOLE_TEST",
+    "real_stop_latency": "RUN_REAL_STOP_LATENCY_TEST",
+    "real_kws_latency": "RUN_REAL_KWS_TEST",
+    "real_kws_threshold": "RUN_REAL_KWS_THRESHOLD_TEST",
+    "real_vosk_stop": "RUN_REAL_VOSK_STOP_TEST",
+}
+
+MODEL_EXEMPT = {
+    "real_model": "RUN_REAL_MODEL_TEST",
+    "real_transcription": "RUN_REAL_TRANSCRIPTION_TEST",
+    "real_voice_console": "RUN_REAL_VOICE_CONSOLE_TEST",
+    "real_stop_latency_synthetic": "RUN_REAL_STOP_LATENCY_SYNTHETIC_TEST",
+    "real_stop_latency": "RUN_REAL_STOP_LATENCY_TEST",
+    "real_kws_latency": "RUN_REAL_KWS_TEST",
+    "real_kws_threshold": "RUN_REAL_KWS_THRESHOLD_TEST",
+    "real_vosk_stop": "RUN_REAL_VOSK_STOP_TEST",
+    "real_vosk_model": "RUN_REAL_VOSK_MODEL_TEST",
+}
+
+PROVIDER_EXEMPT = {
+    "real_api": "RUN_REAL_CLAUDE_TEST",
+}
+
+
+def exempt(node, allowed: dict) -> bool:
+    """True only when a registered marker is present AND its own gate is set. Both, always."""
+    for marker, gate in allowed.items():
+        if node.get_closest_marker(marker) is not None and os.environ.get(gate) == "1":
+            return True
+    return False
+
+
+# --- Desktop ------------------------------------------------------------------------------------------
+# Every function in app/executor/adapter.py that can change something outside this process, mapped to the
+# OS primitive that makes it real. A test may run the adapter FUNCTION only once it has replaced that
+# primitive - which is what its own unit tests already do. Checked when the function is called, not when
+# the fixture is set up, because a test installs its fake inside its body.
+
+DESKTOP_BOUNDARIES = (
+    "launch_app",            # subprocess.Popen - the one that opened real Notepad windows
+    "request_close",
+    "click",
+    "send_character",
+    "send_shortcut",
+    "release_keys",
+    "send_wheel_notch",
+    "request_window_state",
+    "register_hotkey",
+    "unregister_hotkey",
+    "create_message_queue",
+    "wait_for_hotkey_message",
+    "post_quit_to_thread",
+)
+
+# The OS primitives that make a desktop boundary real. An adapter unit test replaces one of these and
+# then exercises the genuine adapter function; everything else never gets that far, because the boundary
+# function itself is replaced.
+_PRIMITIVE_NAMES = ("subprocess.Popen", "ctypes.WinDLL", "adapter._keyboard_api", "adapter._hotkey",
+                    "adapter._use_physical_pixels")
+_MOUSE_LIBRARY = "pyautogui"
+
+_ORIGINALS = {}
+
+
+def remember_originals(adapter) -> None:
+    """Record the genuine boundary functions once, so they can be restored behind a primitive guard."""
+    if _ORIGINALS:
+        return
+    for name in DESKTOP_BOUNDARIES:
+        _ORIGINALS[name] = getattr(adapter, name, None)
+
+
+def _desktop_refusal(name: str, what: str) -> PhysicalDesktopEscaped:
+    return PhysicalDesktopEscaped(
+        f"offline test attempted a REAL desktop action: it reached {what}. "
+        f"Patch app.console.execute_with_recovery for an orchestration test; if this test is about "
+        f"app/executor/adapter.py itself, request the `os_primitives_faked` fixture and replace the "
+        f"Windows primitive ({name}) before calling the adapter. No argument is shown: a target can be "
+        f"a window title or typed text.")
+
+
+def install_desktop_guard(adapter, monkeypatch, *, allow_faked_primitives: bool) -> None:
+    """Two strictnesses, one rule: the real machine is never reached.
+
+    allow_faked_primitives=False - every test. The adapter's public functions are replaced, so nothing
+    above them can reach the machine and the refusal arrives early with a clear message.
+
+    allow_faked_primitives=True - the `os_primitives_faked` fixture, for tests OF the adapter. The
+    functions stay genuine, so their validation, their platform checks and their error translation can
+    all be exercised; what is replaced is the Windows primitive underneath. A test that installs its own
+    fake first wins (monkeypatch applies in order); a test that forgets hits the refuser instead of the
+    machine. Requesting the fixture therefore permits nothing by itself."""
+    remember_originals(adapter)
+    if not allow_faked_primitives:
+        for name in DESKTOP_BOUNDARIES:
+            monkeypatch.setattr(adapter, name, _boundary_refuser(name), raising=False)
+        return
+    monkeypatch.setattr(subprocess, "Popen", _primitive_refuser("subprocess.Popen"))
+    for name in ("_keyboard_api", "_hotkey", "_use_physical_pixels"):
+        monkeypatch.setattr(adapter, name, _primitive_refuser(f"adapter.{name}"), raising=False)
+    # ctypes.WinDLL is NOT replaced: merely LOADING user32 is harmless, and a test fixture legitimately
+    # constructs adapter._KeyboardApi(), which loads it. Only the two functions that build user32 inline
+    # and immediately PostMessage can act, so those two stay wrapped and delegate only once the test has
+    # replaced WinDLL itself.
+    loaded = getattr(adapter.ctypes, "WinDLL", None)
+    for name in ("request_close", "request_window_state"):
+        monkeypatch.setattr(adapter, name, _needs_faked_windll(adapter, name, loaded), raising=False)
+    # click does `import pyautogui` inside the function; a test replaces sys.modules["pyautogui"] first.
+    monkeypatch.setattr(sys, "meta_path",
+                        [RefuseLibraries({_MOUSE_LIBRARY: (PhysicalDesktopEscaped,
+                                                           "mouse-library access", DESKTOP_EXEMPT)}),
+                         *sys.meta_path])
+
+
+def _boundary_refuser(name: str):
+    def refuse(*args, **kwargs):
+        raise _desktop_refusal(", ".join(_PRIMITIVE_NAMES), f"app.executor.adapter.{name}()")
+    return refuse
+
+
+def _needs_faked_windll(adapter, name: str, loaded):
+    """request_close/request_window_state post a window message the moment they run, so they may only
+    proceed once the test has replaced ctypes.WinDLL with its own fake."""
+    original = _ORIGINALS[name]
+
+    def call(*args, **kwargs):
+        if getattr(adapter.ctypes, "WinDLL", None) is not loaded:
+            return original(*args, **kwargs)
+        if getattr(adapter.sys, "platform", "") != "win32":
+            # The test has said this is not Windows, so the function refuses on its own before it can
+            # reach anything - which is the behaviour those tests exist to check.
+            return original(*args, **kwargs)
+        raise _desktop_refusal("ctypes.WinDLL", f"app.executor.adapter.{name}()")
+    return call
+
+
+def _primitive_refuser(name: str):
+    def refuse(*args, **kwargs):
+        raise _desktop_refusal(name, f"the real {name}")
+    return refuse
+
+
+# --- Speaker, microphone and the speech model: refused at import --------------------------------------
+# Refusing the import reaches the barrier BEFORE aiohttp opens a socket, before comtypes builds a SAPI
+# object, before PortAudio claims the microphone and before a model is read from disk. A test that
+# installs its own fake is found in sys.modules first and never consults the finder.
+
+SPEECH_LIBRARIES = ("edge_tts", "pyttsx3")
+MICROPHONE_LIBRARIES = ("sounddevice",)
+MODEL_LIBRARIES = ("faster_whisper",)
+
+
+class RefuseLibraries:
+    """A sys.meta_path finder that refuses to load a real-world library."""
+
+    def __init__(self, blocked: dict):
+        self._blocked = blocked      # top-level name -> (sentinel, what it would do, allowed markers)
+
+    def find_spec(self, fullname, path=None, target=None):
+        entry = self._blocked.get(fullname.split(".")[0])
+        if entry is not None:
+            sentinel, what, markers = entry
+            raise sentinel(
+                f"offline test attempted real {what}: it tried to import {fullname!r}. Install a fake "
+                f"for the module under test, or mark the test {' or '.join(sorted(markers))} AND set "
+                f"that marker's RUN_REAL_* gate if it is genuinely meant to use this computer.")
+        return None
+
+
+def install_library_guard(monkeypatch, *, speaker: bool, microphone: bool, model: bool) -> None:
+    blocked = {}
+    if speaker:
+        blocked.update({name: (PhysicalAudioEscaped, "speaker/network TTS access", AUDIO_EXEMPT)
+                        for name in SPEECH_LIBRARIES})
+    if microphone:
+        blocked.update({name: (PhysicalListenerEscaped, "microphone access", MICROPHONE_EXEMPT)
+                        for name in MICROPHONE_LIBRARIES})
+    if model:
+        blocked.update({name: (PhysicalListenerEscaped, "speech-model loading", MODEL_EXEMPT)
+                        for name in MODEL_LIBRARIES})
+    if blocked:
+        monkeypatch.setattr(sys, "meta_path", [RefuseLibraries(blocked), *sys.meta_path])
+
+
+def refuse_playback(command):
+    raise PhysicalAudioEscaped(
+        f"offline test attempted real speaker access: it reached winmm/MCI playback "
+        f"({str(command).split()[0]!r} command). Replace app.speaker.adapter._mci with a fake, or mark "
+        f"the test real_speaker / real_voice_console with its RUN_REAL_* gate set.")
+
+
+# --- Provider -----------------------------------------------------------------------------------------
+# The lowest boundary that tells a fake transport from a real one: httpx2.MockTransport is what the
+# fake-Claude fixture installs, and httpx2.HTTPTransport is what actually opens a socket. Blocking the
+# real transport leaves loopback, subprocess and every fake untouched - and it does not depend on
+# ANTHROPIC_API_KEY being absent, which was never isolation, only luck.
+
+def install_provider_guard(monkeypatch) -> None:
+    import httpx2
+
+    def refuse(self, request, *args, **kwargs):
+        raise ProviderEscaped(
+            "offline test attempted a REAL provider request: it reached httpx2.HTTPTransport, the "
+            "transport the Anthropic client sends over. Use the `fake_claude` fixture (httpx2."
+            "MockTransport), or mark the test real_api AND set RUN_REAL_CLAUDE_TEST=1. The URL is not "
+            "shown, and neither is the request body.")
+
+    monkeypatch.setattr(httpx2.HTTPTransport, "handle_request", refuse)
+    if hasattr(httpx2, "AsyncHTTPTransport"):
+        async def refuse_async(self, request, *args, **kwargs):
+            raise ProviderEscaped(
+                "offline test attempted a REAL provider request over the async transport.")
+
+        monkeypatch.setattr(httpx2.AsyncHTTPTransport, "handle_async_request", refuse_async)

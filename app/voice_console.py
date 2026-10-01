@@ -32,6 +32,7 @@ import threading
 
 from app import console
 from app.listener import adapter, logic
+from app.planner.models import VOICE_CONSOLE, TurnContext
 from app.listener.models import (DEVICE_BUSY, LANGUAGE_UNSUPPORTED, PendingCommand, Transcript,
                                  VoiceFailure)
 from app.speaker import adapter as speaker_adapter
@@ -256,10 +257,17 @@ def run_voice_console(listen, read=input, write=print, focus=None, speaker=None)
     is what makes this whole loop testable with no microphone and no speech model.
 
     `speaker` is the session's SpeakerSettings, built once by run_voice_mode. None means say nothing,
-    which is what an injected test session does."""
+    which is what an injected test session does.
+
+    ONE TurnContext belongs to this session and nothing else: it holds the last verified action, any
+    pending clarification or plan, and the Brain-call allowance. It is never persisted, never shared
+    between launches, and there is no second context model - these are the same Slice 1B contracts the
+    typed console uses."""
     write(WELCOME)
     confirm = console.typed_confirmation(read, write)
     offer_retry = console.typed_retry_offer(read, write)
+    prompts = console.Prompts(read=read, write=write, confirm=confirm, offer_retry=offer_retry)
+    context = TurnContext()
     while True:
         try:
             line = read("voice> ")
@@ -275,29 +283,34 @@ def run_voice_console(listen, read=input, write=print, focus=None, speaker=None)
             write(HELP)
             continue
         try:
-            if not _one_utterance(listen, read, write, focus, confirm, offer_retry, speaker):
+            carry_on, context = _one_utterance(listen, read, write, focus, speaker, context, prompts)
+            if not carry_on:
                 return 0
         except LeaveVoiceMode:  # end of input while recording: abandon it and leave
             return 0
 
 
-def _one_utterance(listen, read, write, focus, confirm, offer_retry, speaker=None) -> bool:
+def _one_utterance(listen, read, write, focus, speaker, context, prompts) -> tuple[bool, TurnContext]:
     """Listen, show, let the user accept/correct/redictate/cancel, and run at most one command.
 
-    True to carry on taking commands, False when voice mode should end."""
+    (carry on taking commands?, the session state afterwards).
+
+    Everything up to acceptance - redictating, correcting a token, choosing a reading - is about WHAT WAS
+    HEARD and is not a root command: none of it touches `context`, so none of it can spend a Brain
+    allowance. The root command begins when the accepted candidate reaches _run()."""
     while True:  # redictating comes back here; nothing from the old attempt survives it
         try:
             heard = listen()
         except AttemptAbandoned:  # Ctrl+C while recording: the message is already on screen
-            return True
+            return True, context
         if isinstance(heard, VoiceFailure):
             write(heard.message)
             if heard.kind == LANGUAGE_UNSUPPORTED:
                 # One settings object is bound for the whole session, so this would fail identically
                 # on every future recording. Ending beats recording under settings known to fail.
                 write(LANGUAGE_ENDS)
-                return False
-            return True
+                return False, context
+            return True, context
         if not isinstance(heard, Transcript):
             raise TypeError(f"listen() must return a Transcript or a VoiceFailure, got "
                             f"{type(heard).__name__}")
@@ -307,7 +320,7 @@ def _one_utterance(listen, read, write, focus, confirm, offer_retry, speaker=Non
             choice = _choice(read, write)
             if choice == CANCEL:
                 write(CANCELLED)
-                return True
+                return True, context
             if choice == REDICTATE:
                 break  # the pending candidate is dropped here, and can never be run
             if choice == CORRECT:
@@ -316,11 +329,10 @@ def _one_utterance(listen, read, write, focus, confirm, offer_retry, speaker=Non
             decided, pending = _reconcile(pending, read, write)
             if decided == CANCEL:
                 write(CANCELLED)
-                return True
+                return True, context
             if decided is None:  # stay pending: nothing runs, the user decides what to do next
                 continue
-            _run(pending, write, focus, confirm, offer_retry, speaker)
-            return True
+            return True, _run(pending, write, focus, speaker, context, prompts)
 
 
 # --- Showing the pending command ------------------------------------------------------------------
@@ -413,6 +425,13 @@ def _reconcile(pending: PendingCommand, read, write):
     if as_heard.same_action_as(without):
         return ACCEPT, pending  # the punctuation made no difference at all
     if not as_heard.is_command and not without.is_command:
+        # NEITHER mechanical reading is a command. Before refusing, ask whether the line is one the
+        # Brain could read - a PURE routing question (console.is_brain_eligible) that parses, checks
+        # resolvability and does nothing else: no provider call, no allowance, no context change.
+        # Order matters and is deliberate: reconciliation runs FIRST, so a deterministic command with a
+        # full stop the recogniser added is still offered as reading 2 and still costs nothing.
+        if console.is_brain_eligible(pending.candidate):
+            return ACCEPT, pending
         write(NOT_A_COMMAND)
         return None, pending
     return _choose_reading(pending, as_heard, trimmed, without, read, write)
@@ -446,16 +465,26 @@ def _reading(preview) -> str:
 
 # --- Handing it over, unchanged --------------------------------------------------------------------
 
-def _run(pending: PendingCommand, write, focus, confirm, offer_retry, speaker=None) -> None:
+def _run(pending: PendingCommand, write, focus, speaker, context, prompts) -> TurnContext:
     """The accepted candidate, byte for byte, into the same pipeline a typed command uses.
 
-    `confirm` is the console's own KEYBOARD confirmation: a Medium-or-above action still asks the
-    user to type yes, and no transcript can answer it."""
+    This is the one root command boundary: handle_typed_line() routes it, and a line that already
+    resolves runs locally with no model call, exactly as it did in Phase 2.
+
+    frontend=VOICE_CONSOLE is the Brain's capability guard, not a label. Voice has no reliable focus
+    hand-over for click, type_text, shortcut, scroll, refresh or window_control, so a Brain-planned step
+    of those kinds is refused by the Planner before any action exists. It restricts only what the BRAIN
+    may newly plan: the deterministic commands Phase 2 already ships are untouched by it.
+
+    Every question asked from here on is on the KEYBOARD - plan acceptance, a clarification answer, a
+    correction, and the Medium-or-above safety confirmation inside the Executor. No transcript can
+    answer any of them, and no new recording window is opened."""
     log.info("Spoken command accepted after %d correction(s)", pending.corrections)  # never the text
-    reply = console.handle_command(pending.candidate, confirm=confirm, offer_retry=offer_retry,
-                                   focus=focus)
+    reply, context = console.handle_typed_line(pending.candidate, context, prompts, focus=focus,
+                                               frontend=VOICE_CONSOLE)
     write(reply.message)
     _speak(reply, speaker, write)
+    return context
 
 
 def _speak(reply, speaker, write) -> None:

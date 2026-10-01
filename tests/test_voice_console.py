@@ -73,10 +73,13 @@ def ran(monkeypatch):
     """Records every app.console.handle_command call instead of running it."""
     calls = []
 
-    def handle_command(text, confirm=None, offer_retry=None, focus=None):
-        calls.append(dict(text=text, confirm=confirm, offer_retry=offer_retry, focus=focus))
-        return console.CommandReply(console.Status.RAN, "pretend it ran")
-    monkeypatch.setattr(console, "handle_command", handle_command)
+    def handle_typed_line(text, context, prompts, focus=None, interpret=None, *, frontend=None):
+        # Since Slice 3B the voice console hands an accepted candidate to the SHARED orchestration,
+        # which routes it: a resolved command still runs locally, exactly as handle_command did.
+        calls.append(dict(text=text, confirm=prompts.confirm, offer_retry=prompts.offer_retry,
+                          focus=focus, frontend=frontend, context=context))
+        return console.CommandReply(console.Status.RAN, "pretend it ran"), context
+    monkeypatch.setattr(console, "handle_typed_line", handle_typed_line)
     return calls
 
 
@@ -302,11 +305,24 @@ def test_the_measured_punctuation_cases_all_ask(ran, spoken, trimmed):
     assert f"[1] [{spoken}]" in screen.text and f"[2] [{trimmed}]" in screen.text
 
 
-def test_a_line_that_is_not_a_command_either_way_runs_nothing(ran):
-    """"minimize." is unknown, and so is "minimize"... no: trimmed IS a command, so this one asks.
-    A line that is nothing either way just reports."""
-    screen, _, _, _ = run(say("kuch bhi bolo."), "listen", "a", "x", "exit")
-    assert ran == [] and voice_console.NOT_A_COMMAND in screen.lines
+def test_a_line_that_is_not_a_command_either_way_now_reaches_the_brain(ran):
+    """CHANGED IN SLICE 3B, deliberately. Neither mechanical reading is a command, so Phase 2 stopped
+    here with NOT_A_COMMAND. Now reconciliation asks the PURE routing question first: a line the Brain
+    could read is released to the shared orchestration instead of being refused locally.
+
+    This is what stops a loose request being trapped forever just because the recogniser added a full
+    stop. A line that is not even BrainEligible still gets NOT_A_COMMAND - the next test."""
+    screen, _, _, _ = run(say("kuch bhi bolo."), "listen", "a", "exit")
+    assert len(ran) == 1 and ran[0]["text"] == "kuch bhi bolo."
+    assert ran[0]["frontend"] is not None, "and it plans as the voice console"
+    assert voice_console.NOT_A_COMMAND not in screen.lines
+
+
+def test_a_line_the_brain_cannot_help_with_either_still_reports_locally(ran):
+    """The other half: only an empty line is not BrainEligible, and it never reaches the Brain."""
+    from app import console as typed
+    assert not typed.is_brain_eligible("   ")
+    assert typed.is_brain_eligible("kuch bhi bolo.")
 
 
 def test_minimize_with_a_full_stop_offers_the_command_it_almost_was(ran):
@@ -472,7 +488,9 @@ def test_the_voice_console_does_not_parse_or_act_by_itself():
     reached = {f"{node.func.value.id}.{node.func.attr}" for node in ast.walk(tree)
                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                and isinstance(node.func.value, ast.Name)}
-    assert reached & {"console.handle_command"}, "the one way anything runs"
+    # Slice 3B: the entry point is the shared orchestration, which routes to run_action - still the
+    # one way anything runs, and still inside app/console.py.
+    assert reached & {"console.handle_typed_line"}, "the one way anything runs"
     # The only adapter it may reach is the Listener's, and only for listening (D-6). Any Executor
     # adapter is out of the question - the import rule above already forbids importing one.
     assert {name for name in reached if name.startswith("adapter.")} <= {
@@ -602,11 +620,11 @@ def test_nothing_is_spoken_after_the_emergency_stop(ran, mouth, monkeypatch):
     """Someone who just hit Ctrl+Alt+Backspace wants quiet, not a spoken summary."""
     recorder = mouth()
 
-    def stopped(text, confirm=None, offer_retry=None, focus=None):
+    def stopped(text, context, prompts, focus=None, interpret=None, *, frontend=None):
         ran.append(dict(text=text))
-        return console.CommandReply(console.Status.STOPPED, "Stopped. Nothing else was done.")
+        return console.CommandReply(console.Status.STOPPED, "Stopped. Nothing else was done."), context
 
-    monkeypatch.setattr(console, "handle_command", stopped)
+    monkeypatch.setattr(console, "handle_typed_line", stopped)
     screen, _, _, _ = spoken_run(say("open notepad"), "listen", "a", "exit")
     assert ran, "the command was still attempted"
     assert "Stopped. Nothing else was done." in screen.lines, "and the outcome is still printed"
@@ -623,11 +641,11 @@ def test_every_other_outcome_is_spoken_including_the_failures(ran, mouth, monkey
     """A failure reason is exactly what someone listening needs to hear."""
     recorder = mouth()
 
-    def replied(text, confirm=None, offer_retry=None, focus=None):
+    def replied(text, context, prompts, focus=None, interpret=None, *, frontend=None):
         ran.append(dict(text=text))
-        return console.CommandReply(status, message)
+        return console.CommandReply(status, message), context
 
-    monkeypatch.setattr(console, "handle_command", replied)
+    monkeypatch.setattr(console, "handle_typed_line", replied)
     spoken_run(say("open notepad"), "listen", "a", "exit")
     assert recorder.said == [message]
 
@@ -639,7 +657,7 @@ def test_speaking_happens_after_the_whole_pipeline_not_before_it():
     body = next(node for node in ast.walk(ast.parse(source))
                 if isinstance(node, ast.FunctionDef) and node.name == "_run")
     steps = [ast.unparse(statement) for statement in body.body]
-    handled = next(index for index, step in enumerate(steps) if "handle_command" in step)
+    handled = next(index for index, step in enumerate(steps) if "handle_typed_line" in step)
     written = next(index for index, step in enumerate(steps) if step.startswith("write(reply.message)"))
     said = next(index for index, step in enumerate(steps) if step.startswith("_speak("))
     assert handled < written < said, steps
@@ -654,8 +672,10 @@ def test_the_typed_console_never_speaks(monkeypatch):
         raise AssertionError("the typed console must never speak")
 
     monkeypatch.setattr(voice_console.speaker_adapter, "speak", must_not_speak)
-    monkeypatch.setattr(typed, "handle_command",
-                        lambda text, **rest: typed.CommandReply(typed.Status.RAN, "pretend it ran"))
+    # handle_typed_line is what the typed loop calls since Slice 3A; it returns (reply, context).
+    monkeypatch.setattr(typed, "handle_typed_line",
+                        lambda text, context, prompts, **rest: (
+                            typed.CommandReply(typed.Status.RAN, "pretend it ran"), context))
     screen, script = Screen(), Script("open notepad", "exit")
     assert typed.run_console(read=script, write=screen) == 0
     assert "pretend it ran" in screen.lines, "the typed console still works"

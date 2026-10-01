@@ -22,6 +22,7 @@ import pytest
 
 from app.speaker import adapter
 from app.speaker.models import SpeakerSettings, SpeechFailure, Spoken
+import conftest as root_conftest   # the REPOSITORY-ROOT conftest: the outer safety boundary
 from tests import conftest
 from tests.conftest import PhysicalAudioEscaped
 
@@ -151,17 +152,16 @@ def test_only_the_two_speaking_markers_are_exempt():
 
 def test_the_guard_covers_both_speech_libraries_and_playback():
     assert set(conftest.SPEECH_LIBRARIES) == {"edge_tts", "pyttsx3"}
-    guard = conftest.no_physical_audio.__wrapped__ if hasattr(conftest.no_physical_audio, "__wrapped__") \
-        else conftest.no_physical_audio
+    guard = root_conftest.no_physical_speaker_or_listener
     import inspect
     body = inspect.getsource(guard)
-    assert "meta_path" in body and "_mci" in body, "both barriers are installed"
-    assert "SPEAKING_MARKERS" in body, "and only the speaking markers are exempt"
+    assert "install_library_guard" in body and "_mci" in body, "both barriers are installed"
+    assert "AUDIO_EXEMPT" in body, "and only the speaking markers are exempt"
 
 
 def test_the_guard_is_autouse_so_a_new_test_is_protected_by_default():
     import inspect
-    source = inspect.getsource(conftest)
-    block = source.split("def no_physical_audio")[0].splitlines()[-2:]
+    source = inspect.getsource(root_conftest)
+    block = source.split("def no_physical_speaker_or_listener")[0].splitlines()[-2:]
     assert any("autouse=True" in line for line in block), (
         "a test must not have to remember to ask for protection")

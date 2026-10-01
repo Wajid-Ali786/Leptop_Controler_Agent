@@ -7,6 +7,7 @@ and real input is blocked. The REAL parser, the REAL Executor pipeline, the REAL
 REAL Verifier logic decide everything else - the console only asks and reports.
 """
 import ast
+import contextlib
 import dataclasses
 import logging
 import threading
@@ -18,6 +19,7 @@ import pytest
 
 import main
 from app import console
+from app.brain import logic as brain_logic
 from app.console import CommandReply, FocusHandover, Status, handle_command, run_console
 from app.executor import adapter, commands, emergency_stop, hotkey
 from app.executor import logic as executor_logic
@@ -209,7 +211,7 @@ def requests(world):
 def test_a_parsed_command_is_run_through_execute_with_recovery(world, monkeypatch):
     seen = []
     monkeypatch.setattr(console, "execute_with_recovery",
-                        lambda action, confirm=None, offer_retry=None:
+                        lambda action, confirm=None, offer_retry=None, **floor:
                         seen.append(action) or ActionResult(action, True, "ok"))
     reply = handle_command("open notepad")
     assert seen == [ExecutorAction(OPEN_APP, "notepad")]
@@ -331,7 +333,7 @@ def test_an_unclassified_action_kind_fails_safe_by_asking_for_hand_over(caplog):
 ])
 def test_only_actions_that_land_on_the_desktop_wait_for_hand_over(world, monkeypatch, line, hands_over):
     monkeypatch.setattr(console, "execute_with_recovery",
-                        lambda action, confirm=None, offer_retry=None: ActionResult(action, True, "ok"))
+                        lambda action, confirm=None, offer_retry=None, **floor: ActionResult(action, True, "ok"))
     focus = ScriptedFocus()
     handle_command(line, focus=focus)
     assert focus.calls == ([console.HAND_OVER_PROMPT] if hands_over else [])
@@ -516,7 +518,11 @@ def test_the_loop_runs_commands_until_the_user_leaves(world):
     scripted = ScriptedConsole(["minimize", "", "   ", "nonsense", "exit"])
     assert run_console(read=scripted.read, write=scripted.write, focus=ScriptedFocus()) == 0
     assert "Minimized the window." in scripted.output
-    assert commands.UNKNOWN_MESSAGE in scripted.output
+    # Since Slice 3A an unrecognised line is BrainEligible, and with no reasoning service reachable the
+    # console shows the frozen unavailable sentence and NOTHING else - not the parser's explanation
+    # (Slice 3A amendment: that message must be the whole message).
+    assert brain_logic.UNAVAILABLE_MESSAGE in scripted.output
+    assert commands.UNKNOWN_MESSAGE not in scripted.output
     assert scripted.prompts.count("> ") == 5  # blank lines are simply ignored
 
 
@@ -539,7 +545,8 @@ def test_ctrl_c_at_the_prompt_leaves_the_console(world):
 def test_ctrl_c_during_an_action_says_it_is_not_the_emergency_stop(world, monkeypatch):
     def interrupt(*args, **kwargs):
         raise KeyboardInterrupt
-    monkeypatch.setattr(console, "handle_command", interrupt)
+    # The loop entry point is handle_typed_line since Slice 3A; it calls run_action for a local command.
+    monkeypatch.setattr(console, "handle_typed_line", interrupt)
     scripted = ScriptedConsole(["minimize"])
     assert run_console(read=scripted.read, write=scripted.write, focus=ScriptedFocus()) == 1
     assert console.INTERRUPTED in scripted.output
@@ -548,7 +555,7 @@ def test_ctrl_c_during_an_action_says_it_is_not_the_emergency_stop(world, monkey
 def test_an_unexpected_failure_reports_its_type_only_and_keeps_going(world, monkeypatch, caplog):
     def broken(*args, **kwargs):
         raise RuntimeError(SECRET)
-    monkeypatch.setattr(console, "handle_command", broken)
+    monkeypatch.setattr(console, "handle_typed_line", broken)
     scripted = ScriptedConsole([f"type {SECRET}", "exit"])
     with caplog.at_level(logging.DEBUG):
         assert run_console(read=scripted.read, write=scripted.write, focus=ScriptedFocus()) == 0
@@ -610,7 +617,9 @@ def test_the_console_imports_no_adapter_and_only_one_way_to_act():
             imported.setdefault("", set()).update(alias.name for alias in node.names)
     assert not any("adapter" in module for module in imported), imported
     assert not any(name in ("pyautogui", "ctypes", "pywinauto") for names in imported.values() for name in names)
-    assert imported["app.executor.logic"] == {"execute_with_recovery"}
+    assert imported["app.executor.logic"] == {"execute_with_recovery", "resolve"}, (
+        "execute_with_recovery stays the only way to act; resolve() is the pure routing question, "
+        "proven side-effect free by tests/test_executor_resolve.py")
 
 
 def test_the_console_only_reads_from_the_verifier():
@@ -638,6 +647,10 @@ def test_main_console_starts_the_console(monkeypatch):
     started = []
     monkeypatch.setattr(main, "run_console", lambda: started.append(True) or 0)
     monkeypatch.setattr(main, "run_health_check", lambda **kwargs: pytest.fail("the console must not run checks"))
+    # main() wraps the console in hotkey.listening(), which really registers a global hotkey on this
+    # computer and spins a message-queue thread. This test is about which function main picks, not about
+    # the hotkey, so the real registration is replaced - the central desktop guard found it doing this.
+    monkeypatch.setattr(main.hotkey, "listening", contextlib.nullcontext)
     assert main.main(["--console"]) == 0 and started == [True]
 
 

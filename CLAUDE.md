@@ -73,3 +73,14 @@ Phase 2 — Voice: COMPLETE (Done-when verified 2026-09-29). Evidence, and the f
   mode targets the console window, and Roman Urdu speech can come back in Devanagari or Urdu script,
   so the Brain will need three scripts rather than one.
 Model selection is still PENDING - deferred to Phase 3 (see brain.model in config/config.yaml).
+
+## Test safety rule (added 2026-10-01, after a real desktop side-effect incident)
+- Never run a pytest or scratch probe that can reach a physical or provider boundary from
+  outside the repository's protected pytest root. conftest.py and safety_guards.py at the
+  repository root are the outer boundary; a file outside it gets no guards at all.
+- Normal/offline tests must rely on the project-wide fail-closed guards, not on high-level
+  mocks alone. A mock on the wrong level is not isolation: when a refactor moves the level
+  being mocked, the tests keep passing while the machine is acted on.
+- Never claim "no physical/provider action occurred" unless that specific boundary has
+  evidence — from a guard that fired, or from an independent observation. Verify each
+  boundary separately; never infer one from another.

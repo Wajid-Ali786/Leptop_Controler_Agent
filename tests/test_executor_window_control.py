@@ -552,7 +552,7 @@ def fake_post(monkeypatch):
 
 
 @pytest.mark.parametrize("operation, command", [("minimize", 0xF020), ("maximize", 0xF030), ("restore", 0xF120)])
-def test_adapter_posts_the_title_bar_system_command(fake_post, operation, command):
+def test_adapter_posts_the_title_bar_system_command(os_primitives_faked, fake_post, operation, command):
     adapter.request_window_state(123, operation)
     assert fake_post.posted == [(123, 0x0112, command, 0)]
 
@@ -562,13 +562,13 @@ def test_adapter_posts_the_title_bar_system_command(fake_post, operation, comman
     (5, adapter.WindowControlError, "it runs with administrator rights"),
     (87, adapter.WindowControlError, "Windows refused the request (error 87)"),
 ])
-def test_adapter_turns_windows_errors_into_clear_ones(fake_post, error, exception, message):
+def test_adapter_turns_windows_errors_into_clear_ones(os_primitives_faked, fake_post, error, exception, message):
     fake_post.answer.update(result=0, error=error)
     with pytest.raises(exception, match=message.replace("(", r"\(").replace(")", r"\)")):
         adapter.request_window_state(123, "maximize")
 
 
-def test_adapter_refuses_off_windows(monkeypatch):
+def test_adapter_refuses_off_windows(os_primitives_faked, monkeypatch):
     monkeypatch.setattr(adapter.sys, "platform", "linux")
     with pytest.raises(adapter.WindowControlError, match="only supported on Windows"):
         adapter.request_window_state(123, "minimize")

@@ -568,12 +568,12 @@ def fake_send_input(monkeypatch):
 DOWN, UP, EXTENDED = 0, 0x2, 0x1
 
 
-def test_adapter_sends_the_whole_shortcut_in_one_batch(fake_send_input):
+def test_adapter_sends_the_whole_shortcut_in_one_batch(os_primitives_faked, fake_send_input):
     assert adapter.send_shortcut(("Ctrl",), "C") == (4, 4)
     assert fake_send_input.batches == [[(0x11, DOWN), (0x43, DOWN), (0x43, UP), (0x11, UP)]]
 
 
-def test_adapter_marks_the_win_key_extended_and_releases_in_reverse(fake_send_input):
+def test_adapter_marks_the_win_key_extended_and_releases_in_reverse(os_primitives_faked, fake_send_input):
     adapter.send_shortcut(("Win",), "D")
     adapter.send_shortcut(("Alt",), "Tab")
     assert fake_send_input.batches == [
@@ -582,12 +582,12 @@ def test_adapter_marks_the_win_key_extended_and_releases_in_reverse(fake_send_in
     ]
 
 
-def test_adapter_reports_how_many_events_windows_accepted(fake_send_input):
+def test_adapter_reports_how_many_events_windows_accepted(os_primitives_faked, fake_send_input):
     fake_send_input.answer["accepted"] = 2
     assert adapter.send_shortcut(("Alt",), "F4") == (2, 4)
 
 
-def test_adapter_release_taps_an_unassigned_key_before_releasing_alt_or_win(fake_send_input):
+def test_adapter_release_taps_an_unassigned_key_before_releasing_alt_or_win(os_primitives_faked, fake_send_input):
     assert adapter.release_keys(("Alt",), "F4") is True
     assert adapter.release_keys(("Ctrl",), "Z") is True
     assert fake_send_input.batches == [
@@ -596,7 +596,7 @@ def test_adapter_release_taps_an_unassigned_key_before_releasing_alt_or_win(fake
     ]
 
 
-def test_adapter_includes_scan_codes(fake_send_input, monkeypatch):
+def test_adapter_includes_scan_codes(os_primitives_faked, fake_send_input, monkeypatch):
     seen = []
     api = adapter._keyboard_api()
     real = api.SendInput
@@ -605,7 +605,7 @@ def test_adapter_includes_scan_codes(fake_send_input, monkeypatch):
     assert seen == [0x11 + 1000, 0x41 + 1000, 0x41 + 1000, 0x11 + 1000]
 
 
-def test_adapter_refuses_off_windows(monkeypatch):
+def test_adapter_refuses_off_windows(os_primitives_faked, monkeypatch):
     monkeypatch.setattr(adapter.sys, "platform", "linux")
     with pytest.raises(adapter.ShortcutError, match="only supported on Windows"):
         adapter.send_shortcut(("Ctrl",), "C")

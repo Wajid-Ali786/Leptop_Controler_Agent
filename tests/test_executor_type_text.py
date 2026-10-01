@@ -547,36 +547,36 @@ def fake_send_input(monkeypatch):
     return SimpleNamespace(calls=calls, answer=answer)
 
 
-def test_adapter_sends_a_unicode_character_down_and_up_in_one_call(fake_send_input):
+def test_adapter_sends_a_unicode_character_down_and_up_in_one_call(os_primitives_faked, fake_send_input):
     adapter.send_character("a")
     assert fake_send_input.calls == [[(1, 0, ord("a"), 0x4), (1, 0, ord("a"), 0x4 | 0x2)]]
 
 
-def test_adapter_presses_enter_for_a_line_break(fake_send_input):
+def test_adapter_presses_enter_for_a_line_break(os_primitives_faked, fake_send_input):
     adapter.send_character("\n")
     assert fake_send_input.calls == [[(1, 0x0D, 0, 0), (1, 0x0D, 0, 0x2)]]
 
 
-def test_adapter_sends_both_halves_of_an_emoji_in_one_call(fake_send_input):
+def test_adapter_sends_both_halves_of_an_emoji_in_one_call(os_primitives_faked, fake_send_input):
     adapter.send_character("\U0001F600")
     assert fake_send_input.calls == [[(1, 0, 0xD83D, 0x4), (1, 0, 0xD83D, 0x6), (1, 0, 0xDE00, 0x4), (1, 0, 0xDE00, 0x6)]]
 
 
 @pytest.mark.parametrize("accepted, partly", [(0, False), (1, True)])
-def test_adapter_reports_refused_input_without_the_character(fake_send_input, accepted, partly):
+def test_adapter_reports_refused_input_without_the_character(os_primitives_faked, fake_send_input, accepted, partly):
     fake_send_input.answer["accepted"] = accepted
     with pytest.raises(adapter.TypingError) as info:
         adapter.send_character("Z")
     assert info.value.partly_sent is partly and "Z" not in str(info.value)
 
 
-def test_adapter_sends_exactly_one_character(monkeypatch):
+def test_adapter_sends_exactly_one_character(os_primitives_faked, monkeypatch):
     monkeypatch.setattr(adapter.sys, "platform", "win32")
     with pytest.raises(adapter.TypingError, match="exactly one character"):
         adapter.send_character("ab")
 
 
-def test_adapter_refuses_off_windows(monkeypatch):
+def test_adapter_refuses_off_windows(os_primitives_faked, monkeypatch):
     monkeypatch.setattr(adapter.sys, "platform", "linux")
     with pytest.raises(adapter.TypingError, match="only supported on Windows"):
         adapter.send_character("a")

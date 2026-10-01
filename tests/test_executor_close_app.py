@@ -617,7 +617,7 @@ def fake_user32(monkeypatch):
     return install
 
 
-def test_adapter_sends_wm_close_to_the_window(fake_user32):
+def test_adapter_sends_wm_close_to_the_window(os_primitives_faked, fake_user32):
     user32 = fake_user32(result=1)
     adapter.request_close(777)
     assert user32.PostMessageW.posted == [(777, 0x0010, 0, 0)]
@@ -628,13 +628,13 @@ def test_adapter_sends_wm_close_to_the_window(fake_user32):
     (5, adapter.WindowCloseError, "it runs with administrator rights, and the assistant doesn't run elevated"),
     (87, adapter.WindowCloseError, "Windows refused the request (error 87)"),
 ])
-def test_adapter_turns_windows_errors_into_clear_messages(fake_user32, last_error, error, message):
+def test_adapter_turns_windows_errors_into_clear_messages(os_primitives_faked, fake_user32, last_error, error, message):
     fake_user32(result=0, last_error=last_error)
     with pytest.raises(error, match=re.escape(message)):
         adapter.request_close(777)
 
 
-def test_adapter_refuses_off_windows(monkeypatch):
+def test_adapter_refuses_off_windows(os_primitives_faked, monkeypatch):
     monkeypatch.setattr(adapter.sys, "platform", "linux")
     with pytest.raises(adapter.WindowCloseError, match="only supported on Windows"):
         adapter.request_close(777)

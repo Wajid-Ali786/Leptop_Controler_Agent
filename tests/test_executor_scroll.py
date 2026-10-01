@@ -523,18 +523,18 @@ def fake_send_input(monkeypatch):
     return SimpleNamespace(events=events, answer=answer)
 
 
-def test_adapter_sends_one_wheel_notch_per_call(fake_send_input):
+def test_adapter_sends_one_wheel_notch_per_call(os_primitives_faked, fake_send_input):
     assert adapter.send_wheel_notch(up=True) is True
     assert adapter.send_wheel_notch(up=False) is True
     assert fake_send_input.events == [[(0, 0x0800, 120)], [(0, 0x0800, 0xFFFFFF88)]]  # +120 / -120
 
 
-def test_adapter_reports_a_refused_notch(fake_send_input):
+def test_adapter_reports_a_refused_notch(os_primitives_faked, fake_send_input):
     fake_send_input.answer["accepted"] = 0
     assert adapter.send_wheel_notch(up=False) is False
 
 
-def test_adapter_refuses_off_windows(monkeypatch):
+def test_adapter_refuses_off_windows(os_primitives_faked, monkeypatch):
     monkeypatch.setattr(adapter.sys, "platform", "linux")
     with pytest.raises(adapter.ShortcutError, match="scrolling is only supported on Windows"):
         adapter.send_wheel_notch(up=True)
