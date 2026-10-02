@@ -59,7 +59,7 @@ git log, git show) are fine. Stage files (git add) only when the owner explicitl
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 3 — Brain + Planner. DESIGN/AUDIT only; not started.
+Current phase: 4 — Memory. DESIGN/AUDIT ONLY; NOT STARTED.
 Phase 0 — Foundation: COMPLETE (Done-when checklist passed 2026-09-16; tagged v0.1).
 Phase 1 — Basic Computer Control: COMPLETE (Done-when verified 2026-09-20).
   Verified by TWO runs of scripts/phase1_checklist.py, because the real-desktop and
@@ -72,7 +72,13 @@ Phase 2 — Voice: COMPLETE (Done-when verified 2026-09-29). Evidence, and the f
   emergency stop is NOT implemented (Ctrl+Alt+Backspace stays authoritative), TYPE_TEXT from voice
   mode targets the console window, and Roman Urdu speech can come back in Devanagari or Urdu script,
   so the Brain will need three scripts rather than one.
-Model selection is still PENDING - deferred to Phase 3 (see brain.model in config/config.yaml).
+Phase 3 — Brain + Planner: COMPLETE (Done-when verified 2026-10-02). Evidence, and the eight
+  limitations it carries, are in /docs/phase3-closeout.md — read that before starting Phase 4. In
+  short: Voice may plan only open_app and close_app until focus handover is redesigned; a window
+  whose ownership token can't be attached is not automatically closable; a destroyed-and-recreated
+  window refuses rather than guessing; persistent memory is Phase 4, broad conversational context
+  Phase 6, and communication integrations Phase 10.
+Model selection is RESOLVED: brain.model = claude-sonnet-5-5 (config/config.yaml).
 
 ## Test safety rule (added 2026-10-01, after a real desktop side-effect incident)
 - Never run a pytest or scratch probe that can reach a physical or provider boundary from

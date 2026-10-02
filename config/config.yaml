@@ -39,6 +39,14 @@ safety:
 
 # --- Folder paths ---
 
+# --- Memory (app/memory/) ---
+memory:
+  # The structured memory database (docs/step3 Section 1 puts it under data/; data/*.db is git-ignored).
+  # This is the PATH only - remembered facts never live in config, which is in source control.
+  # A relative path resolves under the project root. The file is created only when memory is
+  # initialised explicitly: a missing database is reported, never silently replaced by an empty one.
+  db_path: data/memory.db
+
 # --- Logging (app/logging_setup.py) ---
 logging:
   file: logs/companion.log   # rotated copies: companion.1.log, companion.2.log, ... (git-ignored by logs/*.log)

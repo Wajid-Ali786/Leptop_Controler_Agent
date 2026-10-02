@@ -7,6 +7,8 @@ rule proved here is uniform: a test may exercise as much application logic as it
 reach the real machine or the real network. Bypassing a guard needs a registered marker AND that
 marker's RUN_REAL_* gate - never a file name, a class name or a function-name prefix.
 """
+from pathlib import Path
+
 import pytest
 
 import safety_guards
@@ -14,7 +16,7 @@ from app.brain import adapter as brain_adapter
 from app.executor import adapter as executor_adapter
 from app.listener import adapter as listener_adapter
 from safety_guards import (PhysicalAudioEscaped, PhysicalDesktopEscaped, PhysicalListenerEscaped,
-                           ProviderEscaped)
+                           ProviderEscaped, RealDatabaseEscaped)
 
 FAKE_KEY = "sk-ant-api03-" + "A" * 80 + "-ZZtestZZ"      # shaped like a real key, and not one
 
@@ -280,6 +282,7 @@ CATEGORIES = {
     "microphone": safety_guards.MICROPHONE_EXEMPT,
     "model": safety_guards.MODEL_EXEMPT,
     "provider": safety_guards.PROVIDER_EXEMPT,
+    "database": safety_guards.DATABASE_EXEMPT,
 }
 
 
@@ -323,7 +326,7 @@ def test_every_real_category_this_project_has_is_in_the_matrix():
     eight §11 names, each mapped to a gate."""
     everything = {marker for allowed in CATEGORIES.values() for marker in allowed}
     for required in ("real_desktop", "real_elevated", "real_clipboard", "real_microphone",
-                     "real_voice_console", "real_speaker", "real_model", "real_api"):
+                     "real_voice_console", "real_speaker", "real_model", "real_api", "real_database"):
         assert required in everything, required
 
 
@@ -339,6 +342,118 @@ def test_a_wrong_marker_does_not_open_another_category(category, monkeypatch):
             if marker in other_allowed:
                 continue                      # real_voice_console deliberately spans several
             assert not safety_guards.exempt(Node(marker), other_allowed), f"{marker} opened {other}"
+
+
+# --- The two databases that belong to the user ---------------------------------------------------------
+# data/memory.db (structured memory) and data/claude_usage.db (the Claude usage ledger). Before the
+# central guard existed the ledger was protected only by whichever fixture a test happened to request -
+# the same per-test-mocking shape that opened real Notepad windows in Slice 3B.
+#
+# NOTE ON WHAT IS ASSERTED. Not "the real file must not exist": in normal use it SHOULD exist, and a test
+# whose invariant is its absence would start failing the day the owner uses the feature. What is asserted
+# is that this test neither created, modified nor read it - by snapshotting the file's state and by
+# proving the configured path resolves inside this test's own temporary area.
+
+def real_database(name):
+    from config.settings import PROJECT_ROOT
+    return PROJECT_ROOT / "data" / name
+
+
+def snapshot(path):
+    """Whether the file is there, and if so its size and modification time. Works either way."""
+    if not path.exists():
+        return ("absent",)
+    stat = path.stat()
+    return ("present", stat.st_size, stat.st_mtime_ns)
+
+
+def test_the_memory_database_path_resolves_inside_this_test(tmp_path):
+    """Item 19. The configured path is redirected, so the real file is not even named."""
+    from app.memory import logic as memory_logic
+    resolved = memory_logic.database_path()
+    assert resolved.is_relative_to(tmp_path), resolved
+    assert resolved != real_database("memory.db")
+
+
+def test_the_usage_ledger_path_resolves_inside_this_test(tmp_path):
+    """Item 20. The gap this guard closed: previously this depended on the test's own fixtures."""
+    from app.brain import cost_controls
+    resolved = cost_controls._ledger_path()
+    assert resolved.is_relative_to(tmp_path), resolved
+    assert resolved != real_database("claude_usage.db")
+
+
+def test_real_memory_use_never_touches_the_users_memory_database():
+    """Item 21. A full initialise/write/wipe cycle through production code, with the real file's state
+    compared before and after - whether or not it exists."""
+    import sqlite3
+
+    from app.memory import logic as memory_logic
+    from app.memory.models import MemoryDatabase
+    real = real_database("memory.db")
+    before = snapshot(real)
+
+    created = memory_logic.initialize()
+    assert isinstance(created, MemoryDatabase), getattr(created, "message", created)
+    with sqlite3.connect(created.path) as conn:
+        conn.execute("INSERT INTO people (name, created_at) VALUES ('Ali', 1.0)")
+    memory_logic.wipe()
+
+    assert snapshot(real) == before, "the user's own memory database changed"
+    assert Path(created.path) != real
+
+
+def test_real_ledger_use_never_touches_the_users_usage_database(fake_claude):
+    """Item 22. The ledger genuinely exists on this machine, so this proves the point for a file that
+    is present, not merely for a missing one."""
+    from app.brain import cost_controls
+    real = real_database("claude_usage.db")
+    before = snapshot(real)
+
+    request_id = cost_controls.authorize(model="test-model", prompt="hello", max_tokens=16)
+    cost_controls.release_reservation(request_id)
+
+    assert snapshot(real) == before, "the user's own usage ledger changed"
+
+
+def test_a_database_inside_the_repository_is_refused_outright(tmp_path):
+    """The second layer. The path redirect could be refactored around; this cannot - building a
+    repository path by hand and connecting to it fails loudly instead of quietly reaching data/."""
+    import sqlite3
+
+    from config.settings import PROJECT_ROOT
+    with pytest.raises(RealDatabaseEscaped):
+        sqlite3.connect(PROJECT_ROOT / "data" / "memory.db")
+    with pytest.raises(RealDatabaseEscaped):
+        sqlite3.connect(str(PROJECT_ROOT / "data" / "claude_usage.db"))
+
+
+def test_sqlite_itself_still_works_normally(tmp_path):
+    """The guard redirects and refuses; it does not disable SQLite and does not mock it. A temporary
+    database and an in-memory one both behave exactly as the driver does."""
+    import sqlite3
+    path = tmp_path / "ordinary.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        conn.execute("INSERT INTO t (x) VALUES (42)")
+        assert conn.execute("SELECT x FROM t").fetchone()[0] == 42
+    with sqlite3.connect(":memory:") as conn:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_no_desktop_audio_or_provider_side_effect_accompanies_memory_work():
+    """Item 23. Memory is a file boundary and must not have quietly become another kind."""
+    import sys
+
+    from app.memory import logic as memory_logic
+    memory_logic.initialize()
+    memory_logic.wipe()
+    for library in ("sounddevice", "faster_whisper", "pyautogui", "pywinauto", "playwright"):
+        assert library not in sys.modules, library
+    with pytest.raises(PhysicalDesktopEscaped):
+        executor_adapter.launch_app("notepad.exe")
+    with pytest.raises(ProviderEscaped):
+        brain_adapter.httpx2.HTTPTransport().handle_request(object())
 
 
 # --- §12 The fail-closed sentinel ---------------------------------------------------------------------

@@ -56,6 +56,11 @@ class ProviderEscaped(PhysicalBoundaryEscaped):
     """It would have sent a real HTTP request - the path the Anthropic client uses."""
 
 
+class RealDatabaseEscaped(PhysicalBoundaryEscaped):
+    """It would have opened a SQLite database inside the repository - the user's own memory or usage
+    ledger - instead of the test's own temporary copy."""
+
+
 # --- Which markers may bypass which guard, and the gate each one needs ---------------------------------
 # Mirrored from tests/conftest.OPT_IN_GATES rather than imported, so this module keeps working for a test
 # file that cannot see tests/. A test asserts the two agree, so they cannot drift apart silently.
@@ -97,6 +102,10 @@ MODEL_EXEMPT = {
 
 PROVIDER_EXEMPT = {
     "real_api": "RUN_REAL_CLAUDE_TEST",
+}
+
+DATABASE_EXEMPT = {
+    "real_database": "RUN_REAL_DATABASE_TEST",
 }
 
 
@@ -294,3 +303,105 @@ def install_provider_guard(monkeypatch) -> None:
                 "offline test attempted a REAL provider request over the async transport.")
 
         monkeypatch.setattr(httpx2.AsyncHTTPTransport, "handle_async_request", refuse_async)
+
+
+# --- Databases ----------------------------------------------------------------------------------------
+# SQLite writes a FILE; it does not act on the world, so this guard redirects rather than refuses. An
+# ordinary test gets a real SQLite database in its own temporary directory - full coverage of the real
+# adapter - while the two databases that belong to the USER stay unreachable:
+#
+#     data/memory.db          structured memory (app/memory/)
+#     data/claude_usage.db    the Claude usage ledger (app/brain/cost_controls.py)
+#
+# WHY THIS IS CENTRAL AND AUTOUSE. The ledger was previously protected only because the tests that
+# exercise it happen to request the `fake_claude` fixture, which points the setting at a temporary file.
+# That is per-test mocking - the same shape that opened real Notepad windows in Slice 3B - so a test that
+# reached cost_controls without that fixture would have used the real ledger. The redirect below does not
+# depend on any test remembering anything.
+#
+# Two layers, because the first alone could be refactored around:
+#   1. the two functions that resolve a configured database path return a path inside this test's tmp_path
+#   2. sqlite3.connect refuses any file inside the repository, so inlining the resolution fails loudly
+#      instead of quietly reaching data/. SQLite itself is NOT disabled and NOT mocked: every other
+#      connection, including :memory:, passes straight through to the real driver.
+
+# (module path, function name, file name the test gets) - resolved lazily so importing this file never
+# imports the application.
+_DATABASE_PATHS = (
+    ("app.memory.logic", "database_path", "memory.db"),
+    ("app.brain.cost_controls", "_ledger_path", "claude_usage.db"),
+)
+
+
+def install_database_guard(tmp_path, monkeypatch) -> None:
+    """Point every configured database at `tmp_path`, and make a repository database unreachable."""
+    import importlib
+    from pathlib import Path
+
+    area = Path(tmp_path) / "databases"
+    area.mkdir(parents=True, exist_ok=True)
+    repository_root = Path(__file__).resolve().parent
+    for module_name, function_name, file_name in _DATABASE_PATHS:
+        module = importlib.import_module(module_name)
+        original = getattr(module, function_name)
+        monkeypatch.setattr(module, function_name,
+                            _redirected(original, area / file_name, repository_root), raising=True)
+
+    import sqlite3
+    real_connect = sqlite3.connect
+    repository = Path(__file__).resolve().parent
+
+    def connect(database, *args, **kwargs):
+        target = _database_file(database)
+        if target is not None and _inside(target, repository):
+            raise RealDatabaseEscaped(
+                f"offline test attempted to open a REAL database inside the repository "
+                f"({target.name}). Normal tests get their own SQLite file under tmp_path - resolve the "
+                f"path through the configured setting instead of building it, or mark the test "
+                f"real_database AND set RUN_REAL_DATABASE_TEST=1. No row contents are shown.")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+
+
+def _redirected(original, safe_path, repository_root):
+    """Keep a path the test chose for itself; replace one that points inside the repository.
+
+    A fixture that already configured a temporary database (`fake_claude` does, for the ledger) must win,
+    or its own assertions would read a different file from the one production writes. Only a path that
+    would reach the user's real database is replaced. A settings error is NOT swallowed: a test that
+    checks a missing setting still sees it."""
+    from pathlib import Path
+
+    def resolve():
+        resolved = Path(original())
+        return safe_path if _inside(resolved.resolve(), repository_root) else resolved
+
+    resolve.__wrapped__ = original   # so a test can still reach the genuine resolver
+    return resolve
+
+
+def _database_file(database):
+    """The file a connect() target names, or None when it is not a file (`:memory:`, a URI for it, or a
+    connection object the driver accepts)."""
+    from pathlib import Path
+    if isinstance(database, Path):
+        return database.resolve()
+    if not isinstance(database, (str, bytes)):
+        return None
+    text = database.decode("utf-8", "replace") if isinstance(database, bytes) else database
+    if not text or text.startswith(":") or ":memory:" in text or "mode=memory" in text:
+        return None
+    if text.startswith("file:"):
+        text = text[len("file:"):].split("?", 1)[0]
+        if not text:
+            return None
+    return Path(text).resolve()
+
+
+def _inside(path, directory) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True

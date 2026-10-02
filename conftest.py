@@ -24,13 +24,15 @@ PhysicalDesktopEscaped = safety_guards.PhysicalDesktopEscaped
 PhysicalAudioEscaped = safety_guards.PhysicalAudioEscaped
 PhysicalListenerEscaped = safety_guards.PhysicalListenerEscaped
 ProviderEscaped = safety_guards.ProviderEscaped
+RealDatabaseEscaped = safety_guards.RealDatabaseEscaped
 
 
 def pytest_configure(config):
     """Register the real markers here too, so a test file outside tests/ can still be marked."""
     for marker, gate in sorted({**safety_guards.DESKTOP_EXEMPT, **safety_guards.AUDIO_EXEMPT,
                                 **safety_guards.MICROPHONE_EXEMPT, **safety_guards.MODEL_EXEMPT,
-                                **safety_guards.PROVIDER_EXEMPT}.items()):
+                                **safety_guards.PROVIDER_EXEMPT,
+                                **safety_guards.DATABASE_EXEMPT}.items()):
         config.addinivalue_line("markers", f"{marker}: uses this computer or the network for real; "
                                            f"needs {gate}=1 as well as this marker")
 
@@ -85,3 +87,19 @@ def no_real_provider(request, monkeypatch):
     if safety_guards.exempt(request.node, safety_guards.PROVIDER_EXEMPT):
         return
     safety_guards.install_provider_guard(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def databases_stay_in_this_test(request, tmp_path, monkeypatch):
+    """Point every configured SQLite database at this test's own temporary directory.
+
+    The user's structured memory (data/memory.db) and usage ledger (data/claude_usage.db) are the two
+    databases that belong to THEM, and no ordinary test may read or write either. Unlike the other
+    guards this one REDIRECTS rather than refuses: SQLite writes a file, it does not act on the world, so
+    a test gets a real database and real adapter coverage - just not the user's.
+
+    Before this existed the ledger was protected only by whichever fixture a test happened to request,
+    which is the per-test-mocking shape that caused the Slice 3B desktop incident."""
+    if safety_guards.exempt(request.node, safety_guards.DATABASE_EXEMPT):
+        return
+    safety_guards.install_database_guard(tmp_path, monkeypatch)

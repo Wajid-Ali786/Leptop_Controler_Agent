@@ -169,6 +169,9 @@ def pytest_configure(config):
 
 
 OPT_IN_GATES = {
+    "real_database": ("RUN_REAL_DATABASE_TEST",
+                      "Uses a real database outside the test's own temporary directory - "
+                      "set RUN_REAL_DATABASE_TEST=1 to run"),
     "real_api": (REAL_API_OPT_IN,
                  f"Real Claude API call - set {REAL_API_OPT_IN}=1 to run (uses the .env key, costs a few tokens)"),
     "real_desktop": (REAL_DESKTOP_OPT_IN,
