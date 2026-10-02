@@ -24,6 +24,7 @@ from app.verifier import adapter as verifier_adapter
 from app.verifier import logic as verifier_logic
 from app.verifier.models import WindowInfo
 from config import settings
+from tests import fake_window_props
 
 CONFIG = (
     "safety:\n"
@@ -63,6 +64,8 @@ def world(tmp_path, monkeypatch):
         launches=0,
         window_appears=lambda launch_number: True,
     )
+    fake_window_props.install(monkeypatch, adapter,
+                              exists=lambda handle: any(w.handle == handle for w in desktop.windows))
     real_authorize = safety_logic.authorize
 
     def recording_authorize(action, confirm=None):

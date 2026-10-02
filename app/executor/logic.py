@@ -22,7 +22,11 @@ Phase 1 is built one action at a time: open_app, close_app, click, type_text, sh
 then window_control.
 
 close_app closes ONLY windows the assistant opened in this session. open_app remembers them in
-memory, so nothing carries over a restart, and windows the user opened are never touched. Closing
+memory, so nothing carries over a restart, and windows the user opened are never touched. Each group
+is remembered as its handles PLUS an ownership token attached to those windows (a Windows window
+property, app/executor/adapter.py), because a handle number alone is not an identity: Windows gives
+handle numbers to new windows, so a window we never opened could otherwise be mistaken for ours. A
+window the token can't be attached to is never recorded, and so is never closable. Closing
 is a polite request (like clicking the window's X), never ending a process, and outcomes stay
 distinct (models.Outcome): a window already gone is ALREADY_CLOSED, one showing a dialog such as
 "Save changes?" is NEEDS_USER, and one that stays open is STILL_OPEN. Neither of the last two is
@@ -129,7 +133,7 @@ import logging
 import re
 import threading
 import unicodedata
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from app.executor import adapter, emergency_stop, shortcuts
@@ -168,8 +172,23 @@ _ENTER_RISK_REASON = ("text contains line breaks - each presses Enter, which can
                       "or run a command")
 
 # Windows the assistant opened in this session: app name -> window groups, oldest first.
-_session_windows: dict[str, list[frozenset[int]]] = {}
+_session_windows: dict[str, list["_OwnedWindowGroup"]] = {}
 _session_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _OwnedWindowGroup:
+    """Windows the assistant opened in this session, and the token that proves it.
+
+    `handles` holds ONLY the windows whose ownership token was attached and read back, so a window that
+    could not be proved ours is never closable. The token is what makes ownership refer to the window
+    OBJECTS rather than to their numbers: a window property dies with its window, so a different window
+    that is later given one of these numbers carries no token and can never be ours.
+
+    The token is never logged, never shown to the user and never persisted - it is left out of the repr
+    (but NOT out of equality) so that logging a group can't leak it."""
+    handles: frozenset[int]
+    token: int = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -401,8 +420,12 @@ def _prepare_open_app(action: ExecutorAction):
         check = verifier.wait_for_new_window(expectation, before)
         if not check.ok:
             return _result(action, False, check.message, retryable=check.retryable)
-        _remember_opened(name, check.window_handles)
-        return _result(action, True, f"Opened {name}; its window appeared after {check.elapsed_seconds:.1f}s.")
+        opened = f"Opened {name}; its window appeared after {check.elapsed_seconds:.1f}s"
+        if _remember_opened(name, check.window_handles):
+            return _result(action, True, f"{opened}.")
+        # The launch really happened, so it is reported as success - but nothing was proved ours, and
+        # saying so now is better than refusing without explanation when a close is asked for later.
+        return _result(action, True, f"{opened}, but I won't be able to close it automatically.")
 
     return run
 
@@ -429,7 +452,7 @@ class _SessionGroup:
     """A window group the assistant opened in this session. Created only by _open_session_group and
     _session_group_containing, which resolve it from the session's own records - never from a raw handle."""
     app: str
-    group: frozenset[int]
+    group: _OwnedWindowGroup
     expectation: WindowExpectation
 
 
@@ -463,16 +486,18 @@ def _close_session_group(action: ExecutorAction, session: _SessionGroup) -> Acti
         log.warning("Close refused: the window group isn't one this session opened")
         return _result(action, False, "I only close windows I opened in this session, so I left it alone.")
     try:
-        still_open = verifier.find_open(expectation, group)  # it may have closed during confirmation
+        still_open = _ours_now(group, expectation)  # it may have closed during confirmation
     except verifier.VerifierUnavailableError as exc:
         return _cant_check(action, name, exc)
     if not still_open:
         _forget(name, group)
         return _result(action, True, f"{name} is already closed.", outcome=Outcome.ALREADY_CLOSED)
+    ours = frozenset(window.handle for window in still_open)
     try:
         # Titled windows inside the group (a Store app's content window) must be gone too: they move
-        # out of the frame as a separate window while the app closes.
-        relevant = group | verifier.hosted_windows(expectation, frozenset(w.handle for w in still_open))
+        # out of the frame as a separate window while the app closes. Only windows that are still OURS
+        # count - waiting for a handle number that now belongs to someone else would never finish.
+        relevant = ours | verifier.hosted_windows(expectation, ours)
     except verifier.VerifierUnavailableError as exc:
         return _cant_check(action, name, exc)
     emergency_stop.check()  # last checkpoint before the close request is sent
@@ -532,26 +557,53 @@ def _cant_check(action: ExecutorAction, name: str, exc: Exception) -> ActionResu
     return _result(action, False, f"Didn't close {name}: I can't check its windows ({exc}).")
 
 
-def _remember_opened(name: str, handles: frozenset[int]) -> None:
-    if handles:
-        with _session_lock:
-            _session_windows.setdefault(name, []).append(frozenset(handles))
+def _remember_opened(name: str, handles: frozenset[int]) -> bool:
+    """Take ownership of the windows the Verifier just saw appear, and say whether any could be taken.
+
+    Only handles whose ownership token was attached AND read back are recorded: a sibling that couldn't
+    be tagged is left out rather than kept on its number alone, so it can never receive a close request.
+    If none could be tagged there is no ownership record at all - the open still happened, but close_app
+    will refuse these windows."""
+    if not handles:
+        return False
+    token = adapter.new_window_token()
+    tagged = frozenset(handle for handle in handles if adapter.tag_window(handle, token))
+    if not tagged:
+        log.warning("Executor: couldn't prove ownership of the new %s window(s), so I won't close them", name)
+        return False
+    if tagged != handles:
+        log.info("Executor: %d of %d new %s window(s) can be closed later", len(tagged), len(handles), name)
+    with _session_lock:
+        _session_windows.setdefault(name, []).append(_OwnedWindowGroup(tagged, token))
+    return True
 
 
-def _forget(name: str, group: frozenset[int]) -> None:
+def _ours_now(group: _OwnedWindowGroup, expectation: WindowExpectation) -> list[WindowInfo]:
+    """THE ownership test, and the only one: the windows of `group` that are still open, still match the
+    app, and still carry this group's ownership token.
+
+    Both halves are required. A recorded handle NUMBER is not ownership, because Windows gives handle
+    numbers to new windows; the token is what the original window object carried. Raises
+    VerifierUnavailableError."""
+    return [window for window in verifier.find_open(expectation, group.handles)
+            if adapter.window_token(window.handle) == group.token]
+
+
+def _forget(name: str, group: _OwnedWindowGroup) -> None:
     with _session_lock:
         groups = _session_windows.get(name, [])
         if group in groups:
             groups.remove(group)
 
 
-def _open_session_group(name: str, expectation: WindowExpectation) -> frozenset[int] | None:
-    """The most recently opened window group of `name` from this session that is still open, or None.
-    Groups whose windows are all gone are forgotten. Raises VerifierUnavailableError."""
+def _open_session_group(name: str, expectation: WindowExpectation) -> _OwnedWindowGroup | None:
+    """The most recently opened window group of `name` from this session that is still ours, or None.
+    Groups with no token-carrying window left are forgotten - whether their windows closed or their
+    handle numbers now belong to windows we never opened. Raises VerifierUnavailableError."""
     with _session_lock:
         groups = list(_session_windows.get(name, []))
     for group in reversed(groups):
-        if verifier.find_open(expectation, group):
+        if _ours_now(group, expectation):
             return group
         _forget(name, group)
     return None
@@ -1344,9 +1396,11 @@ def _session_group_containing(handle: int) -> _SessionGroup | None:
     with _session_lock:
         groups = [(app, group) for app, app_groups in _session_windows.items() for group in app_groups]
     for app, group in groups:
-        if handle in group:
+        # The active window must itself still carry the token: its handle being one we recorded proves
+        # nothing on its own, because Windows reuses handle numbers for new windows.
+        if handle in group.handles and adapter.window_token(handle) == group.token:
             expectation = verifier.expect_window(app)
-            if verifier.find_open(expectation, group):
+            if _ours_now(group, expectation):
                 return _SessionGroup(app, group, expectation)
     return None
 

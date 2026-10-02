@@ -31,6 +31,7 @@ from app.safety.models import Action, RiskAssessment, RiskLevel
 from app.verifier import adapter as verifier_adapter
 from app.verifier.models import ActiveTarget, Screen, WindowInfo, WindowState
 from config import settings
+from tests import fake_window_props
 
 SECRET = "hunter2-correct-horse-battery"
 CONSOLE_WINDOW = WindowInfo(100, "Windows PowerShell", "ConsoleWindowClass")
@@ -149,6 +150,7 @@ def world(tmp_path, monkeypatch):
         monkeypatch.setattr(verifier_adapter, name, getattr(desktop, name))
     for name in ("request_window_state", "request_close", "click", "launch_app", "send_character"):
         monkeypatch.setattr(adapter, name, getattr(desktop, name))
+    fake_window_props.install(monkeypatch, adapter, exists=lambda handle: handle in desktop.windows)
 
     def no_real_input():
         raise AssertionError("real input must not be sent in this test")

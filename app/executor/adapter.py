@@ -35,10 +35,16 @@ one combination to us: no keyboard hook, no key polling, no other keystroke ever
 functions send nothing and change nothing; app/executor/hotkey.py is the only caller, and a press
 does exactly one thing - the existing emergency stop.
 
+Window ownership is marked with a Windows window property (SetPropW/GetPropW/RemovePropW), because a
+property belongs to the window OBJECT and dies with it, while a handle number can be handed to a new
+window later. tag_window/window_token/untag_window are how "the assistant opened this window" is
+recorded and re-checked; new_window_token() is the one pure function here and touches nothing.
+
 Every other function here performs a real action on the computer, so nothing may call it except
 app/executor/logic.py, which routes every action through app/safety first (CLAUDE.md rule 5).
 """
 import ctypes
+import secrets
 import shutil
 import subprocess
 import sys
@@ -131,6 +137,90 @@ def request_close(handle: int) -> None:
     if error == _WINDOWS_ACCESS_DENIED:
         raise WindowCloseError("it runs with administrator rights, and the assistant doesn't run elevated")
     raise WindowCloseError(f"Windows refused the request (error {error})")
+
+
+# --- window ownership -------------------------------------------------------------------
+# The assistant may close only windows it opened, and a handle NUMBER cannot carry that fact: Windows
+# reuses handle numbers, so a window we never opened can later be given a number we recorded and be
+# closed as ours. A window PROPERTY can carry it, because the property list belongs to the window
+# OBJECT - when a window is destroyed "the system will call RemoveProp on your behalf", so a new window
+# that inherits the number never inherits the property.
+#
+# SetPropW and RemovePropW are restricted by User Interface Privilege Isolation: they work on a window
+# belonging to a process of lesser or equal integrity level and fail with ERROR_ACCESS_DENIED (5)
+# otherwise. That failure is safe - a window we cannot tag simply never becomes closable. No code is
+# injected into the target process; Windows itself keeps the property list.
+_OWNERSHIP_PROPERTY = "AIDesktopCompanion.WindowOwnership"  # fixed and internal, never user-configurable
+_TOKEN_BITS = ctypes.sizeof(ctypes.c_void_p) * 8 - 2  # fits a HANDLE, and stays positive read as signed
+
+
+def new_window_token() -> int:
+    """An unpredictable ownership token for ONE group of windows, sized to this process's native pointer
+    width. Always odd, so it is never zero and can never be confused with GetPropW's NULL ("no such
+    property"). Touches nothing: process-local, never persisted, never logged, never shown."""
+    return (secrets.randbits(_TOKEN_BITS) << 1) | 1
+
+
+def tag_window(handle: int, token: int) -> bool:
+    """Attach `token` to the window `handle` as proof the assistant opened it, then read it back and
+    report success only if it returns identical.
+
+    Returns False - never raises - for every failure, so a window that cannot be PROVED ours never
+    becomes closable. The read-back is what makes a wrong prototype, a truncated value or a silently
+    rejected property fail closed instead of registering ownership that can't be re-checked later."""
+    user32 = _property_api()
+    if user32 is None:
+        return False
+    if not user32.SetPropW(handle, _OWNERSHIP_PROPERTY, token):
+        # Read it to clear it: ctypes keeps the last error from this call, and leaving ours behind could
+        # be misread by the next adapter call. UIPI gives 5 for a higher-integrity window; every failure
+        # is handled identically, and the code is never reported because nothing may carry the token.
+        ctypes.get_last_error()
+        return False
+    return user32.GetPropW(handle, _OWNERSHIP_PROPERTY) == token
+
+
+def window_token(handle: int) -> int | None:
+    """The ownership token attached to the window `handle`, or None if it carries none - which includes
+    every failure, so a window that can't be read is never treated as ours."""
+    user32 = _property_api()
+    if user32 is None:
+        return None
+    value = user32.GetPropW(handle, _OWNERSHIP_PROPERTY)
+    return int(value) if value else None
+
+
+def untag_window(handle: int, token: int) -> bool:
+    """Drop our token from a window that is still alive, when ownership is deliberately given up.
+
+    Removes the property ONLY when it currently holds exactly `token`, because Windows documents that an
+    application "can remove only those properties it has added. It must not remove properties added by
+    other applications or by the system itself". Not needed for safety - Windows removes the property
+    when the window is destroyed - so this covers only the abandoning-a-live-window case."""
+    user32 = _property_api()
+    if user32 is None:
+        return False
+    if user32.GetPropW(handle, _OWNERSHIP_PROPERTY) != token:
+        return False
+    removed = user32.RemovePropW(handle, _OWNERSHIP_PROPERTY)
+    return bool(removed) and int(removed) == token
+
+
+def _property_api():
+    """user32 with the three window-property functions declared exactly: HANDLE is pointer-width, and
+    SetPropW returns BOOL - not a handle. None off Windows, where no window can be owned."""
+    if sys.platform != "win32":
+        return None
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SetPropW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.HANDLE]
+    user32.SetPropW.restype = wintypes.BOOL
+    user32.GetPropW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    user32.GetPropW.restype = wintypes.HANDLE
+    user32.RemovePropW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    user32.RemovePropW.restype = wintypes.HANDLE
+    return user32
 
 
 def click(x: int, y: int) -> None:

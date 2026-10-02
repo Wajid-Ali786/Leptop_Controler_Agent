@@ -28,6 +28,7 @@ from app.verifier import adapter as verifier_adapter
 from app.verifier import logic as verifier_logic
 from app.verifier.models import ActiveTarget, WindowInfo, WindowState
 from config import settings
+from tests import fake_window_props
 
 CONFIG = (
     "safety:\n"
@@ -134,6 +135,7 @@ def world(tmp_path, monkeypatch):
         monkeypatch.setattr(verifier_adapter, name, getattr(desktop, name))
     monkeypatch.setattr(adapter, "request_window_state", desktop.request_window_state)
     monkeypatch.setattr(adapter, "request_close", desktop.request_close)
+    fake_window_props.install(monkeypatch, adapter, exists=lambda handle: handle in desktop.windows)
 
     def no_real_input():
         raise AssertionError("real input must not be sent in this test")

@@ -49,7 +49,7 @@ class Script:
 
 def owned(name="notepad"):
     """What the Executor's own ownership store says, read directly."""
-    return [set(group) for group in executor_logic._session_windows.get(name, [])]
+    return [set(group.handles) for group in executor_logic._session_windows.get(name, [])]
 
 
 def understood(*intents):

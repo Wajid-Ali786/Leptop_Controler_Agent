@@ -117,6 +117,9 @@ def exempt(node, allowed: dict) -> bool:
 DESKTOP_BOUNDARIES = (
     "launch_app",            # subprocess.Popen - the one that opened real Notepad windows
     "request_close",
+    "tag_window",            # SetPropW on another process's window
+    "window_token",          # GetPropW on another process's window
+    "untag_window",          # RemovePropW on another process's window
     "click",
     "send_character",
     "send_shortcut",
@@ -177,11 +180,11 @@ def install_desktop_guard(adapter, monkeypatch, *, allow_faked_primitives: bool)
     for name in ("_keyboard_api", "_hotkey", "_use_physical_pixels"):
         monkeypatch.setattr(adapter, name, _primitive_refuser(f"adapter.{name}"), raising=False)
     # ctypes.WinDLL is NOT replaced: merely LOADING user32 is harmless, and a test fixture legitimately
-    # constructs adapter._KeyboardApi(), which loads it. Only the two functions that build user32 inline
-    # and immediately PostMessage can act, so those two stay wrapped and delegate only once the test has
-    # replaced WinDLL itself.
+    # constructs adapter._KeyboardApi(), which loads it. Only the functions that build user32 inline and
+    # immediately act on another process's window can reach the machine, so those stay wrapped and
+    # delegate only once the test has replaced WinDLL itself.
     loaded = getattr(adapter.ctypes, "WinDLL", None)
-    for name in ("request_close", "request_window_state"):
+    for name in ("request_close", "request_window_state", "tag_window", "window_token", "untag_window"):
         monkeypatch.setattr(adapter, name, _needs_faked_windll(adapter, name, loaded), raising=False)
     # click does `import pyautogui` inside the function; a test replaces sys.modules["pyautogui"] first.
     monkeypatch.setattr(sys, "meta_path",
@@ -197,8 +200,9 @@ def _boundary_refuser(name: str):
 
 
 def _needs_faked_windll(adapter, name: str, loaded):
-    """request_close/request_window_state post a window message the moment they run, so they may only
-    proceed once the test has replaced ctypes.WinDLL with its own fake."""
+    """These reach another process's window the moment they run - posting a message, or reading, setting
+    or removing a window property - so they may only proceed once the test has replaced ctypes.WinDLL
+    with its own fake."""
     original = _ORIGINALS[name]
 
     def call(*args, **kwargs):

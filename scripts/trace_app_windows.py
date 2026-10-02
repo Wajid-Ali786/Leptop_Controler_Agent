@@ -235,7 +235,9 @@ def trace(app_name: str, watch_after_open: float, watch_after_close: float):
     tracer.mark(f"open_app called (matching windows already open: {len(before)})")
     opened = executor.execute_with_recovery(ExecutorAction(OPEN_APP, app_name))
     tracer.mark(f"open_app returned ok={opened.ok}: {opened.message}")
-    recorded = [sorted(f"{h:#010x}" for h in group) for group in executor._session_windows.get(app_name, [])]
+    # Handles only - the ownership token that goes with them is never printed or logged.
+    recorded = [sorted(f"{h:#010x}" for h in group.handles)
+                for group in executor._session_windows.get(app_name, [])]
     tracer.mark(f"open_app recorded window group(s): {recorded}")
     time.sleep(watch_after_open)
     tracer.mark("close_app called (confirmation auto-answered yes)")

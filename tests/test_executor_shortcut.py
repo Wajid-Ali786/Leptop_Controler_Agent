@@ -25,6 +25,7 @@ from app.safety.models import RiskLevel
 from app.verifier import adapter as verifier_adapter
 from app.verifier.models import ActiveTarget, WindowInfo
 from config import settings
+from tests import fake_window_props
 
 CONFIG = (
     "safety:\n"
@@ -141,6 +142,7 @@ def world(tmp_path, monkeypatch):
         monkeypatch.setattr(verifier_adapter, name, getattr(desktop, name))
     monkeypatch.setattr(adapter, "send_shortcut", desktop.send_shortcut)
     monkeypatch.setattr(adapter, "release_keys", desktop.release_keys)
+    fake_window_props.install(monkeypatch, adapter)
 
     def no_real_keyboard():
         raise AssertionError("real keyboard input must not be sent in this test")

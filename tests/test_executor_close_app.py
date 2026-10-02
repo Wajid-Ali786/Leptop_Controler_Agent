@@ -24,6 +24,7 @@ from app.safety.logic import ActionDeniedError
 from app.safety.models import RiskLevel
 from app.verifier import adapter as verifier_adapter
 from app.verifier.models import WindowInfo
+from tests import fake_window_props
 from config import settings
 
 CONFIG = (
@@ -69,6 +70,11 @@ class FakeDesktop:
         self.windows = {USERS_NOTEPAD.handle: USERS_NOTEPAD}  # the user's own, already open
         self.hosted = {}      # frame handle -> content windows inside it
         self.content_of = {}  # frame handle -> its content window while that is still top-level
+        # Window properties, as Windows keeps them: attached to the window OBJECT, so they appear when a
+        # window is created and are gone the moment it is destroyed. A new window that is handed a
+        # handle number an old one used does NOT inherit its properties - which is the whole point.
+        self.props = {}       # handle -> {key: value}
+        self.refuse_tags = set()   # handles SetPropW must fail on, e.g. a higher-integrity window
         self.next_handle = 1000
         self.reaction = "close"  # close | dialog | ignore | gone | denied | blink
         self.scheduled = []
@@ -109,6 +115,24 @@ class FakeDesktop:
     def update(self, handle, **changes):
         if handle in self.windows:
             self.windows[handle] = dataclasses.replace(self.windows[handle], **changes)
+
+    def destroy(self, handle):
+        """The window OBJECT is destroyed, so its property list goes with it. Use this rather than
+        popping `windows` directly: a test that destroys a window and hands its number to a new one is
+        exactly the case the ownership token exists for, and the props must not survive."""
+        self.windows.pop(handle, None)
+        self.props.pop(handle, None)
+
+    def reuse(self, handle, title="Untitled - Notepad", class_name="Notepad"):
+        """Destroy whatever holds `handle`, then give that same NUMBER to a different window object."""
+        self.destroy(handle)
+        self.windows[handle] = WindowInfo(handle, title, class_name)
+        return handle
+
+    def _exists(self, handle):
+        """Whether a window OBJECT with this handle is there to carry a property."""
+        return handle in self.windows or any(content.handle == handle
+                                             for contents in self.hosted.values() for content in contents)
 
     def launch(self, executable):
         self.calls.append(("launch", executable))
@@ -157,14 +181,14 @@ class FakeDesktop:
     def close_family(self, window):
         """The window goes at once. A Store frame's content window becomes a separate top-level window
         again (or already is one) and is destroyed two reads later."""
-        self.windows.pop(window.handle, None)
+        self.destroy(window.handle)
         contents = [dataclasses.replace(c, cloaked=True) for c in self.hosted.pop(window.handle, [])]
         top_level_content = self.content_of.pop(window.handle, None)
         if top_level_content in self.windows:
             contents.append(self.windows[top_level_content])
         for content in contents:
             self.windows[content.handle] = content
-            self.after_polls(2, lambda h=content.handle: self.windows.pop(h, None))
+            self.after_polls(2, lambda h=content.handle: self.destroy(h))
 
     def handles(self, title_part):
         return sorted(h for h, w in self.windows.items() if title_part in w.title)
@@ -192,6 +216,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(logic, "authorize", recording_authorize)
     monkeypatch.setattr(adapter, "launch_app", desktop.launch)
     monkeypatch.setattr(adapter, "request_close", desktop.request_close)
+    desktop.props = fake_window_props.install(monkeypatch, adapter, exists=desktop._exists,
+                                              refuse=desktop.refuse_tags)
     monkeypatch.setattr(verifier_adapter, "list_windows", desktop.list_windows)
     monkeypatch.setattr(verifier_adapter, "list_child_windows", desktop.list_child_windows)
     monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
@@ -410,7 +436,8 @@ def test_store_app_counts_as_opened_only_once_its_frame_is_on_screen(world):
     frame = world.desktop.frame("Calculator")
     assert not world.desktop.windows[frame].cloaked
     group = logic._session_windows["calculator"][-1]
-    assert group == set(world.desktop.handles("Calculator")) and len(group) == 2  # frame + content window
+    assert group.handles == set(world.desktop.handles("Calculator"))
+    assert len(group.handles) == 2  # frame + content window
 
 
 def test_store_app_closes_through_its_frame_and_done_waits_for_the_content_window(world):
@@ -435,7 +462,7 @@ def test_store_app_closed_right_after_opening_still_waits_for_the_content_window
 
 def test_content_window_created_after_opening_is_waited_for_too(world):
     open_app("weather")  # its content window appears only after the frame is on screen
-    assert len(logic._session_windows["weather"][-1]) == 1
+    assert len(logic._session_windows["weather"][-1].handles) == 1
     world.desktop.settle()
     result = close_app("weather")
     assert result.ok and result.outcome is Outcome.DONE
