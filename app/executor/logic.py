@@ -146,7 +146,9 @@ from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, RESOLVE_BA
 from app.safety.logic import Confirm, authorize
 from app.safety.models import Action, RiskLevel
 from app.verifier import logic as verifier
-from app.verifier.models import ActiveTarget, Screen, WindowExpectation, WindowInfo
+from app.verifier import observation
+from app.verifier.models import (ActionTarget, ActiveTarget, Ambiguous, NotEligible, NotFound, Observed,
+                                 Screen, Stale, Target, Unavailable, WindowExpectation, WindowInfo)
 from config.settings import SettingsError, get_setting
 
 log = logging.getLogger(__name__)
@@ -339,6 +341,14 @@ def execute(action: ExecutorAction, confirm: Confirm | None = None, *,
     if prepare is None:
         return _result(action, False, f"I don't know how to do '{action.kind}' yet.")
     prepared = prepare(action)  # validation only - nothing happens on the computer here
+    return _authorize_and_run(action, prepared, confirm, risk_floor)
+
+
+def _authorize_and_run(action: ExecutorAction, prepared, confirm: Confirm | None,
+                       risk_floor: RiskLevel) -> ActionResult:
+    """The gate, and then the action. Extracted so every entry point - a typed command and a
+    re-identified screen target alike - goes through the SAME confirmation and the same checkpoints.
+    There is deliberately no second copy of this sequence anywhere."""
     if isinstance(prepared, ActionResult):
         return prepared
     if not isinstance(prepared, _Prepared):
@@ -656,26 +666,155 @@ def _prepare_click(action: ExecutorAction):
         if _window_identity(now) != _window_identity(approved):
             return _result(action, False, f"The window at ({x}, {y}) changed after you approved the click, "
                                           f"so I didn't click.")
-        emergency_stop.check()  # last checkpoint before the input is sent
-        try:
-            adapter.click(x, y)
-        except adapter.MouseFailSafeError:
-            emergency_stop.trigger("mouse-corner")
-            emergency_stop.check()  # raises EmergencyStopError
-        except adapter.ExecutorAdapterError as exc:
-            return _result(action, False, f"I couldn't click at ({x}, {y}): {exc}.")
-        try:
-            pointer = verifier.cursor_position()
-        except verifier.VerifierUnavailableError:
-            return _result(action, True, f"Clicked at ({x}, {y}). I couldn't read where the mouse pointer ended "
-                                         f"up, and I can't check what the click did.", outcome=Outcome.UNVERIFIED)
-        if pointer != (x, y):
-            return _result(action, False, f"I sent the click, but the mouse pointer is at {pointer} instead of "
-                                          f"({x}, {y}), so the click may have landed somewhere else.")
-        return _result(action, True, f"Clicked at ({x}, {y}). I can't check what the click did.",
-                       outcome=Outcome.UNVERIFIED)
+        return _send_click(action, x, y, f"at ({x}, {y})")
 
     return _Prepared(run, safety_action)
+
+
+def _send_click(action: ExecutorAction, x: int, y: int, what: str,
+                log_what: str | None = None) -> ActionResult:
+    """Send the one click and check where the pointer ended up. The ONLY place this module clicks.
+
+    `what` is how the click is described back to the user - "at (500, 300)" for a coordinate click,
+    the user's own word for the control for a screen target. It changes the wording and nothing else:
+    both kinds of click pass the same emergency-stop checkpoint, the same fail-safe handling and the
+    same after-the-fact pointer check, and both are UNVERIFIED, because what a click DID still cannot
+    be observed - a re-identified target proves where the click landed, never what it achieved.
+
+    `log_what` is how the same click is described in the log when `what` is the user's own words, which
+    are not written to disk. Left out, the message is logged as it stands, as every other action's is."""
+    emergency_stop.check()  # last checkpoint before the input is sent
+    logged = what if log_what is None else log_what
+    try:
+        adapter.click(x, y)
+    except adapter.MouseFailSafeError:
+        emergency_stop.trigger("mouse-corner")
+        emergency_stop.check()  # raises EmergencyStopError
+    except adapter.ExecutorAdapterError as exc:
+        return _result(action, False, f"I couldn't click {what}: {exc}.",
+                       log_message=f"couldn't click {logged}: {exc}")
+    try:
+        pointer = verifier.cursor_position()
+    except verifier.VerifierUnavailableError:
+        return _result(action, True, f"Clicked {what}. I couldn't read where the mouse pointer ended "
+                                     f"up, and I can't check what the click did.", outcome=Outcome.UNVERIFIED,
+                       log_message=f"clicked {logged} at ({x}, {y}); the pointer could not be read back")
+    if pointer != (x, y):
+        return _result(action, False, f"I sent the click, but the mouse pointer is at {pointer} instead of "
+                                      f"({x}, {y}), so the click may have landed somewhere else.")
+    return _result(action, True, f"Clicked {what}. I can't check what the click did.",
+                   outcome=Outcome.UNVERIFIED, log_message=f"clicked {logged} at ({x}, {y})")
+
+
+# --- click on a screen target the user named (Phase 5 Slice 2) ---------------------------------------
+# A UIA target does not get its own click. It gets its own PREPARER, and then joins the existing path:
+# the same safety gate, the same confirmation, the same emergency-stop checkpoints, the same single
+# adapter.click() and the same honest UNVERIFIED result.
+#
+# THE ORDER IS THE WHOLE POINT. Observing, confirming and acting happen at three different moments, and
+# the screen is free to change between them. So the bounds shown to the user are never the bounds that
+# are clicked: the control is found AGAIN after the confirmation, and if anything about it has changed -
+# it moved out of view, it was disabled, it became two controls, it went away - nothing is clicked. The
+# pre-confirmation observation is used for exactly one thing: knowing what to look for again.
+#
+# Precision does not buy permission. Knowing exactly which button is under the pointer says nothing
+# about what that button DOES, so a UIA click is confirmed at MEDIUM exactly like a coordinate click.
+
+# How a click on a screen target is described in LOGS. The user's own word for the control is command
+# text and never goes to disk, so the log says which KIND of click it was and what became of it.
+_TARGET = "screen target"
+
+_TARGET_CLICK_RISK = RiskLevel.MEDIUM
+_TARGET_CLICK_RISK_REASON = ("click on a screen target - always needs confirmation (what the control does "
+                             "can't be known from its name)")
+
+
+def click_target(target: Target, observed: Observed, confirm: Confirm | None = None, *,
+                 risk_floor: RiskLevel = RiskLevel.LOW) -> ActionResult:
+    """Click the control the user named, having found it again first.
+
+    `target` is the user's own words and the window they meant; `observed` is what app/verifier
+    observation found for it. Phase 5 Slice 2 deliberately takes both as typed arguments: wiring this to
+    a spoken or typed sentence is a later slice, and the local primitive is built and proved first."""
+    emergency_stop.check()
+    action = ExecutorAction(CLICK)  # a click, with no coordinate yet: it is not known until after the gate
+    return _authorize_and_run(action, _prepare_target_click(action, target, observed), confirm, risk_floor)
+
+
+def _prepare_target_click(action: ExecutorAction, target: Target, observed: Observed):
+    if not isinstance(target, Target) or not isinstance(target.name, str) or not target.name.strip():
+        return _result(action, False, "I need the name of something to click.")
+    if not isinstance(observed, Observed):
+        return _result(action, False, f"I haven't found '{target.name.strip()}' on screen yet, "
+                                      f"so there's nothing to click.",
+                       log_message=f"{_TARGET} not observed yet")
+    named = target.name.strip()
+    try:
+        window = verifier.window_by_handle(target.window_handle)
+    except verifier.VerifierUnavailableError as exc:
+        return _result(action, False, f"Didn't click '{named}': I can't check the screen ({exc}).",
+                       log_message=f"{_TARGET}: the screen could not be read ({exc})")
+    if window is None:
+        return _result(action, False, f"Didn't click '{named}': that window isn't open any more.",
+                       log_message=f"{_TARGET}: the window is gone")
+    where = f'window "{window.title}"' if window.title else "a window with no readable title"
+    # The prompt names the user's own word for the control and the window it is in. Nothing read off the
+    # screen goes in here: the accessible labels that made the match never left the verifier's adapter.
+    safety_action = Action(f'click "{named}" in {where}',
+                           minimum_level=_TARGET_CLICK_RISK, minimum_reason=_TARGET_CLICK_RISK_REASON)
+
+    def run() -> ActionResult:
+        emergency_stop.check()  # before the re-identification, which is allowed to take a moment
+        found = observation.reidentify(target, observed)
+        if not isinstance(found, ActionTarget):
+            message, why = _refused(named, found)
+            return _result(action, False, message, log_message=f"{_TARGET}: {why}")
+        x, y = found.point
+        try:
+            all_screens = verifier.screens()
+            if not verifier.on_screen(all_screens, x, y):
+                return _result(action, False, f"'{named}' is at ({x}, {y}), which isn't on any screen, "
+                                              f"so I didn't click it.",
+                               log_message=f"{_TARGET}: ({x}, {y}) is on no screen")
+            if (x, y) in _fail_safe_corners(all_screens):
+                return _result(action, False, f"'{named}' is in a corner of the main screen, which is the "
+                                              f"manual emergency stop, so I won't click there.",
+                               log_message=f"{_TARGET}: ({x}, {y}) is a fail-safe corner")
+            # UIA reports where a control IS, not whether anything is in front of it. An overlapping
+            # window would take the click instead, so the window that is actually on top at that point
+            # has to be the one the target belongs to.
+            on_top = verifier.window_at(x, y)
+        except verifier.VerifierUnavailableError as exc:
+            return _result(action, False, f"Didn't click '{named}': I can't check the screen ({exc}).",
+                           log_message=f"{_TARGET}: the screen could not be read ({exc})")
+        if on_top is None or on_top.handle != found.window_handle:
+            return _result(action, False, f"Something else is in front of '{named}' now, so I didn't click "
+                                          f"it - the click would have gone to the wrong window.",
+                           log_message=f"{_TARGET}: another window is in front of it")
+        return _send_click(action, x, y, f'"{named}"', _TARGET)
+
+    return _Prepared(run, safety_action)
+
+
+def _refused(named: str, found) -> tuple[str, str]:
+    """Why a re-identified target was not clicked: what the USER is told, and what a LOG may keep.
+
+    Two sentences rather than one because they have different audiences. The user's needs their own word
+    for the control in it to make sense; the log must not have it, because that word is command text.
+
+    Every branch refuses. The Executor never falls back to the coordinates it was shown before the
+    confirmation, because those describe where the control WAS."""
+    if isinstance(found, NotEligible):
+        return found.reason, "not eligible to be clicked"
+    if isinstance(found, Stale):
+        return found.reason, "a different control now answers to that name"
+    if isinstance(found, Ambiguous):
+        return found.message, f"ambiguous now ({len(found.candidates)} matches)"
+    if isinstance(found, NotFound):
+        return found.message, "no longer in that window"
+    if isinstance(found, Unavailable):
+        return f"Didn't click '{named}': {found.reason}", "the window could not be read again"
+    return f"Didn't click '{named}': I couldn't find it again.", "unrecognised re-identification result"
 
 
 def _window_identity(window: WindowInfo | None) -> tuple | None:
@@ -1443,8 +1582,16 @@ def _retry_accepted(result: ActionResult, offer_retry: OfferRetry | None) -> boo
 
 
 def _result(action: ExecutorAction, ok: bool, message: str, retryable: bool = False,
-            outcome: Outcome | None = None, progress: tuple[int, int] | None = None) -> ActionResult:
+            outcome: Outcome | None = None, progress: tuple[int, int] | None = None, *,
+            log_message: str | None = None) -> ActionResult:
+    """Build the result, and log it.
+
+    Every message passed here is LOGGED, which is why no message in this module contains typed text.
+    `log_message` is for the one case where what the user should read and what a log file may keep are
+    not the same sentence: a click on a screen target says the user's own word for the control back to
+    them, and that word is command text, which this project does not write to disk."""
     result = ActionResult(action, ok, message, retryable, outcome, progress)
     log.log(logging.INFO if ok else logging.WARNING, "Executor %s '%s': %s (%s) - %s",
-            action.kind, action.log_label, "OK" if ok else "FAILED", result.outcome.value, message)
+            action.kind, action.log_label, "OK" if ok else "FAILED", result.outcome.value,
+            message if log_message is None else log_message)
     return result

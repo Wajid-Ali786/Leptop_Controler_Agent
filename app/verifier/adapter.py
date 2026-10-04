@@ -491,3 +491,27 @@ def _uia_patterns(element) -> tuple:
         except Exception:
             continue
     return tuple(supported)
+
+
+def uia_window_bounds(window_handle: int) -> tuple[int, int, int, int] | None:
+    """The window's own rectangle, as UI Automation currently reports it.
+
+    Read through UIA rather than GetWindowRect on purpose: it is the frame the CONTROL rectangles are
+    reported in, so a control's position can be judged against its own window in the same terms. None
+    means UIA exposes no rectangle for it; VerifierAdapterError means the window could not be read at
+    all, which is also what a window that has closed looks like."""
+    if sys.platform != "win32":
+        raise VerifierAdapterError("reading the accessibility tree is only supported on Windows")
+    try:
+        from pywinauto.uia_element_info import UIAElementInfo
+    except Exception as exc:
+        raise VerifierAdapterError(
+            f"UI Automation is unavailable on this computer ({type(exc).__name__})") from None
+    try:
+        rectangle = UIAElementInfo(window_handle).rectangle
+        if rectangle is None:
+            return None
+        return (int(rectangle.left), int(rectangle.top), int(rectangle.right), int(rectangle.bottom))
+    except Exception as exc:
+        raise VerifierAdapterError(
+            f"the window could not be read ({type(exc).__name__})") from None

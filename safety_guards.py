@@ -437,6 +437,7 @@ VERIFIER_CONTENT_READS = (
     "selection",            # which characters are selected in that control
     "text_length",          # how much text it holds
     "uia_find_by_name",     # Phase 5: walks the accessibility tree and compares every control's name
+    "uia_window_bounds",    # Phase 5: the same UIA entry, for one window's own rectangle
 )
 
 UIA_LIBRARIES = ("pywinauto",)

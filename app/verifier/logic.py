@@ -180,6 +180,15 @@ def window_at(x: int, y: int) -> WindowInfo | None:
     return _observe(adapter.window_at, x, y)
 
 
+def window_by_handle(handle: int) -> WindowInfo | None:
+    """The visible top-level window with this handle, or None if it is gone. Raises
+    VerifierUnavailableError. Used where a handle is already known and the window has to be described
+    to the user - a confirmation prompt names the window it is about."""
+    if not isinstance(handle, int) or isinstance(handle, bool) or handle <= 0:
+        return None
+    return next((window for window in _list_windows() if window.handle == handle), None)
+
+
 def cursor_position() -> tuple[int, int]:
     """Where the mouse pointer is. Raises VerifierUnavailableError."""
     return _observe(adapter.cursor_position)

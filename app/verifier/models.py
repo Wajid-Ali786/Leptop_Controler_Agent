@@ -212,3 +212,50 @@ class UiaElement:
     offscreen: bool = False
     is_password: bool = False
     patterns: tuple[str, ...] = ()
+
+
+# --- Phase 5 Slice 2: re-identified, action-ready evidence --------------------------------------------
+# An Observed is evidence about a MOMENT. By the time the user has read a confirmation and answered it,
+# that moment has passed: the window may have moved, the list may have scrolled, the button may have been
+# disabled. So nothing here is derived from the observation that was shown to the user - the bounds and
+# the click point are read again, after the confirmation, and only then does a target become actionable.
+#
+# WHY runtime_id IS NOT THE IDENTITY. pywinauto documents its own runtime_id as "may be different from
+# run to run", and its element equality deliberately uses UI Automation's CompareElements instead - which
+# needs both live COM elements, something this project does not keep across a confirmation and should
+# not. So runtime_id is recorded and compared as CORROBORATION and never decides identity: building on it
+# would repeat exactly the mistake of assuming a window handle is an identity.
+
+
+@dataclass(frozen=True)
+class ActionTarget:
+    """One re-identified control the Executor may act on, and nothing more.
+
+    It carries no accessible name, no value, no document text and no UI tree. `target_name` is the
+    USER's own word for the control, carried through from the Target they gave - never a label read off
+    the screen - which is why a confirmation prompt may safely show it.
+
+    This is NOT an action: it says where a control is, not what to do to it. The Executor decides that,
+    and app/safety still decides whether it may happen."""
+    source: ObservationSource               # kept, so provenance survives: a UIA point stays a UIA point
+    window_handle: int
+    bounds: tuple[int, int, int, int]       # the bounds read AFTER the confirmation, never the old ones
+    point: tuple[int, int]                  # derived from those bounds, inside this window
+    target_name: str
+    reidentified_at: float
+    identity: str = ""                      # WHICH KINDS of evidence matched, never their values
+
+
+@dataclass(frozen=True)
+class Stale:
+    """The control that is there now is not the one that was observed, so nothing is assumed about it.
+
+    Deliberately distinct from NotFound: something did match the user's word, but its identity differs,
+    which is the case where guessing would be most tempting and most wrong."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class NotEligible:
+    """Re-identified, and still not something to click: disabled, off screen, or in an impossible place."""
+    reason: str

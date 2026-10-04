@@ -20,8 +20,8 @@ import logging
 import time
 
 from app.verifier import adapter
-from app.verifier.models import (Ambiguous, Found, NotFound, Observed, ObservationSource, Target,
-                                 Unavailable, normalize_name)
+from app.verifier.models import (ActionTarget, Ambiguous, Found, NotEligible, NotFound, Observed,
+                                 ObservationSource, Stale, Target, Unavailable, normalize_name)
 from config.settings import SettingsError, get_setting
 
 log = logging.getLogger(__name__)
@@ -120,3 +120,133 @@ def _positive(name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise SettingsError(f"Setting '{name}' must be a positive number, got {value!r}.")
     return float(value)
+
+
+# --- Re-identification: turning an old observation into something safe to act on NOW ------------------
+# WHAT runtime_id ACTUALLY PROMISES, checked rather than assumed. pywinauto's own uia_element_info
+# documents runtime_id as a "hashable value but may be different from run to run", and its element
+# equality uses UI Automation's CompareElements instead - which needs two LIVE COM elements, something
+# this project deliberately does not hold across a user confirmation. Microsoft documents the runtime id
+# as unique among live elements at one moment, not as a durable name for a control.
+#
+# So runtime_id DOES NOT decide identity here. It is carried and may be compared as corroboration, but a
+# changed runtime id alone is not treated as a different control - if it were, this feature would refuse
+# at random for reasons the platform never promised to avoid. Identity is decided by evidence that is
+# documented to mean something: the control's automation id, its control type and its window class,
+# inside the same window, matching the user's own word for it, and matching it UNIQUELY.
+#
+# This is the window-handle lesson applied a second time. A number that happens to be stable in practice
+# is not an identity, and the moment it is trusted as one the failure is silent and lands on the wrong
+# control.
+
+_IDENTITY_WITH_AUTOMATION_ID = "automation id, control type and window class"
+_IDENTITY_STRUCTURAL_ONLY = "control type and window class (this control exposes no automation id)"
+
+Reidentified = ActionTarget | Stale | NotEligible | Ambiguous | NotFound | Unavailable
+
+
+def reidentify(target: Target, observed: Observed) -> Reidentified:
+    """Find the control that was observed, AGAIN, right now, and say whether it may be acted on.
+
+    This is not a convenience re-read: it is the step between acting on evidence and acting on a memory.
+    Everything the Executor is given - the bounds, and the point inside them - comes from this call and
+    never from the observation the user was shown, because by the time a confirmation has been read and
+    answered the window may have moved, the list may have scrolled and the button may have been disabled.
+
+    Refuses rather than choosing whenever identity is in doubt: a control that cannot be found again, one
+    whose identity no longer matches, and two controls that now answer to the same name are all
+    refusals. Nothing here guesses, and nothing here acts."""
+    if not isinstance(target, Target) or not isinstance(observed, Observed):
+        return Unavailable("I don't have an observed target to re-check.")
+    if not isinstance(target.name, str) or not target.name.strip():
+        # Asked here rather than left to the adapter: an empty name matching nothing is the right
+        # outcome by luck, and a rule that holds by luck is one refactor away from not holding.
+        return NotFound("I need the name of something to look for.")
+    if observed.source is not ObservationSource.UIA:
+        return Unavailable(f"I can only re-check targets found through UI Automation, "
+                           f"not {observed.source.value}.")
+    if not isinstance(target.window_handle, int) or target.window_handle != observed.window_handle:
+        return Unavailable("That target belongs to a different window from the one it was found in.")
+
+    try:
+        timeout = _timeout_seconds()
+        window_bounds = adapter.uia_window_bounds(target.window_handle)
+        elements = adapter.uia_find_by_name(target.window_handle, normalize_name(target.name), timeout)
+    except SettingsError as exc:
+        return Unavailable(str(exc))
+    except adapter.VerifierAdapterError as exc:
+        # The commonest reason is the one that matters most: the window closed while the user was reading
+        # the confirmation. Reported as it is, never worked around.
+        log.info("Reidentify: source=%s resolution=unavailable candidates=0 escalation=false",
+                 ObservationSource.UIA.value)
+        return Unavailable(f"I couldn't read that window any more ({exc}).")
+
+    reidentified_at = _now()
+    candidates = tuple(_observed(element, reidentified_at) for element in elements)
+    log.info("Reidentify: source=%s resolution=%s candidates=%d escalation=false",
+             ObservationSource.UIA.value,
+             "found" if len(candidates) == 1 else "ambiguous" if candidates else "not_found",
+             len(candidates))
+    if not candidates:
+        return NotFound(f"'{target.name.strip()}' isn't in that window any more, so I didn't click.")
+    if len(candidates) > 1:
+        return Ambiguous(candidates,
+                         f"There are now {len(candidates)} things called '{target.name.strip()}' in that "
+                         f"window, so I'm not going to guess which one you meant.")
+
+    current = candidates[0]
+    identity = _identity_match(observed, current)
+    if identity is None:
+        return Stale(f"The '{target.name.strip()}' in that window isn't the one I found a moment ago, so "
+                     f"I didn't click it.")
+    return _action_target(target, current, window_bounds, identity, reidentified_at)
+
+
+def _identity_match(observed: Observed, current: Observed) -> str | None:
+    """Is `current` the same control as `observed`? The NAME OF THE EVIDENCE that says so, or None.
+
+    runtime_id is deliberately absent from this decision - see the note above. The evidence name is
+    returned rather than a bare True so that a caller, and a prompt, can say how strong the match was;
+    it names kinds of evidence and never their values, so it is safe to show and to log."""
+    if observed.control_type != current.control_type or observed.class_name != current.class_name:
+        return None
+    if observed.automation_id or current.automation_id:
+        if observed.automation_id != current.automation_id:
+            return None
+        return _IDENTITY_WITH_AUTOMATION_ID
+    # No automation id to lean on. The match then rests on the control type, the window class, the user's
+    # own word for it, and the fact that exactly ONE control in this window answers to it. That is
+    # genuinely weaker evidence, so it is named rather than quietly treated as equivalent.
+    return _IDENTITY_STRUCTURAL_ONLY
+
+
+def _action_target(target: Target, current: Observed, window_bounds, identity: str,
+                   reidentified_at: float) -> ActionTarget | NotEligible:
+    """The eligibility rules. Every one of them refuses; none of them adjusts anything to make a target
+    usable, because a target that needs adjusting is a target that is not understood."""
+    named = target.name.strip()
+    if not current.enabled:
+        return NotEligible(f"'{named}' is there but greyed out, so clicking it would do nothing.")
+    if current.offscreen:
+        return NotEligible(f"'{named}' is scrolled or hidden out of view, so I didn't click it.")
+    if not _usable(current.bounds):
+        return NotEligible(f"I can't tell where '{named}' is on screen, so I didn't click it.")
+    bounds = current.bounds
+    point = (bounds[0] + (bounds[2] - bounds[0]) // 2, bounds[1] + (bounds[3] - bounds[1]) // 2)
+    if _usable(window_bounds) and not (window_bounds[0] <= point[0] < window_bounds[2]
+                                       and window_bounds[1] <= point[1] < window_bounds[3]):
+        # The control reports a position outside its own window. There is nothing to reconcile here: the
+        # evidence contradicts itself, and the one thing not to do is click where it points.
+        return NotEligible(f"'{named}' is reported outside its own window, so I didn't click it - that "
+                           f"position can't be right.")
+    return ActionTarget(source=ObservationSource.UIA, window_handle=current.window_handle, bounds=bounds,
+                        point=point, target_name=target.name, reidentified_at=reidentified_at,
+                        identity=identity)
+
+
+def _usable(bounds) -> bool:
+    """Four whole numbers describing a rectangle with real area. An empty or inverted rectangle is not a
+    very small target: it is unreadable evidence, and it is treated as such."""
+    return (isinstance(bounds, tuple) and len(bounds) == 4
+            and all(isinstance(value, int) and not isinstance(value, bool) for value in bounds)
+            and bounds[2] > bounds[0] and bounds[3] > bounds[1])

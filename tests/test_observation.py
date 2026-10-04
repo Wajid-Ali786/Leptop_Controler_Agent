@@ -16,6 +16,7 @@ every test here drives the real resolver against a fake tree.
 """
 import ast
 import logging
+import pathlib
 import time
 
 import pytest
@@ -131,7 +132,9 @@ def test_only_the_adapter_boundary_imports_the_uia_library():
                 importers.append(path.relative_to(root).as_posix())
             elif isinstance(node, ast.Import) and any(a.name.startswith("pywinauto") for a in node.names):
                 importers.append(path.relative_to(root).as_posix())
-    assert importers == ["verifier/adapter.py"], importers
+    # The rule is about WHICH FILE may reach the library, not how many times it does: Slice 2 added a
+    # second lazy import in that same adapter for one window's own rectangle.
+    assert set(importers) == {"verifier/adapter.py"}, importers
 
     module = ast.parse((root / "verifier" / "adapter.py").read_text(encoding="utf-8"))
     top_level = {alias.name for node in module.body if isinstance(node, ast.Import)
@@ -258,6 +261,24 @@ def test_no_accessible_name_is_logged(tree, caplog):
     assert "source=uia" in written and "escalation=false" in written
     assert "resolution=found" in written and "resolution=ambiguous" in written
     assert "resolution=not_found" in written
+
+
+def code_of(path) -> str:
+    """A module as CODE, with every docstring stripped.
+
+    Needed for both files: observation.py's own docstring explains that the later screenshot layer is
+    the one planned egress, and adapter.py's prose names "chrome.exe" in an example. A substring search
+    over raw source matches that prose rather than any behaviour - the mistake these tests exist to
+    avoid, and one I made twice while writing them."""
+    module = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+    for node in ast.walk(module):
+        body = getattr(node, "body", None)
+        if not (isinstance(body, list) and body and isinstance(body[0], ast.Expr)):
+            continue
+        first = body[0].value
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            body.pop(0)
+    return ast.unparse(module)
 
 
 def uia_code() -> str:
@@ -399,7 +420,7 @@ def test_an_unreadable_freshness_setting_fails_closed(tree, tmp_path, monkeypatc
 
 def test_nothing_polls_continuously():
     """§7. Freshness is asked; it is not watched."""
-    source = (settings.PROJECT_ROOT / "app" / "verifier" / "observation.py").read_text(encoding="utf-8")
+    source = code_of(settings.PROJECT_ROOT / "app" / "verifier" / "observation.py")
     for forbidden in ("while True", "time.sleep", "Thread", "threading"):
         assert forbidden not in source, f"observation.py contains {forbidden}"
 
@@ -499,7 +520,7 @@ def test_the_guard_is_one_system_not_a_parallel_one():
 def test_only_the_uia_layer_exists_so_far():
     """§15. The enum names all five layers, but no DOM, OCR, vision or coordinate acquisition exists -
     and nothing here calls a provider."""
-    source = (settings.PROJECT_ROOT / "app" / "verifier" / "observation.py").read_text(encoding="utf-8")
+    source = code_of(settings.PROJECT_ROOT / "app" / "verifier" / "observation.py")
     code = uia_code()
     for absent in ("playwright", "screenshot", "ocr", "tesseract", "vision", "anthropic", "httpx"):
         assert absent not in source.lower(), f"observation.py mentions {absent}"
@@ -512,8 +533,7 @@ def test_only_the_uia_layer_exists_so_far():
 
 def test_no_app_specific_code_was_added():
     """§12. The examples motivated the architecture; the resolver is generic."""
-    observation_source = (settings.PROJECT_ROOT / "app" / "verifier" / "observation.py").read_text(
-        encoding="utf-8")
+    observation_source = code_of(settings.PROJECT_ROOT / "app" / "verifier" / "observation.py")
     for body in (observation_source.lower(), uia_code().lower()):
         for app in ("chrome", "notepad", "vscode", "explorer", "profile picker", "save as"):
             assert app not in body, f"the new code special-cases {app}"
