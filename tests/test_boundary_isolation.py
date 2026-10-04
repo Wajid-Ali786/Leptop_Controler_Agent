@@ -480,3 +480,129 @@ def test_a_production_shaped_handler_cannot_absorb_a_guard_hit():
                  lambda: listener_adapter._whisper()):
         with pytest.raises(safety_guards.PhysicalBoundaryEscaped):
             production_like(call)
+
+
+# --- The verifier's live keyboard read ----------------------------------------------------------------
+# app/verifier/adapter.py::modifier_keys_down() calls GetAsyncKeyState, which reads the REAL keyboard.
+# Nothing centrally replaced it, so whether a shortcut test passed depended on whether a modifier key
+# happened to be held while the suite ran - test_a_low_brain_floor_cannot_soften_a_real_executor_rule
+# failed once in six identical runs for exactly that reason.
+#
+# This boundary is REDIRECTED, not refused: it is a read, so there is no escape to prevent, only
+# non-determinism to remove. The other verifier observation reads are deliberately NOT covered - see the
+# note in safety_guards.py and the carried Phase 5 item.
+
+from app.verifier import adapter as verifier_adapter
+
+# Captured at IMPORT time - collection happens before any fixture runs, so this is the genuine
+# GetAsyncKeyState implementation rather than the stand-in the autouse guard installs.
+GENUINE_MODIFIER_READ = verifier_adapter.modifier_keys_down
+
+
+def test_an_ordinary_test_sees_no_modifier_held():
+    """1. Deterministic, whatever is physically held while the suite runs."""
+    assert verifier_adapter.modifier_keys_down() == []
+
+
+def test_the_real_getasynckeystate_path_is_not_reached(monkeypatch):
+    """2. Behavioural proof rather than an identity check: the genuine implementation goes through
+    _api(), so breaking _api() would make it raise. It still returns [], so the real read did not run."""
+    assert verifier_adapter.modifier_keys_down is not GENUINE_MODIFIER_READ, "it was not replaced"
+    monkeypatch.setattr(verifier_adapter, "_api",
+                        lambda: (_ for _ in ()).throw(AssertionError("the real keyboard was read")))
+    assert verifier_adapter.modifier_keys_down() == []
+
+
+def test_a_test_may_still_simulate_held_modifiers(monkeypatch):
+    """3, and §2. The autouse guard installs a default; a test that needs a modifier to look held patches
+    the same function in its own body, which runs afterwards and therefore wins."""
+    monkeypatch.setattr(verifier_adapter, "modifier_keys_down", lambda: ["ctrl"])
+    assert verifier_adapter.modifier_keys_down() == ["ctrl"]
+
+
+def test_the_guard_redirects_and_never_raises():
+    """§2. Unlike the executor boundaries, reaching this one is not an escape, so it must not raise."""
+    for _ in range(3):
+        assert verifier_adapter.modifier_keys_down() == []
+
+
+@pytest.mark.parametrize("marker, gate", sorted(safety_guards.DESKTOP_EXEMPT.items()))
+def test_the_desktop_marker_alone_does_not_grant_the_real_read(marker, gate, monkeypatch):
+    """4. A marker with no gate is not an exemption - the same rule as every other guard."""
+    monkeypatch.delenv(gate, raising=False)
+    assert safety_guards.exempt(Node(marker), safety_guards.DESKTOP_EXEMPT) is False
+
+
+@pytest.mark.parametrize("marker, gate", sorted(safety_guards.DESKTOP_EXEMPT.items()))
+def test_the_gate_alone_does_not_grant_the_real_read(marker, gate, monkeypatch):
+    """5. And a gate with no marker is not one either."""
+    monkeypatch.setenv(gate, "1")
+    assert safety_guards.exempt(Node(), safety_guards.DESKTOP_EXEMPT) is False
+
+
+@pytest.mark.parametrize("marker, gate", sorted(safety_guards.DESKTOP_EXEMPT.items()))
+def test_marker_and_gate_together_exempt_the_real_read(marker, gate, monkeypatch):
+    """6, first half: with both, the pair IS an exemption."""
+    monkeypatch.setenv(gate, "1")
+    assert safety_guards.exempt(Node(marker), safety_guards.DESKTOP_EXEMPT) is True
+
+
+def test_an_exempt_test_never_has_the_guard_installed():
+    """6, second half - over the SHIPPED fixture rather than a re-implementation of its condition.
+
+    The genuine function cannot be observed from inside an ordinary test, because the guard has already
+    replaced it by the time the test body runs. So what is checked here is the fixture itself: it returns
+    on the exempt branch, and the installer is reachable only after that check."""
+    import ast
+    import inspect
+
+    import conftest
+    source = inspect.getsource(conftest)
+    fixture = next(node for node in ast.walk(ast.parse(source))
+                   if isinstance(node, ast.FunctionDef) and node.name == "no_live_input_state")
+
+    guarded = [node for node in ast.walk(fixture) if isinstance(node, ast.If)]
+    assert len(guarded) == 1, "the fixture has more than one branch"
+    assert "DESKTOP_EXEMPT" in ast.unparse(guarded[0].test)
+    assert any(isinstance(node, ast.Return) for node in ast.walk(guarded[0])), "it does not return early"
+
+    installs = [node for node in ast.walk(fixture) if isinstance(node, ast.Call)
+                and "install_verifier_input_guard" in ast.unparse(node.func)]
+    assert len(installs) == 1, installs
+    assert ast.unparse(fixture.body[-1]).startswith("safety_guards.install_verifier_input_guard"), (
+        "the install must be the last statement, after the exemption check")
+    assert GENUINE_MODIFIER_READ.__module__ == "app.verifier.adapter", "the real read still exists"
+
+
+def test_the_guard_reuses_the_existing_desktop_category_and_adds_no_marker():
+    """§1. No new marker or gate: the real-desktop pair already means "this test may touch the machine",
+    and 7 - the exemption-map drift test - therefore has nothing new to agree about."""
+    from tests.conftest import OPT_IN_GATES
+    assert set(safety_guards.DESKTOP_EXEMPT) <= set(OPT_IN_GATES)
+    categories = {**safety_guards.DESKTOP_EXEMPT, **safety_guards.AUDIO_EXEMPT,
+                  **safety_guards.MICROPHONE_EXEMPT, **safety_guards.MODEL_EXEMPT,
+                  **safety_guards.PROVIDER_EXEMPT, **safety_guards.DATABASE_EXEMPT}
+    assert "real_verifier_input" not in categories, "a new marker category was invented"
+    assert "real_modifier" not in categories
+
+
+def test_the_guard_covers_only_the_keyboard_read():
+    """§4. Deliberately narrow. The other verifier observation reads stay per-test-faked, recorded as a
+    Phase 5 item rather than fixed here, because Phase 5 is what expands screen observation."""
+    import inspect
+    source = inspect.getsource(safety_guards.install_verifier_input_guard)
+    assert "modifier_keys_down" in source
+    for untouched in ("active_target", "cursor_position", "window_at", "list_windows",
+                      "clipboard_sequence_number", "clipboard_kinds", "read_text"):
+        assert untouched not in source, f"{untouched} was pulled into this fix"
+
+
+def test_production_code_was_not_changed_by_this_fix():
+    """§3. The real implementation still reads the real keyboard; only the test harness differs."""
+    from config.settings import PROJECT_ROOT
+    adapter_source = (PROJECT_ROOT / "app" / "verifier" / "adapter.py").read_text(encoding="utf-8")
+    assert "GetAsyncKeyState" in adapter_source, "the production read was removed"
+    assert "safety_guards" not in adapter_source, "production imports the test harness"
+    logic_source = (PROJECT_ROOT / "app" / "verifier" / "logic.py").read_text(encoding="utf-8")
+    assert "adapter.modifier_keys_down" in logic_source
+    assert "safety_guards" not in logic_source

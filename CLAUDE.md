@@ -59,7 +59,9 @@ git log, git show) are fine. Stage files (git add) only when the owner explicitl
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 4 — Memory. DESIGN/AUDIT ONLY; NOT STARTED.
+Current phase: 5 — Screen Understanding. DESIGN/AUDIT ONLY; NOT STARTED.
+  The Phase 5 audit must define coherent verifier/screen-observation privacy and test-isolation
+  boundaries BEFORE expanding observation capability (see /docs/phase4-closeout.md Limitation G).
 Phase 0 — Foundation: COMPLETE (Done-when checklist passed 2026-09-16; tagged v0.1).
 Phase 1 — Basic Computer Control: COMPLETE (Done-when verified 2026-09-20).
   Verified by TWO runs of scripts/phase1_checklist.py, because the real-desktop and
@@ -78,6 +80,12 @@ Phase 3 — Brain + Planner: COMPLETE (Done-when verified 2026-10-02). Evidence,
   whose ownership token can't be attached is not automatically closable; a destroyed-and-recreated
   window refuses rather than guessing; persistent memory is Phase 4, broad conversational context
   Phase 6, and communication integrations Phase 10.
+Phase 4 — Memory: COMPLETE (Done-when verified 2026-10-03). Evidence, and the seven limitations it
+  carries, are in /docs/phase4-closeout.md — read that before starting Phase 5. In short: Memory data
+  is never sent to Claude and any future egress needs its own privacy review; the People query boundary
+  has no messaging caller because messaging is Phase 10; nine of the fifteen structures are
+  persistence-oriented only; and the wider verifier observation reads (read_text, the clipboard reads,
+  active_target, cursor_position, window_at, list_windows) are NOT centrally isolated yet.
 Model selection is RESOLVED: brain.model = claude-sonnet-5-5 (config/config.yaml).
 
 ## Test safety rule (added 2026-10-01, after a real desktop side-effect incident)

@@ -619,9 +619,12 @@ def test_the_console_imports_no_adapter_and_only_one_way_to_act():
             imported.setdefault("", set()).update(alias.name for alias in node.names)
     assert not any("adapter" in module for module in imported), imported
     assert not any(name in ("pyautogui", "ctypes", "pywinauto") for names in imported.values() for name in names)
-    assert imported["app.executor.logic"] == {"execute_with_recovery", "resolve"}, (
+    assert imported["app.executor.logic"] == {"execute_with_recovery", "resolve",
+                                              "configured_app_names"}, (
         "execute_with_recovery stays the only way to act; resolve() is the pure routing question, "
-        "proven side-effect free by tests/test_executor_resolve.py")
+        "proven side-effect free by tests/test_executor_resolve.py; configured_app_names() is a "
+        "read-only config question, added so the remembered-alias path checks a name against the "
+        "configured set without re-reading or duplicating executor.apps")
 
 
 def test_the_console_only_reads_from_the_verifier():

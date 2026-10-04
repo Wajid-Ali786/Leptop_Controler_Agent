@@ -39,6 +39,16 @@ safety:
 
 # --- Folder paths ---
 
+# --- Observation (app/verifier/observation.py) - Phase 5 screen understanding ---
+# Finding a control the user named, through the Windows accessibility tree. Only layer 1 of the frozen
+# hierarchy exists so far; nothing here configures DOM, OCR, vision or coordinate fallback.
+# Nothing observed is logged, persisted, or sent to Claude.
+observation:
+  snapshot_timeout_seconds: 2.0   # how long reading one window's controls may take before it fails
+  freshness_seconds: 2.0          # how old an observation may be and still be worth acting on; the
+                                  # screen can change between observing and acting, so this is asked
+                                  # explicitly rather than assumed
+
 # --- Memory (app/memory/) ---
 memory:
   # The structured memory database (docs/step3 Section 1 puts it under data/; data/*.db is git-ignored).
@@ -58,9 +68,23 @@ logging:
 executor:
   # Apps the assistant may open: name -> Windows executable. Anything not listed is refused,
   # never guessed (Phase 4 memory adds user aliases). Every open still passes the safety gate.
+  # Entries are launched with NO ARGUMENTS and no shell: the value must be something
+  # shutil.which() can resolve - a name on PATH, or an absolute path. A .cmd/.bat shim will NOT work
+  # (Windows cannot start one without a shell), which is why VS Code points at Code.exe rather than the
+  # `code` command.
   apps:
     notepad: notepad.exe
     calculator: calc.exe
+    chrome: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+    vscode: 'C:\Users\Wajid\AppData\Local\Programs\Microsoft VS Code\Code.exe'
+    explorer: explorer.exe
+    # NOT SUPPORTED by the current launch contract, and removed after a real smoke test: a console
+    # application cannot be configured here. launch_app() runs Popen([path]) with the standard handles
+    # redirected to NUL and no CREATE_NEW_CONSOLE, so powershell.exe (and cmd.exe, identically) reads
+    # EOF from its stdin immediately and exits, having inherited this console rather than creating one.
+    # Four real attempts left no surviving process at all. Supporting it needs an explicit
+    # console-launch capability in the Executor, not a configuration entry.
+    #   powershell: powershell.exe
   # Action -> Result -> Recovery: attempts per action, including the first. A failed, retryable
   # attempt is offered to the user for retry - never silently continued.
   max_attempts: 3
@@ -100,9 +124,24 @@ verifier:
   # Title of each app's window (case-insensitive regular expression). Opening an app only counts
   # as done when a NEW window matching it appears; windows already open never count. Closing an app
   # only closes windows the assistant opened in this session, and counts as done when they're gone.
+  # A pattern must match the part of the title that does NOT change while the window lives. Ownership is
+  # lost the moment a window stops matching (a window whose title no longer matches is treated as gone),
+  # so anchoring on the app's own name is what keeps close_app working after the user navigates.
   app_windows:
     notepad: "Notepad$"
     calculator: "^Calculator$"
+    # Chrome appends its own name to every page title, so this survives navigation. Note that Chrome,
+    # VS Code and other Electron apps all share the window CLASS Chrome_WidgetWin_1 - only the title
+    # tells them apart, which is why these two patterns must stay distinct.
+    chrome: "Google Chrome$"
+    vscode: "Visual Studio Code$"
+    # KNOWN LIMITATION, accepted deliberately. explorer.exe with no arguments opens a window titled
+    # exactly "File Explorer", so opening is reliable - but as soon as the user navigates to a folder the
+    # title becomes the folder's name and no longer matches, so close_app refuses rather than guessing.
+    # A looser pattern was rejected: it would miscount other windows and risk matching unrelated ones.
+    explorer: "^File Explorer$"
+    # powershell removed with its executor.apps entry. The pattern was never at fault and was never
+    # even tested: no process and therefore no window ever existed. It is NOT broadened.
 
 # --- Listener (app/listener/) — Phase 2 voice input ---
 # Speech-to-text runs locally (faster-whisper). Nothing here downloads anything by itself:

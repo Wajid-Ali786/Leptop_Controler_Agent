@@ -386,7 +386,9 @@ def _python_files():
     # hotkey.py registers the global emergency-stop hotkey, which sends nothing and acts on nothing.
     # tests/test_executor_hotkey.py limits it to the adapter's five hotkey functions.
     ("app.executor", ("app/executor/logic.py", "app/executor/hotkey.py")),
-    ("app.verifier", ("app/verifier/logic.py",)),
+    # app/verifier/observation.py is the Phase 5 screen-observation decision file - a focused extra
+    # file in its own module (CLAUDE.md amendment 2026-09-16). It uses the VERIFIER's adapter only.
+    ("app.verifier", ("app/verifier/logic.py", "app/verifier/observation.py")),
 ])
 def test_only_each_modules_logic_uses_its_adapter(package, allowed):
     """Every real action must pass the safety gate in executor.execute(), and desktop reads go
@@ -405,12 +407,16 @@ def test_only_each_modules_logic_uses_its_adapter(package, allowed):
 def test_only_executor_adapter_controls_the_computer():
     root = settings.PROJECT_ROOT
     allowed = root / "app" / "executor" / "adapter.py"
-    controllers = ("subprocess", "pyautogui", "pywinauto", "playwright")
+    # pywinauto is UI Automation - it READS the screen, and reading the desktop is the Verifier
+    # adapter's job (Phase 5 layer 1). It is allowed there and nowhere else; it can still only be
+    # reached through app/verifier/observation.py, and an offline test cannot even import it.
+    reader = root / "app" / "verifier" / "adapter.py"
+    controllers = ("subprocess", "pyautogui", "playwright")
     offenders = [
         f"{path.relative_to(root)}: {module}"
-        for path in (root / "app").rglob("*.py") if path != allowed
+        for path in (root / "app").rglob("*.py") if path not in (allowed, reader)
         for module, _ in _imports(path)
-        if module.split(".")[0] in controllers
+        if module.split(".")[0] in (*controllers, "pywinauto")
     ]
     assert offenders == [], f"Only app/executor/adapter.py may control the computer: {offenders}"
 

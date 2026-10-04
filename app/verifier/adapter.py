@@ -24,7 +24,8 @@ extra dependency and has no side effects.
 import ctypes
 import sys
 
-from app.verifier.models import ActiveTarget, ControlInfo, ScrollState, Screen, WindowInfo, WindowState
+from app.verifier.models import (ActiveTarget, ControlInfo, ScrollState, Screen, UiaElement,
+                                 WindowInfo, WindowState)
 
 _MAX_CLASS_NAME = 256  # Windows limits window class names to 256 characters
 _DWMWA_CLOAKED = 14    # "cloaked": the window exists and counts as visible, but isn't drawn on screen
@@ -371,3 +372,122 @@ def _window_info(api: _Api, hwnd) -> WindowInfo | None:
         cloaked.value = 0  # attribute unavailable: treat the window as shown
     return WindowInfo(handle=int(hwnd), title=buffer.value, class_name=class_name.value,
                       enabled=bool(api.user32.IsWindowEnabled(hwnd)), cloaked=bool(cloaked.value))
+
+
+# --- Phase 5: UI Automation (layer 1 of the frozen hierarchy) ----------------------------------------
+# pywinauto is imported lazily, inside the one function that needs it, exactly as the mouse and speech
+# libraries are: importing this module must never load a UI Automation stack, and an offline test must
+# never be able to.
+#
+# THE PRIVACY BOUNDARY IS HERE, AND IT IS ABSOLUTE. Finding a control the user named means reading
+# accessible names, and an accessible name is user-visible content. So the name is read, normalised and
+# compared INSIDE this function, and the elements that come back carry no name at all. An unmatched
+# label therefore cannot be returned to a caller, cannot be logged, cannot be persisted and cannot be
+# sent anywhere - not because a caller is careful, but because it never leaves.
+#
+# The cost of that is a sliver of matching policy living in the adapter rather than in logic. It buys an
+# absolute boundary instead of a convention, which is the better trade for content.
+#
+# NEVER READ, in this phase and under no flag: ValuePattern values, TextPattern text, document or body
+# text, and the value of any control that reports itself as a password.
+
+_UIA_MAX_ELEMENTS = 2000          # a hard ceiling so a pathological tree cannot be walked forever
+
+
+def uia_find_by_name(window_handle: int, normalized_name: str, timeout_seconds: float = 2.0) -> list:
+    """Structural evidence for every control in `window_handle` whose accessible name matches.
+
+    Returns a list of UiaElement - identifiers, role, bounds and state, and NO name. Empty means the
+    window was readable and nothing matched; VerifierAdapterError means the window could not be read at
+    all (no accessibility tree exposed, the window is gone, or UI Automation refused)."""
+    if sys.platform != "win32":
+        raise VerifierAdapterError("reading the accessibility tree is only supported on Windows")
+    if not isinstance(normalized_name, str) or not normalized_name:
+        return []
+    try:
+        from pywinauto.uia_element_info import UIAElementInfo
+    except Exception as exc:                      # not installed, or the COM wrappers cannot be built
+        raise VerifierAdapterError(
+            f"UI Automation is unavailable on this computer ({type(exc).__name__})") from None
+    try:
+        root = UIAElementInfo(window_handle)
+        found = []
+        for index, element in enumerate(root.descendants()):
+            if index >= _UIA_MAX_ELEMENTS:
+                break
+            if _uia_name(element) != normalized_name:
+                continue                          # the name is compared here and then dropped
+            found.append(_uia_element(window_handle, element))
+        return found
+    except Exception as exc:
+        raise VerifierAdapterError(
+            f"the window's accessibility tree could not be read ({type(exc).__name__})") from None
+
+
+def _uia_name(element) -> str:
+    """The element's accessible name in comparison form. Never returned, never logged."""
+    try:
+        return " ".join(str(element.name or "").split()).lower()
+    except Exception:
+        return ""
+
+
+def _uia_element(window_handle: int, element):
+    """Structural properties only. Anything unreadable degrades to a safe default rather than failing
+    the whole walk: a missing automation id is not a reason to refuse to find a button."""
+    def safe(read, default):
+        try:
+            value = read()
+            return default if value is None else value
+        except Exception:
+            return default
+
+    rectangle = safe(lambda: element.rectangle, None)
+    bounds = None
+    if rectangle is not None:
+        bounds = safe(lambda: (int(rectangle.left), int(rectangle.top),
+                               int(rectangle.right), int(rectangle.bottom)), None)
+    runtime = safe(lambda: element.runtime_id, None)
+    return UiaElement(
+        window_handle=window_handle,
+        control_type=str(safe(lambda: element.control_type, "")),
+        runtime_id="-".join(str(part) for part in runtime) if runtime else "",
+        automation_id=str(safe(lambda: element.automation_id, "")),
+        class_name=str(safe(lambda: element.class_name, "")),
+        bounds=bounds,
+        enabled=bool(safe(lambda: element.enabled, True)),
+        focused=bool(safe(lambda: element.has_keyboard_focus, False)),
+        offscreen=bool(safe(lambda: element.is_offscreen, False)),
+        # A control that reports itself as a password: its structure is evidence, its value is never read.
+        is_password=bool(safe(lambda: _is_password(element), False)),
+        patterns=tuple(sorted(str(name) for name in safe(lambda: _uia_patterns(element), ()))),
+    )
+
+
+def _is_password(element) -> bool:
+    for attribute in ("is_password", "IsPassword"):
+        value = getattr(element, attribute, None)
+        if isinstance(value, bool):
+            return value
+    element_info = getattr(element, "element", None)
+    return bool(getattr(element_info, "CurrentIsPassword", False)) if element_info is not None else False
+
+
+def _uia_patterns(element) -> tuple:
+    """Which UIA patterns the element supports - structural metadata, no values read."""
+    element_info = getattr(element, "element", None)
+    if element_info is None:
+        return ()
+    supported = []
+    for name, available in (("Invoke", "CurrentIsInvokePatternAvailable"),
+                            ("Value", "CurrentIsValuePatternAvailable"),
+                            ("Text", "CurrentIsTextPatternAvailable"),
+                            ("Toggle", "CurrentIsTogglePatternAvailable"),
+                            ("Selection", "CurrentIsSelectionPatternAvailable"),
+                            ("ExpandCollapse", "CurrentIsExpandCollapsePatternAvailable")):
+        try:
+            if bool(getattr(element_info, available, False)):
+                supported.append(name)
+        except Exception:
+            continue
+    return tuple(supported)

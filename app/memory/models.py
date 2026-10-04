@@ -15,6 +15,7 @@ conversation transcripts, arbitrary window titles, file contents, and the Execut
 tokens. There is also no general-purpose payload column, because one would quietly permit all of them.
 """
 from dataclasses import dataclass
+from enum import Enum
 
 # The schema this build understands. A database recording a HIGHER number was written by a newer build,
 # so it is refused rather than guessed at (app/memory/logic.py). There is no migration framework in this
@@ -548,3 +549,19 @@ class Deleted:
     cannot put an address into a result, a log line or an assertion failure."""
     table: str
     key: object
+
+
+# --- Final integration: the persistence decision -----------------------------------------------------
+
+class PersistenceDecision(Enum):
+    """Whether a caller has decided this correction is safe to keep.
+
+    Memory has no way to recognise a password or an API key inside an arbitrary string, and it must not
+    guess. So a durable write requires the CALLER to say so: the decision is a required argument with no
+    default, which means a caller that has not thought about it cannot accidentally persist anything.
+
+    It carries no value of its own - only "allow" or "deny" - so the decision itself can never become a
+    place where a secret is passed along."""
+    ALLOW = "allow"
+    DENY = "deny"
+

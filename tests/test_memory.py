@@ -1079,7 +1079,11 @@ def test_there_are_exactly_two_delete_statements_and_each_has_its_own_job():
 # =======================================================================================================
 
 from app.memory.logic import CANNOT_LEARN, CANNOT_REMEMBER
-from app.memory.models import (EXPLICIT, LEARNED_PATTERN, Correction, CorrectionLearner, CorrectionTask)
+from app.memory.models import (EXPLICIT, LEARNED_PATTERN, Correction, CorrectionLearner,
+                               CorrectionTask, PersistenceDecision)
+
+ALLOW = PersistenceDecision.ALLOW      # these tests are about durable behaviour, so they say so
+DENY = PersistenceDecision.DENY
 
 SCOPE = "website:example.com/login"
 WRONG, RIGHT = "button-A", "button-B"
@@ -1157,7 +1161,7 @@ def test_the_first_correction_does_not_become_a_learned_pattern(ready):
     """Items 6 and 7. The frozen rule: one correction must not permanently change behaviour. The evidence
     that it happened lives only in the process-local learner, which no lookup consults."""
     learner = CorrectionLearner()
-    task, outcome = logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
+    task, outcome = logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
 
     assert isinstance(outcome, NotFound), outcome
     assert rows(ready) == [], "the first correction persisted"
@@ -1168,7 +1172,7 @@ def test_the_first_correction_does_not_become_a_learned_pattern(ready):
 
 def test_the_first_correction_stops_mattering_when_its_task_ends(ready):
     learner = CorrectionLearner()
-    task, _outcome = logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
+    task, _outcome = logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
     assert logic.resolve_value(SCOPE, WRONG, task=task.ended()).value == WRONG
     assert rows(ready) == []
 
@@ -1176,8 +1180,8 @@ def test_the_first_correction_stops_mattering_when_its_task_ends(ready):
 def test_the_second_matching_correction_promotes_immediately(ready):
     """Items 8 and 9, read out of SQLite: exactly one learned row, occurrences = 2."""
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
-    task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner, a_correction())
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
+    task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner, a_correction(), ALLOW)
 
     assert isinstance(outcome, Found), getattr(outcome, "message", outcome)
     stored = rows(ready)
@@ -1191,8 +1195,8 @@ def test_the_second_matching_correction_promotes_immediately(ready):
 def test_a_learned_pattern_outlives_its_task(ready):
     """Item 10."""
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
-    task, _ = logic.observe_correction(CorrectionTask("task-B"), learner, a_correction())
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
+    task, _ = logic.observe_correction(CorrectionTask("task-B"), learner, a_correction(), ALLOW)
     assert logic.resolve_value(SCOPE, WRONG, task=task.ended()).value == RIGHT
     assert logic.resolve_value(SCOPE, WRONG).value == RIGHT
 
@@ -1201,8 +1205,8 @@ def test_a_learned_pattern_survives_reopening_the_database(ready):
     """Item 11. Closed and reopened through the real logic, with a brand-new learner - so only the row
     can be what answers."""
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
-    logic.observe_correction(CorrectionTask("task-B"), learner, a_correction())
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
+    logic.observe_correction(CorrectionTask("task-B"), learner, a_correction(), ALLOW)
 
     assert isinstance(logic.open_memory(), MemoryDatabase)
     assert logic.resolve_value(SCOPE, WRONG).value == RIGHT
@@ -1212,9 +1216,9 @@ def test_a_learned_pattern_survives_reopening_the_database(ready):
 def test_a_different_scope_is_a_different_correction(ready):
     """Item 12."""
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
     _task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner,
-                                             a_correction(scope="website:other.example/login"))
+                                             a_correction(scope="website:other.example/login"), ALLOW)
     assert isinstance(outcome, NotFound), "a different scope counted as a repetition"
     assert rows(ready) == []
     assert learner.count(a_correction()) == 1
@@ -1223,9 +1227,9 @@ def test_a_different_scope_is_a_different_correction(ready):
 def test_a_different_right_value_is_a_different_correction(ready):
     """Item 13."""
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(right="button-B"))
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(right="button-B"), ALLOW)
     _task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner,
-                                             a_correction(right="button-C"))
+                                             a_correction(right="button-C"), ALLOW)
     assert isinstance(outcome, NotFound), "a different right value counted as a repetition"
     assert rows(ready) == []
 
@@ -1233,18 +1237,18 @@ def test_a_different_right_value_is_a_different_correction(ready):
 def test_identity_ignores_case_and_surrounding_space_only(ready):
     """The same deterministic normalisation as everywhere else in Memory - and nothing more."""
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(wrong="  Button-A "))
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(wrong="  Button-A "), ALLOW)
     _task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner,
-                                             a_correction(wrong="button-a"))
+                                             a_correction(wrong="button-a"), ALLOW)
     assert isinstance(outcome, Found), "normalised equality did not match"
     assert len(rows(ready)) == 1
 
 
 def test_a_near_miss_is_not_the_same_correction(ready):
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(right="button-B"))
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(right="button-B"), ALLOW)
     _task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner,
-                                             a_correction(right="button-BB"))
+                                             a_correction(right="button-BB"), ALLOW)
     assert isinstance(outcome, NotFound), "fuzzy matching crept in"
 
 
@@ -1252,7 +1256,7 @@ def test_further_identical_corrections_update_the_one_row(ready):
     """Items 14 and 15. No second learned row, and the count keeps rising on the row that exists."""
     learner = CorrectionLearner()
     for task_name in ("A", "B", "C", "D"):
-        logic.observe_correction(CorrectionTask(task_name), learner, a_correction())
+        logic.observe_correction(CorrectionTask(task_name), learner, a_correction(), ALLOW)
     stored = rows(ready)
     assert len(stored) == 1, f"duplicate learned rows: {stored}"
     assert stored[0][5] == 4, f"occurrences is {stored[0][5]}"
@@ -1263,12 +1267,12 @@ def test_a_new_learner_loses_the_unpromoted_count(ready):
     """Item 16. The candidate count is process-local by design: restarting the companion forgets an
     observation that never earned persistence, which the frozen Done-when does not require to survive."""
     first = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), first, a_correction())
+    logic.observe_correction(CorrectionTask("task-A"), first, a_correction(), ALLOW)
     assert first.count(a_correction()) == 1
 
     restarted = CorrectionLearner()
     assert restarted.count(a_correction()) == 0
-    _task, outcome = logic.observe_correction(CorrectionTask("task-B"), restarted, a_correction())
+    _task, outcome = logic.observe_correction(CorrectionTask("task-B"), restarted, a_correction(), ALLOW)
     assert isinstance(outcome, NotFound), "a lost count still promoted"
     assert rows(ready) == []
 
@@ -1289,7 +1293,7 @@ def test_the_learner_holds_only_the_corrections_identity(ready):
 
 def test_remember_this_is_stored_immediately(ready):
     """Items 17, 18 and 20. One call, no repetition, and it is an explicit row - not a learned one."""
-    outcome = logic.remember_explicitly(a_correction(right="button-Z"))
+    outcome = logic.remember_explicitly(a_correction(right="button-Z"), ALLOW)
     assert isinstance(outcome, Found), getattr(outcome, "message", outcome)
     stored = rows(ready)
     assert len(stored) == 1
@@ -1299,20 +1303,20 @@ def test_remember_this_is_stored_immediately(ready):
 
 
 def test_an_explicit_memory_needs_no_temporary_correction_first(ready):
-    assert isinstance(logic.remember_explicitly(a_correction(right="button-Z")), Found)
+    assert isinstance(logic.remember_explicitly(a_correction(right="button-Z"), ALLOW), Found)
     assert rows(ready)[0][0] == EXPLICIT
 
 
 def test_an_explicit_memory_survives_reopening_the_database(ready):
     """Item 19."""
-    logic.remember_explicitly(a_correction(right="button-Z"))
+    logic.remember_explicitly(a_correction(right="button-Z"), ALLOW)
     assert isinstance(logic.open_memory(), MemoryDatabase)
     assert logic.resolve_value(SCOPE, WRONG).value == "button-Z"
 
 
 def test_remembering_the_same_thing_twice_does_not_duplicate_it(ready):
-    logic.remember_explicitly(a_correction(right="button-Z"))
-    logic.remember_explicitly(a_correction(right="button-Y"))
+    logic.remember_explicitly(a_correction(right="button-Z"), ALLOW)
+    logic.remember_explicitly(a_correction(right="button-Y"), ALLOW)
     stored = rows(ready, EXPLICIT)
     assert len(stored) == 1, stored
     assert stored[0][3] == "button-Y", "the newer instruction did not win"
@@ -1320,7 +1324,7 @@ def test_remembering_the_same_thing_twice_does_not_duplicate_it(ready):
 
 def test_a_correction_needs_its_three_values(ready):
     for bad in (a_correction(scope="  "), a_correction(wrong=""), a_correction(right="   ")):
-        assert isinstance(logic.remember_explicitly(bad), NotFound), bad
+        assert isinstance(logic.remember_explicitly(bad, ALLOW), NotFound), bad
     assert rows(ready) == []
 
 
@@ -1330,7 +1334,7 @@ def test_a_learned_pattern_beats_the_plain_fact(ready):
     """Item 21."""
     learner = CorrectionLearner()
     for name in ("A", "B"):
-        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"))
+        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"), ALLOW)
     assert logic.resolve_value(SCOPE, WRONG).value == "button-Y"
 
 
@@ -1340,11 +1344,11 @@ def test_an_explicit_memory_beats_a_learned_pattern(ready):
     written first and however many times the pattern was seen."""
     learner = CorrectionLearner()
     for name in ("A", "B", "C"):
-        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"))
+        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"), ALLOW)
     assert logic.resolve_value(SCOPE, WRONG).value == "button-Y"
     assert rows(ready, LEARNED_PATTERN)[0][5] == 3, "the pattern really is well established"
 
-    assert isinstance(logic.remember_explicitly(a_correction(right="button-Z")), Found)
+    assert isinstance(logic.remember_explicitly(a_correction(right="button-Z"), ALLOW), Found)
     assert logic.resolve_value(SCOPE, WRONG).value == "button-Z"
 
 
@@ -1358,10 +1362,10 @@ def test_the_full_frozen_precedence_chain(ready):
     """
     learner = CorrectionLearner()
     for name in ("A", "B"):
-        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"))
+        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"), ALLOW)
     assert logic.resolve_value(SCOPE, WRONG).value == "button-Y"
 
-    logic.remember_explicitly(a_correction(right="button-Z"))
+    logic.remember_explicitly(a_correction(right="button-Z"), ALLOW)
     assert logic.resolve_value(SCOPE, WRONG).value == "button-Z"
 
     task = logic.correct_for_this_task(CorrectionTask("task-T"), a_correction(right="button-W"))
@@ -1380,18 +1384,18 @@ def test_the_superseded_learned_row_is_kept_for_history(ready):
     """Item 25 on its own: superseding is not deleting."""
     learner = CorrectionLearner()
     for name in ("A", "B"):
-        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"))
-    logic.remember_explicitly(a_correction(right="button-Z"))
+        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"), ALLOW)
+    logic.remember_explicitly(a_correction(right="button-Z"), ALLOW)
     assert adapter.count_corrections(ready, LEARNED_PATTERN) == 1
     assert adapter.count_corrections(ready, EXPLICIT) == 1
 
 
 def test_nothing_reorders_the_precedence_by_recency(ready):
     """A learned pattern observed AFTER the explicit instruction still does not outrank it."""
-    logic.remember_explicitly(a_correction(right="button-Z"))
+    logic.remember_explicitly(a_correction(right="button-Z"), ALLOW)
     learner = CorrectionLearner()
     for name in ("A", "B", "C", "D", "E"):
-        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"))
+        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"), ALLOW)
     assert rows(ready, LEARNED_PATTERN)[0][5] == 5
     assert logic.resolve_value(SCOPE, WRONG).value == "button-Z", "recency or count reordered it"
 
@@ -1404,7 +1408,7 @@ def test_an_uncorrected_value_comes_back_unchanged(ready):
 def test_the_context_field_separates_corrections(ready):
     """context is part of the identity, so the same wrong value corrected differently in two contexts
     does not collide."""
-    logic.remember_explicitly(a_correction(right="button-Z", context="desktop"))
+    logic.remember_explicitly(a_correction(right="button-Z", context="desktop"), ALLOW)
     assert logic.resolve_value(SCOPE, WRONG, context="desktop").value == "button-Z"
     assert logic.resolve_value(SCOPE, WRONG, context="mobile").value == WRONG
     assert logic.resolve_value(SCOPE, WRONG).value == WRONG
@@ -1425,8 +1429,8 @@ def test_a_temporary_correction_still_works_with_no_database(memory):
 def test_a_promotion_that_cannot_be_written_never_claims_success(memory):
     """Item 27. The task is still fixed, and the durable half says plainly that it could not be kept."""
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
-    task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner, a_correction())
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
+    task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner, a_correction(), ALLOW)
 
     assert isinstance(outcome, MemoryUnavailable), outcome
     assert CANNOT_LEARN in outcome.reason
@@ -1436,7 +1440,7 @@ def test_a_promotion_that_cannot_be_written_never_claims_success(memory):
 
 def test_an_explicit_write_that_fails_never_says_remembered(memory):
     """Item 28."""
-    outcome = logic.remember_explicitly(a_correction())
+    outcome = logic.remember_explicitly(a_correction(), ALLOW)
     assert isinstance(outcome, MemoryUnavailable), outcome
     assert CANNOT_REMEMBER in outcome.reason
     assert "remembered" not in outcome.reason.replace(CANNOT_REMEMBER, "")
@@ -1447,10 +1451,10 @@ def test_no_raw_sqlite_error_escapes_a_correction_operation(memory):
     memory.parent.mkdir(parents=True, exist_ok=True)
     memory.write_bytes(b"SQLite format 3\x00" + b"\x6b" * 320)
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
     operations = [
-        lambda: logic.observe_correction(CorrectionTask("task-B"), learner, a_correction())[1],
-        lambda: logic.remember_explicitly(a_correction()),
+        lambda: logic.observe_correction(CorrectionTask("task-B"), learner, a_correction(), ALLOW)[1],
+        lambda: logic.remember_explicitly(a_correction(), ALLOW),
         lambda: logic.resolve_value(SCOPE, WRONG),
     ]
     for operation in operations:
@@ -1461,11 +1465,11 @@ def test_a_failed_promotion_leaves_no_partial_row(ready, monkeypatch):
     """Item 30. The look-up and the write share one transaction, so a failure mid-promotion rolls the
     whole thing back - no learned row, and no occurrence count without it."""
     learner = CorrectionLearner()
-    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction())
+    logic.observe_correction(CorrectionTask("task-A"), learner, a_correction(), ALLOW)
 
     real_now = adapter._now
     monkeypatch.setattr(adapter, "_now", lambda: (_ for _ in ()).throw(sqlite3.OperationalError("disk")))
-    _task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner, a_correction())
+    _task, outcome = logic.observe_correction(CorrectionTask("task-B"), learner, a_correction(), ALLOW)
     monkeypatch.setattr(adapter, "_now", real_now)
 
     assert isinstance(outcome, MemoryUnavailable), outcome
@@ -1478,7 +1482,7 @@ def test_a_promotion_failure_can_still_succeed_later(ready):
     promotes - and still produces exactly one row."""
     learner = CorrectionLearner()
     for name in ("A", "B", "C"):
-        logic.observe_correction(CorrectionTask(name), learner, a_correction())
+        logic.observe_correction(CorrectionTask(name), learner, a_correction(), ALLOW)
     assert len(rows(ready)) == 1
     assert rows(ready)[0][5] == 3
 
@@ -1522,7 +1526,7 @@ def test_slice_3_added_no_cross_module_import_or_sqlite_leak():
 
 def test_corrections_cannot_produce_an_action(ready):
     """A correction resolves a VALUE. There is no path from one to something happening."""
-    logic.remember_explicitly(a_correction(right="button-Z"))
+    logic.remember_explicitly(a_correction(right="button-Z"), ALLOW)
     resolved = logic.resolve_value(SCOPE, WRONG)
     assert isinstance(resolved.value, str)
     assert type(resolved.value).__name__ not in ("ExecutorAction", "Plan", "Action", "RiskLevel")
@@ -1582,8 +1586,8 @@ def filled(ready):
 
     learner = CorrectionLearner()
     for name in ("task-A", "task-B"):          # twice, so it genuinely promotes
-        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"))
-    logic.remember_explicitly(a_correction(right="button-Z"))
+        logic.observe_correction(CorrectionTask(name), learner, a_correction(right="button-Y"), ALLOW)
+    logic.remember_explicitly(a_correction(right="button-Z"), ALLOW)
 
     # The nine structures with no Slice 2/3 API yet are written directly, which is what they are for in
     # this test: proving the backup carries ALL fifteen, not only the ones with behaviour.
@@ -1692,7 +1696,7 @@ def test_process_local_and_task_local_state_is_not_in_the_export(ready, tmp_path
     active temporary correction: neither may appear, and nothing may have been promoted."""
     learner = CorrectionLearner()
     task, outcome = logic.observe_correction(CorrectionTask("task-A"), learner,
-                                            a_correction(right="button-W"))
+                                            a_correction(right="button-W"), ALLOW)
     assert isinstance(outcome, NotFound), "it must not have promoted"
     assert learner.count(a_correction(right="button-W")) == 1
     assert task.correction_for(SCOPE, WRONG) is not None, "the temporary correction is live"

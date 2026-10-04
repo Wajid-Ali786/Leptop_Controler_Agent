@@ -430,6 +430,15 @@ def _prepare_open_app(action: ExecutorAction):
     return run
 
 
+def configured_app_names() -> list[str]:
+    """The app names configuration allows, sorted. Read-only, and the single source of that answer.
+
+    Published so a caller that must check a name against the configured set does not have to read or
+    re-validate executor.apps for itself. It grants nothing: knowing a name is configured is not
+    permission to open it, and every open still goes through resolve() and the safety gate."""
+    return sorted(_configured_apps())
+
+
 def _configured_apps() -> dict[str, str]:
     apps = get_setting("executor.apps")
     valid = isinstance(apps, dict) and apps and all(

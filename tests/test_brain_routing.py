@@ -19,6 +19,7 @@ from app.brain.models import (ARGS_FOR_KIND, INTERPRETATIONS, ClickArgs, CloseAp
                               PreviousActionContext, RefreshArgs, ScrollArgs, ShortcutArgs,
                               TypeTextArgs, Understood, WindowControlArgs, previous_action_context)
 from app.executor import commands
+from config.settings import get_setting
 from app.executor.logic import resolve
 from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
                                  WINDOW_CONTROL)
@@ -88,8 +89,11 @@ def test_a_brain_eligible_line_carries_the_local_answer_for_the_offline_case():
     """When the Brain can't be reached, nothing runs and the caller still has something true to say."""
     outcome = route("open the calculator")
     assert outcome.text == "open the calculator"
-    assert outcome.local_message == ("I don't know an app called 'the calculator'. "
-                                     "Apps I can open: calculator, notepad.")
+    # The sentence is pinned; the app list inside it is configuration, so it is composed the way
+    # app/executor/logic._resolve_app composes it rather than hardcoded.
+    configured = ", ".join(sorted(get_setting("executor.apps")))
+    assert outcome.local_message == (f"I don't know an app called 'the calculator'. "
+                                     f"Apps I can open: {configured}.")
     assert outcome.parsed is not None and outcome.parsed.kind == OPEN_APP
 
 

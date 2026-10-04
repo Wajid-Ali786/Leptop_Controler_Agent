@@ -36,7 +36,7 @@ messages the Executor already made safe to show (typed text is never in them).
 """
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable
 
@@ -46,12 +46,14 @@ from app.brain.models import (NeedsClarification, NotACommand, NotSupported, Und
                               previous_action_context)
 from app.executor import commands, emergency_stop, hotkey
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError
-from app.executor.logic import execute_with_recovery, resolve
+from app.executor.logic import configured_app_names, execute_with_recovery, resolve
 from app.planner import logic as session
 from app.planner.models import (TYPED_CONSOLE, FrontEnd, LifecycleRefusal, Plan, PlanRefusal,
                                 PlanStepSummary, TurnContext)
 from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL, \
-    ActionResult, ExecutorAction
+    ActionResult, ExecutorAction, RESOLVE_UNKNOWN_APP, Resolved, Unresolved
+from app.memory import queries as memory_queries
+from app.memory.models import Found as MemoryFound
 from app.safety.logic import ActionDeniedError
 from app.safety.models import RiskLevel
 from app.verifier import logic as verifier
@@ -289,18 +291,23 @@ def run_console(read=input, write=print, focus=None) -> int:
     write(_hotkey_line(hotkey.status()))
     was_active = hotkey.status().active
     focus = FocusHandover(write) if focus is None else focus
-    confirm, offer_retry = _confirm(read, write), _offer_retry(read, write)
-    prompts = Prompts(read=read, write=write, confirm=confirm, offer_retry=offer_retry)
+    pending = PendingCommand()
+    confirm, offer_retry = _confirm(read, write), _offer_retry(read, write, pending)
+    prompts = Prompts(read=read, write=write, confirm=confirm, offer_retry=offer_retry, pending=pending)
     context = TurnContext()
     while True:
         if was_active and not hotkey.status().active:  # said once, when it changes - not before every command
             was_active = False
             write(HOTKEY_LOST.format(reason=hotkey.status().reason or "it is no longer registered."))
-        try:
-            line = read("> ")
-        except (EOFError, KeyboardInterrupt):
-            write("")
-            return 0
+        queued = pending.take()      # a command typed at a mini-prompt, taken exactly once
+        if queued is not None:
+            line = queued
+        else:
+            try:
+                line = read("> ")
+            except (EOFError, KeyboardInterrupt):
+                write("")
+                return 0
         word = line.strip().lower()
         if not word:
             continue
@@ -350,6 +357,50 @@ PLAN_DONE = "Done: all {count} step{plural} finished."
 NOTHING_TO_DO = "There was nothing to do in that."
 
 
+def is_fresh_command(line: str) -> bool:
+    """Is this line a NEW top-level command rather than an answer to the question just asked?
+
+    The mini-prompts - retry, correction, clarification - ask for information, and a line typed there
+    used to be consumed as the answer and thrown away. Worse, at the correction prompt it became a paid
+    model call about a plan the user had already abandoned.
+
+    This invents no second parser. It reuses the existing boundaries, and the discriminator is whether
+    the DETERMINISTIC PARSER recognised a verb:
+
+      * LocalAction                 "open chrome"       - parsed and resolvable
+      * BrainEligible with parsed   "close powershell"  - a real verb whose target did not resolve
+      * the console's own words      help, exit
+
+    Everything else is an answer, which is what keeps these prompts usable: a correction like "use the
+    other Ali", a clarification answer, and yes/no/cancel all have no parsed action, so they are still
+    consumed as answers. A bare "close" is ambiguous rather than parsed, so it stays an answer too."""
+    if not isinstance(line, str) or not line.strip():
+        return False
+    if line.strip().lower() in ("exit", "help"):
+        return True
+    route = brain.route(line, resolve)
+    if isinstance(route, brain.LocalAction):
+        return True
+    return isinstance(route, brain.BrainEligible) and getattr(route, "parsed", None) is not None
+
+
+@dataclass
+class PendingCommand:
+    """One slot for a line typed at a mini-prompt that turned out to be a fresh command.
+
+    Owned by run_console. A prompt puts the line here INSTEAD of consuming it, and the loop takes it and
+    runs it exactly once: take() empties the slot, so the line can neither run twice nor be left behind.
+    There is no nesting and no queue - one slot, taken before each read."""
+    line: str | None = None
+
+    def put(self, line: str) -> None:
+        self.line = line
+
+    def take(self) -> str | None:
+        line, self.line = self.line, None
+        return line
+
+
 @dataclass(frozen=True)
 class Prompts:
     """The console's own keyboard and screen, passed in so a test can drive the whole flow.
@@ -360,6 +411,9 @@ class Prompts:
     write: Callable[[str], None]
     confirm: Callable | None = None
     offer_retry: Callable | None = None
+    # Where a mini-prompt hands a fresh command back to the console loop. None - which is what the voice
+    # console and every caller that does not own a loop pass - keeps the old behaviour exactly.
+    pending: "PendingCommand | None" = None
 
 
 def is_brain_eligible(text: str) -> bool:
@@ -400,7 +454,48 @@ def handle_typed_line(text: str, context: TurnContext, prompts: Prompts, focus=N
     context = session.begin_root_command(context)          # a new line is a new root command
     if isinstance(route, brain.LocalAction):
         return _run_local(route.action, context, prompts, focus)
+    remembered = _remembered_app(route)
+    if remembered is not None:
+        return _run_local(remembered, context, prompts, focus)
     return _ask_the_brain(route, context, prompts, focus, interpret, frontend)
+
+
+def _remembered_app(route) -> ExecutorAction | None:
+    """The action a remembered APP ALIAS makes runnable, or None to carry on to the Brain.
+
+    THE ORDER MATTERS AND IS NOT NEGOTIABLE. Configuration is asked first, always: this is reached only
+    after brain.route() has already put the line through the Phase 1 resolver and that resolver refused
+    the name for being an unknown app. So a configured name never gets here, and "open notepad" behaves
+    exactly as it did before Memory existed.
+
+    What Memory may then supply is one thing: a key configuration ALREADY HAS. It cannot return an
+    executable, a path or a command - the applications table has no column that could hold one - and the
+    existing resolver has the final word on whatever comes back. A remembered alias therefore cannot add
+    capability, and a stale one pointing at an app that is no longer configured resolves to nothing.
+
+    Memory missing, empty or broken returns None, which is today's behaviour unchanged: the line goes to
+    the Brain exactly as it would have. A Memory failure never changes what a deterministic command does,
+    and never spends a provider request of its own - a line resolved here makes no model call at all."""
+    parsed = getattr(route, "parsed", None)
+    if parsed is None or parsed.kind not in (OPEN_APP, CLOSE_APP):
+        return None
+    if route.reason != brain.UNRESOLVED_TARGET:
+        return None
+    # brain.route() reports EVERY resolver refusal as UNRESOLVED_TARGET, so the resolver is asked which
+    # refusal it actually was. Memory answers one question - "I don't know that app name" - and must not
+    # be consulted for a missing target ("open" on its own) or for a broken configuration.
+    resolution = resolve(parsed)
+    if not isinstance(resolution, Unresolved) or resolution.reason != RESOLVE_UNKNOWN_APP:
+        return None
+    try:
+        configured = configured_app_names()
+    except SettingsError:
+        return None
+    remembered = memory_queries.application(parsed.target, configured)
+    if not isinstance(remembered, MemoryFound):
+        return None
+    action = replace(parsed, target=remembered.value)
+    return action if isinstance(resolve(action), Resolved) else None
 
 
 def _run_local(action, context, prompts, focus):
@@ -619,7 +714,14 @@ def _ask_text(prompts: Prompts, prompt: str) -> str | None:
     except (EOFError, KeyboardInterrupt):
         prompts.write("")
         return None
-    return answer if isinstance(answer, str) else None
+    if not isinstance(answer, str):
+        return None
+    if prompts.pending is not None and is_fresh_command(answer):
+        # Not an answer: hand it to the console loop and report "no answer", which cancels this
+        # question without spending anything on it.
+        prompts.pending.put(answer)
+        return None
+    return answer
 
 
 def _hotkey_line(state) -> str:
@@ -642,11 +744,22 @@ def _confirm(read, write):
     return confirm
 
 
-def _offer_retry(read, write):
-    """The recovery loop's retry offer: the same exact answer."""
+def _offer_retry(read, write, pending=None):
+    """The recovery loop's retry offer: the same exact answer.
+
+    A fresh command typed here is handed to the console loop instead of being read as "not yes" and
+    thrown away. The answer semantics are unchanged: only YES retries, anything else stops."""
     def offer_retry(result) -> bool:
         write(result.message)
-        return _says_yes(read, write, f"Try again? Type {YES} to retry (anything else stops): ")
+        try:
+            answer = read(f"Try again? Type {YES} to retry (anything else stops): ")
+        except (EOFError, KeyboardInterrupt):
+            write("")
+            return False
+        if pending is not None and is_fresh_command(answer):
+            pending.put(answer)
+            return False                      # stop retrying; the loop runs what was typed
+        return isinstance(answer, str) and answer.strip().lower() == YES
     return offer_retry
 
 

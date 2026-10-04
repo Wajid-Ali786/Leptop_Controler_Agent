@@ -31,7 +31,8 @@ from app.memory.models import (EXPLICIT, EXPORT_FORMAT_VERSION, LEARNED_PATTERN,
                                SCHEMA_VERSION, TABLE_BY_NAME, TABLE_NAMES, Ambiguous, BackupRefused,
                                Contact, Correction, CorrectionLearner, CorrectionTask, Exported, Found,
                                Deleted, MemoryDatabase, MemoryUnavailable, NotFound, Person,
-                               Redacted, Restored, SINGLETON_ROW_ID, normalize)
+                               PersistenceDecision, Redacted, Restored, SINGLETON_ROW_ID,
+                               normalize)
 from config.settings import PROJECT_ROOT, SettingsError, get_setting
 
 log = logging.getLogger(__name__)
@@ -308,6 +309,7 @@ def _write(operation):
 # what arrives is a Correction(scope, wrong_value, right_value, context). The Brain will do the
 # translating, in a later approved slice.
 
+NOT_APPROVED = "I wasn't told it's safe to keep that, so I haven't stored it."
 CANNOT_LEARN = "I can't remember that for next time right now."
 CANNOT_REMEMBER = "I can't store that right now, so I won't say I've remembered it."
 
@@ -320,8 +322,12 @@ def correct_for_this_task(task: CorrectionTask, correction: Correction) -> Corre
     return task.with_correction(correction)
 
 
-def observe_correction(task: CorrectionTask, learner: CorrectionLearner, correction: Correction):
+def observe_correction(task: CorrectionTask, learner: CorrectionLearner, correction: Correction,
+                       decision: PersistenceDecision):
     """A user correction: always LEVEL 1 for this task, and LEVEL 2 once it has been seen twice.
+
+    `decision` is required and has no default. Level 1 does not need it - a temporary correction is
+    applied either way, because it is not kept - but nothing becomes durable without an explicit ALLOW.
 
     Returns (task, outcome). The task always comes back with the temporary correction applied, so the
     current task is fixed even when nothing durable can be written. The outcome says what became of the
@@ -334,6 +340,11 @@ def observe_correction(task: CorrectionTask, learner: CorrectionLearner, correct
     The learner's count is process-local evidence only. It is never consulted by a lookup: until a row
     exists, a correction affects nothing beyond its own task."""
     corrected = correct_for_this_task(task, correction)
+    if decision is not PersistenceDecision.ALLOW:
+        # Fail closed. The task is still fixed, and the observation is not even counted: evidence
+        # gathered without approval would let a later approved correction promote on the strength of
+        # occurrences nobody agreed to keep.
+        return corrected, NotFound(NOT_APPROVED)
     seen = learner.observe(correction)
     if seen < CorrectionLearner.PROMOTE_AT:
         return corrected, NotFound(f"I'll remember that if it comes up again "
@@ -342,11 +353,15 @@ def observe_correction(task: CorrectionTask, learner: CorrectionLearner, correct
     return corrected, promoted
 
 
-def remember_explicitly(correction: Correction):
+def remember_explicitly(correction: Correction, decision: PersistenceDecision):
     """LEVEL 3. The user said to remember this, so it is stored immediately.
 
     No threshold, no repetition, and no need for a temporary correction first. Visible to the very next
-    lookup. If it cannot be written, that is reported - it is never silently called remembered."""
+    lookup. If it cannot be written, that is reported - it is never silently called remembered.
+
+    `decision` is required and has no default: a caller must state that the value is safe to keep."""
+    if decision is not PersistenceDecision.ALLOW:
+        return NotFound(NOT_APPROVED)
     return _record(EXPLICIT, correction, 1, CANNOT_REMEMBER)
 
 

@@ -16,6 +16,7 @@ return before the preparer's first verifier call, which is exactly the property 
 import pytest
 
 from app.executor import logic, shortcuts
+from config.settings import get_setting
 from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, RESOLVE_BAD_FORMAT,
                                  RESOLVE_NO_TARGET, RESOLVE_OUT_OF_RANGE, RESOLVE_UNKNOWN_APP,
                                  RESOLVE_UNKNOWN_KIND, RESOLVE_UNWANTED_TARGET, SCROLL, SHORTCUT,
@@ -23,16 +24,22 @@ from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, RESOLVE_BA
 
 # Recorded from app/executor/logic.py BEFORE resolve() existed, by calling each preparer with an
 # invalid target (which returns before any verifier call). Byte-for-byte; do not reword.
+# The list of apps inside these messages is CONFIGURATION, not wording. The baselines exist to pin the
+# SENTENCE - every character the user reads - so adding an app to config/config.yaml must not break them.
+# The list is therefore composed exactly as app/executor/logic._resolve_app composes it, sorted and
+# comma-separated, rather than hardcoded here.
+CONFIGURED_APPS = ", ".join(sorted(get_setting("executor.apps")))
+
 BASELINE = {
     (OPEN_APP, ""): "Which app should I open?",
     (OPEN_APP, "the calculator"):
-        "I don't know an app called 'the calculator'. Apps I can open: calculator, notepad.",
-    (OPEN_APP, "it"): "I don't know an app called 'it'. Apps I can open: calculator, notepad.",
+        f"I don't know an app called 'the calculator'. Apps I can open: {CONFIGURED_APPS}.",
+    (OPEN_APP, "it"): f"I don't know an app called 'it'. Apps I can open: {CONFIGURED_APPS}.",
     (CLOSE_APP, ""): "Which app should I close?",
     (CLOSE_APP, "everything"):
-        "I don't know an app called 'everything'. Apps I can close: calculator, notepad.",
+        f"I don't know an app called 'everything'. Apps I can close: {CONFIGURED_APPS}.",
     (CLOSE_APP, "the editor"):
-        "I don't know an app called 'the editor'. Apps I can close: calculator, notepad.",
+        f"I don't know an app called 'the editor'. Apps I can close: {CONFIGURED_APPS}.",
     (CLICK, ""): "Where should I click? Give screen coordinates as x, y (e.g. 500, 300).",
     (CLICK, "the blue button"):
         "I can't click at 'the blue button': give whole-number screen coordinates as x, y (e.g. 500, 300).",

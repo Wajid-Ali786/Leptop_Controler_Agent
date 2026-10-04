@@ -17,6 +17,7 @@ import pytest
 import safety_guards
 from app.executor import adapter as executor_adapter
 from app.speaker import adapter as speaker_adapter
+from app.verifier import adapter as verifier_adapter
 
 # Re-exported so tests can import the sentinels from either conftest.
 PhysicalBoundaryEscaped = safety_guards.PhysicalBoundaryEscaped
@@ -103,3 +104,33 @@ def databases_stay_in_this_test(request, tmp_path, monkeypatch):
     if safety_guards.exempt(request.node, safety_guards.DATABASE_EXEMPT):
         return
     safety_guards.install_database_guard(tmp_path, monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def no_live_input_state(request, monkeypatch):
+    """Make the verifier's live keyboard read deterministic.
+
+    app/verifier/adapter.py::modifier_keys_down() reads the real keyboard through GetAsyncKeyState, so
+    without this a physically held Ctrl or Shift decided whether a shortcut test passed. A READ, so it is
+    redirected to [] rather than refused - there is nothing to escape, only non-determinism to remove.
+
+    Exempt through the existing desktop marker-and-gate pair, so a real-desktop test still reads the real
+    modifier state and no new marker category exists."""
+    if safety_guards.exempt(request.node, safety_guards.DESKTOP_EXEMPT):
+        return
+    safety_guards.install_verifier_input_guard(verifier_adapter, monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def no_real_screen_content(request, monkeypatch):
+    """Refuse every verifier read that could return the user's own screen content, and block the UI
+    Automation library at import.
+
+    Phase 4 left this gap open deliberately: the verifier's reads were isolated only by whichever fixture
+    a test happened to request. Phase 5 is the phase that expands screen observation, so the policy lands
+    here - structure is redirected (see no_live_input_state), content is refused.
+
+    Exempt through the existing desktop marker-and-gate pair; no new marker category exists."""
+    if safety_guards.exempt(request.node, safety_guards.DESKTOP_EXEMPT):
+        return
+    safety_guards.install_observation_guard(verifier_adapter, monkeypatch)

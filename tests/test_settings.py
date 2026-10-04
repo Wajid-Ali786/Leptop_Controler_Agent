@@ -1,9 +1,16 @@
 """
 Tests for config/settings.py - the single source of truth for settings and secrets.
-Every test points settings at temporary files; the real config.yaml and .env are never used.
+
+Every test points settings at temporary files, EXCEPT the "shipped app list" section near the bottom,
+which reads the committed config/config.yaml on purpose: a half-configured app (launchable but not
+verifiable, or a path that has moved) can only be caught by checking the real file. Those tests read it
+and launch nothing. The real .env is never used anywhere.
 """
 import ast
 import os
+import re
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -70,9 +77,80 @@ def test_malformed_yaml_fails_clearly(sources):
 
 
 def test_real_config_yaml_is_valid(monkeypatch):
-    """The committed config/config.yaml parses (it holds headings only for now)."""
+    """The committed config/config.yaml parses."""
     monkeypatch.setattr(settings, "CONFIG_PATH", settings.PROJECT_ROOT / "config" / "config.yaml")
     assert isinstance(settings._load_config(), dict)
+
+
+# --- The shipped app list ------------------------------------------------------------------------------
+# Opening an app needs BOTH halves: executor.apps says what may be launched, verifier.app_windows says
+# what proves it opened. An entry with only one half fails at runtime - either "not a configured app" or
+# "opening it can't be verified" - so the two maps agreeing is worth pinning rather than discovering.
+
+
+@pytest.fixture
+def real_config(monkeypatch):
+    monkeypatch.setattr(settings, "CONFIG_PATH", settings.PROJECT_ROOT / "config" / "config.yaml")
+    return settings
+
+
+def test_every_configured_app_can_also_be_verified(real_config):
+    apps = set(real_config.get_setting("executor.apps"))
+    patterns = set(real_config.get_setting("verifier.app_windows"))
+    assert apps == patterns, f"only in apps: {apps - patterns}; only in app_windows: {patterns - apps}"
+    assert len(apps) >= 2
+
+
+def test_every_window_pattern_is_a_valid_regular_expression(real_config):
+    for name, pattern in real_config.get_setting("verifier.app_windows").items():
+        assert isinstance(pattern, str) and pattern.strip(), name
+        re.compile(pattern, re.IGNORECASE)
+
+
+def test_no_configured_executable_is_a_batch_shim(real_config):
+    """app/executor/adapter.py launches with no shell, and Windows cannot start a .cmd or .bat that way.
+    A `code.cmd`-style shim resolves on PATH and then fails at launch, so it is refused here instead."""
+    for name, executable in real_config.get_setting("executor.apps").items():
+        assert not executable.lower().endswith((".cmd", ".bat")), f"{name} points at a shell script"
+
+
+def test_no_configured_executable_carries_arguments(real_config):
+    """The adapter runs Popen([path]) - one element, no command line - so an entry with a flag or a URL
+    in it would be looked up as a single filename and never resolve."""
+    for name, executable in real_config.get_setting("executor.apps").items():
+        assert " -" not in executable and " /" not in executable, f"{name} looks like a command line"
+        assert "&" not in executable and "|" not in executable, f"{name} looks like a shell command"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the configured paths are this machine's")
+def test_every_configured_executable_resolves_the_way_the_adapter_resolves_it(real_config):
+    """shutil.which() is exactly what app/executor/adapter.launch_app() uses, so a typo in a path or an
+    app that has moved is caught here rather than as a failed open. Nothing is launched."""
+    unresolved = {name: executable
+                  for name, executable in real_config.get_setting("executor.apps").items()
+                  if shutil.which(executable) is None}
+    assert unresolved == {}, f"configured but not found on this computer: {unresolved}"
+
+
+def test_the_window_patterns_do_not_match_each_other(real_config):
+    """Chrome, VS Code and other Electron apps share the window class Chrome_WidgetWin_1, so the TITLE is
+    the only thing that tells them apart. Two patterns that matched the same window would let one app's
+    open latch onto another app's window."""
+    patterns = real_config.get_setting("verifier.app_windows")
+    samples = {
+        "notepad": "Untitled - Notepad",
+        "calculator": "Calculator",
+        "chrome": "New Tab - Google Chrome",
+        "vscode": "config.yaml - Leptop_Controler_Agent - Visual Studio Code",
+        "explorer": "File Explorer",
+        "powershell": "Windows PowerShell",
+    }
+    for name, title in samples.items():
+        if name not in patterns:
+            continue
+        matched = [other for other, pattern in patterns.items()
+                   if re.compile(pattern, re.IGNORECASE).search(title)]
+        assert matched == [name], f"{title!r} matches {matched}, not only {name!r}"
 
 
 # --- Secrets from .env ---

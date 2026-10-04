@@ -405,3 +405,79 @@ def _inside(path, directory) -> bool:
     except ValueError:
         return False
     return True
+
+
+# --- Verifier input state -----------------------------------------------------------------------------
+# app/verifier/adapter.py::modifier_keys_down() calls GetAsyncKeyState, so it reads the REAL keyboard.
+# Nothing centrally replaced it, and only some test files faked it for themselves - so whether a shortcut
+# test passed depended on whether a modifier key happened to be held while the suite ran. That is how
+# test_a_low_brain_floor_cannot_soften_a_real_executor_rule failed once in six identical runs.
+#
+# This guard REDIRECTS rather than refuses, because unlike the executor boundaries this is a read: it
+# sends nothing and changes nothing, so there is no escape to prevent - only non-determinism to remove.
+# [] (no modifier held) is the state every offline test already assumes.
+#
+# DELIBERATELY NARROW. The verifier's other observation reads - active_target, cursor_position,
+# window_at, list_windows, the clipboard reads and read_text - are NOT covered here. They are a real
+# test-isolation and privacy question, and they belong to Phase 5, which is the phase that expands
+# screen observation and should define one coherent policy for all of them at once.
+
+# The verifier's reads, split by what each one can expose. STRUCTURE REDIRECTS, CONTENT REFUSES:
+#
+#   redirected  environment state that hundreds of tests need constantly. A deterministic fake removes
+#               the non-determinism without reducing any protection - these say nothing about the user.
+#   refused     the reads that return ARBITRARY CONTENT from whatever window is in front. A test that
+#               silently reads the user's open document is the actual harm, and few tests need these, so
+#               the default is a loud refusal exactly like the executor's boundaries.
+#
+# Phase 5 adds UI Automation to the refused set: an accessibility tree carries every label and field in
+# a window, and pywinauto is blocked at IMPORT so an ordinary test cannot even load a UIA stack.
+VERIFIER_CONTENT_READS = (
+    "read_text",            # WM_GETTEXT on any control - the single most exposing read in the project
+    "selection",            # which characters are selected in that control
+    "text_length",          # how much text it holds
+    "uia_find_by_name",     # Phase 5: walks the accessibility tree and compares every control's name
+)
+
+UIA_LIBRARIES = ("pywinauto",)
+
+
+def install_verifier_input_guard(verifier_adapter, monkeypatch) -> None:
+    """Make the verifier's live keyboard read deterministic for an ordinary test.
+
+    A test that needs a modifier to look held patches the same function in its own body; that runs after
+    this fixture, so it wins. A real-desktop test keeps the genuine read through the existing
+    marker-and-gate pair, because this guard is simply not installed for it."""
+    monkeypatch.setattr(verifier_adapter, "modifier_keys_down", _no_modifiers_held)
+
+
+def install_observation_guard(verifier_adapter, monkeypatch) -> None:
+    """Refuse every read that could return the user's own screen content, and block the UIA library.
+
+    Not a second safety system: the same marker-and-gate rule, the same sentinel, and the same shape as
+    the executor guard - a refuser in place of the function, so the refusal arrives early and says what
+    to do instead. A test that is ABOUT one of these replaces it with a fake in its own body, which runs
+    after this fixture."""
+    for name in VERIFIER_CONTENT_READS:
+        monkeypatch.setattr(verifier_adapter, name, _content_refuser(name), raising=False)
+    monkeypatch.setattr(sys, "meta_path",
+                        [RefuseLibraries({library: (PhysicalDesktopEscaped, "UI Automation access",
+                                                    DESKTOP_EXEMPT)
+                                          for library in UIA_LIBRARIES}),
+                         *sys.meta_path])
+
+
+def _content_refuser(name: str):
+    def refuse(*args, **kwargs):
+        raise PhysicalDesktopEscaped(
+            f"offline test attempted to READ REAL SCREEN CONTENT: it reached "
+            f"app.verifier.adapter.{name}(), which returns whatever is in the window that happens to be "
+            f"in front. Replace it with a fake in the test, or mark the test real_desktop AND set "
+            f"RUN_REAL_DESKTOP_TEST=1. No argument is shown: one of them can be a window title or the "
+            f"user's own text.")
+    return refuse
+
+
+def _no_modifiers_held() -> list:
+    """Named rather than a lambda so a test can tell the stand-in from the real implementation."""
+    return []
