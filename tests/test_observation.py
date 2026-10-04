@@ -277,10 +277,12 @@ def uia_code() -> str:
     for node in uia:                      # drop every docstring before unparsing
         for inner in ast.walk(node):
             body = getattr(inner, "body", None)
-            if isinstance(body, list) and body and isinstance(body[0], ast.Expr)                     and isinstance(body[0].value, ast.Constant)                     and isinstance(body[0].value.value, str):
+            if not (isinstance(body, list) and body and isinstance(body[0], ast.Expr)):
+                continue
+            first = body[0].value
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
                 body.pop(0)
-    return "
-".join(ast.unparse(node) for node in uia)
+    return chr(10).join(ast.unparse(node) for node in uia)
 
 
 def test_no_value_or_document_text_is_ever_requested():
