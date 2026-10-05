@@ -49,6 +49,15 @@ observation:
                                   # screen can change between observing and acting, so this is asked
                                   # explicitly rather than assumed
 
+# --- Browser (assistant-owned, Phase 5 DOM layer) ---
+# The assistant's OWN browser session, never the user's. channel: chrome drives the INSTALLED Chrome,
+# so no Playwright browser binary has to be downloaded, and the session is non-persistent: Playwright
+# makes its own temporary profile, so the user's Chrome profile, cookies and logins are never touched.
+browser:
+  channel: chrome                 # the installed Chrome; not Playwright's bundled Chromium
+  launch_timeout_seconds: 20.0    # starting a browser is slow; bounded all the same
+  query_timeout_seconds: 2.0      # one DOM query. Never Playwright's own 30s default
+
 # --- Memory (app/memory/) ---
 memory:
   # The structured memory database (docs/step3 Section 1 puts it under data/; data/*.db is git-ignored).
@@ -87,6 +96,9 @@ executor:
     #   powershell: powershell.exe
   # Action -> Result -> Recovery: attempts per action, including the first. A failed, retryable
   # attempt is offered to the user for retry - never silently continued.
+  activation_settle_seconds: 2.0   # how long to wait for an owned window to actually reach
+                                   # the foreground after asking. Windows may refuse, so
+                                   # this bounds the wait; it never forces the change
   max_attempts: 3
   # Type text: the most characters one action may type, and the pause between characters (the
   # emergency stop and a change of active window are checked before every character).

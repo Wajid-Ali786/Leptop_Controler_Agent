@@ -50,7 +50,9 @@ from app.executor.logic import configured_app_names, execute_with_recovery, reso
 from app.planner import logic as session
 from app.planner.models import (TYPED_CONSOLE, FrontEnd, LifecycleRefusal, Plan, PlanRefusal,
                                 PlanStepSummary, TurnContext)
-from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL, \
+from app.executor.models import CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, OPEN_APP, \
+    OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, \
+    TYPE_TEXT, WINDOW_CONTROL, \
     ActionResult, ExecutorAction, RESOLVE_UNKNOWN_APP, Resolved, Unresolved
 from app.memory import queries as memory_queries
 from app.memory.models import Found as MemoryFound
@@ -64,7 +66,13 @@ YES = "yes"  # the only answer that confirms anything
 # Actions that land wherever the desktop's focus or pointer is: the user hands focus over first.
 HANDS_OVER = frozenset({CLICK, TYPE_TEXT, SHORTCUT, SCROLL, REFRESH, WINDOW_CONTROL})
 # Actions that don't depend on which window is in front: they name the app, or close windows by name.
-NO_HANDOVER = frozenset({OPEN_APP, CLOSE_APP})
+#
+# click_target is here even though it clicks. It is the one action that already KNOWS its window - the
+# ownership token proved it before anything was read - so it does not need the user to choose one by
+# putting it in front. It brings that window forward itself, after the confirmation, and refuses if
+# Windows will not allow it. Every other clicking or typing action still lands wherever focus is, so
+# those keep the hand-over: without it they would act on the console being typed into.
+NO_HANDOVER = frozenset({OPEN_APP, CLOSE_APP, CLICK_TARGET, OPEN_BROWSER, CLOSE_BROWSER})
 
 WELCOME = ("AI Desktop Companion - typed commands (Phase 1). Type help for the commands, exit to leave.\n"
            f"Anything Medium risk or above asks first, and only {YES} runs it.")
@@ -354,6 +362,12 @@ CORRECTION_PROMPT = "Tell me what to do differently, or press Enter to leave it:
 CLARIFY_PROMPT = "Your answer: "
 NO_ANSWER_MESSAGE = "No answer given, so nothing was done."
 PLAN_DONE = "Done: all {count} step{plural} finished."
+# The same sentence would be a lie about a step whose effect nobody can see. A click is SENT, never
+# observed: Outcome.UNVERIFIED is the Executor saying so, and the plan's closing line has to say it
+# too rather than reporting "done" over the top of it. The narrowest possible change - each step's
+# own message is already truthful and is printed unchanged above this line.
+PLAN_DONE_UNVERIFIED = ("All {count} step{plural} finished, but I couldn't check what {unverified} of "
+                        "them actually did - so this isn't confirmation that it worked.")
 NOTHING_TO_DO = "There was nothing to do in that."
 
 
@@ -610,11 +624,13 @@ def _offer(context, prompts, focus, interpret, frontend):
 def _run_plan(context, prompts, focus, interpret, frontend):
     """Each step through the SAME path a typed command uses, carrying the step's advisory floor."""
     steps = context.pending_plan.plan.steps
+    unverified = 0
     for step in steps:
         reply = run_action(step.action, confirm=prompts.confirm, offer_retry=prompts.offer_retry,
                           focus=focus, risk_floor=step.risk_floor)
         if reply.status is Status.RAN and reply.result is not None and reply.result.ok:
             prompts.write(f"{step.number}. {reply.message}")
+            unverified += 0 if reply.result.verified else 1
             done = session.complete_step(context, step.number)
             context = done if isinstance(done, TurnContext) else context
             context = _remember(reply, context)
@@ -625,6 +641,9 @@ def _run_plan(context, prompts, focus, interpret, frontend):
         # always reported "it reached the Executor and did not work", and the result is what says so.
         return _offer_correction(context, prompts, focus, interpret, reply, frontend)
     plural = "" if len(steps) == 1 else "s"
+    if unverified:
+        return CommandReply(Status.RAN, PLAN_DONE_UNVERIFIED.format(
+            count=len(steps), plural=plural, unverified=unverified)), context
     return CommandReply(Status.RAN, PLAN_DONE.format(count=len(steps), plural=plural)), context
 
 
@@ -671,13 +690,19 @@ def _preview(context: TurnContext) -> list[str]:
     Built from app/planner/logic.plan_summary(), which already describes a typed payload by its length,
     so nothing here can print the user's own words. No repr of a model object is ever shown."""
     lines = [PLAN_HEADER]
+    controls = {step.number: step.action.control for step in context.pending_plan.plan.steps}
     for summary in session.plan_summary(context.pending_plan):
-        lines.append(f"  {summary.number}. {_describe(summary)}")
+        lines.append(f"  {summary.number}. {_describe(summary, controls.get(summary.number, ''))}")
     return lines
 
 
-def _describe(summary: PlanStepSummary) -> str:
-    """One step in plain English. `summary.target` is already the Executor's log-safe label."""
+def _describe(summary: PlanStepSummary, control: str = "") -> str:
+    """One step in plain English. `summary.target` is already the Executor's log-safe label.
+
+    `control` is passed in separately rather than read from the summary, because a PlanStepSummary
+    is the shape that may be SENT TO THE MODEL inside a ReplanRequest. The user's own word for a
+    control does not need to go there for re-planning, so it does not: it is taken straight from
+    the step and used only for this line, which the user reads."""
     kind, target = summary.kind, summary.target
     if kind == OPEN_APP:
         return f"Open {target}"
@@ -685,6 +710,15 @@ def _describe(summary: PlanStepSummary) -> str:
         return f"Close {target}"
     if kind == CLICK:
         return f"Click at {target}"
+    if kind == OPEN_BROWSER:
+        return "Open the assistant's own browser"
+    if kind == CLOSE_BROWSER:
+        return "Close the assistant's own browser"
+    if kind == CLICK_TARGET:
+        # The user's own words for the control, which is the point of a named click: the plan they
+        # check says what they asked for, not a coordinate nobody can verify by reading it.
+        where = f" in {target}" if target else ""
+        return f'Click "{control}"{where}' if control else f"Click the control you named{where}"
     if kind == TYPE_TEXT:
         return f"Type <{target}>"
     if kind == SHORTCUT:

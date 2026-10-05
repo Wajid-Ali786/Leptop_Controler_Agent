@@ -237,19 +237,49 @@ def test_the_alias_branch_is_only_reached_for_an_unknown_app(remembered, executo
 # 2. THE BRAIN / PLANNER QUERY BOUNDARY
 # =======================================================================================================
 
-def test_the_kind_check_is_defence_in_depth_not_the_only_guard():
-    """Honest note on the branch's two conditions. RESOLVE_UNKNOWN_APP is emitted by exactly one
-    function - _resolve_app - so a non-app action can never carry that reason, and the kind check is
-    therefore subsumed by the reason check rather than independently observable.
+def test_the_kind_check_is_now_the_guard_not_defence_in_depth():
+    """This test used to record that the kind check was REDUNDANT, because RESOLVE_UNKNOWN_APP had
+    exactly one emitter - _resolve_app - so no non-app action could ever carry that reason.
 
-    It is kept anyway: it costs nothing and it is what holds if a future resolver ever emits that reason
-    for something else. Stated here so the redundancy is a recorded decision, not an accident."""
+    Phase 5 Slice 3 ended that. _resolve_click_target refuses an unknown app with the same reason, so
+    the reason alone no longer implies "this is an open or close". The kind check is now what stops an
+    Applications alias being used to resolve a UI CONTROL name, which Phase 5 forbids outright: app
+    aliases map a user's app name to a configured app, and they are not a control-synonym table.
+
+    The redundancy that was recorded here as a deliberate, cost-free choice is exactly what made that
+    change safe. It is now load-bearing, and tested as such below."""
     import ast as _ast
     source = (settings.PROJECT_ROOT / "app" / "executor" / "logic.py").read_text(encoding="utf-8")
-    emitters = [node.name for node in _ast.walk(_ast.parse(source))
-                if isinstance(node, _ast.FunctionDef)
-                and "Unresolved(RESOLVE_UNKNOWN_APP" in _ast.unparse(node)]
-    assert emitters == ["_resolve_app"], emitters
+    emitters = sorted(node.name for node in _ast.walk(_ast.parse(source))
+                      if isinstance(node, _ast.FunctionDef)
+                      and "Unresolved(RESOLVE_UNKNOWN_APP" in _ast.unparse(node))
+    assert emitters == ["_resolve_app", "_resolve_click_target"], emitters
+
+    # The kind check, read from the branch itself: only these two kinds may consult Memory.
+    branch = next(node for node in _ast.walk(_ast.parse(
+        (settings.PROJECT_ROOT / "app" / "console.py").read_text(encoding="utf-8")))
+        if isinstance(node, _ast.FunctionDef) and node.name == "_remembered_app")
+    unparsed = _ast.unparse(branch)
+    assert "parsed.kind not in (OPEN_APP, CLOSE_APP)" in unparsed, unparsed
+    assert "CLICK_TARGET" not in unparsed
+
+
+def test_an_unknown_app_on_a_named_click_never_consults_applications_memory(remembered, executor):
+    """Phase 5 forbids Applications aliases as UI-control aliases. A named click whose app is unknown
+    gets the resolver's own refusal and asks Memory nothing - proved by driving the real branch."""
+    from app.executor.models import CLICK_TARGET, RESOLVE_UNKNOWN_APP
+    from types import SimpleNamespace
+    action = ExecutorAction(CLICK_TARGET, "notanapp", "Seven")
+    resolution = resolve(action)
+    assert isinstance(resolution, Unresolved) and resolution.reason == RESOLVE_UNKNOWN_APP
+
+    asked = []
+    route = SimpleNamespace(parsed=action, reason=brain.UNRESOLVED_TARGET)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(console.memory_queries, "application",
+                      lambda *a, **k: asked.append(a) or None)
+        assert console._remembered_app(route) is None
+    assert asked == [], "Memory was consulted about a UI control name"
 
 
 def test_a_broken_app_configuration_degrades_instead_of_crashing(remembered, executor, monkeypatch):

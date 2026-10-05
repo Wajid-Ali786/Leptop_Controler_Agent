@@ -517,16 +517,20 @@ def test_the_guard_is_one_system_not_a_parallel_one():
 
 # --- Later layers are declared, not stubbed -----------------------------------------------------------
 
-def test_only_the_uia_layer_exists_so_far():
-    """§15. The enum names all five layers, but no DOM, OCR, vision or coordinate acquisition exists -
-    and nothing here calls a provider."""
+def test_only_the_first_two_layers_exist_so_far():
+    """§15, updated when the DOM layer arrived. The enum names all five; OCR, vision and the
+    coordinate fallback are still produced by nothing, and nothing here calls a provider.
+
+    DOM is now permitted in this module - the DECISION for layer 2 lives here - but the LIBRARY still
+    must not: Playwright can click, so it stays in the Executor's adapter."""
     source = code_of(settings.PROJECT_ROOT / "app" / "verifier" / "observation.py")
     code = uia_code()
     for absent in ("playwright", "screenshot", "ocr", "tesseract", "vision", "anthropic", "httpx"):
         assert absent not in source.lower(), f"observation.py mentions {absent}"
         assert absent not in code.lower(), f"the UIA code mentions {absent}"
     assert "ObservationSource.UIA" in source
-    for later in ("ObservationSource.DOM", "ObservationSource.OCR", "ObservationSource.VISION",
+    assert "ObservationSource.DOM" in source, "layer 2's decision lives here now"
+    for later in ("ObservationSource.OCR", "ObservationSource.VISION",
                   "ObservationSource.COORDINATE"):
         assert later not in source, f"{later} is used before its layer exists"
 

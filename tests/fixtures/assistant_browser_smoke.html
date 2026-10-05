@@ -1,0 +1,67 @@
+<!doctype html>
+<!--
+  Fixture for the owner's assistant-browser console smoke (Phase 5).
+
+  It is a FIXTURE, not a feature: the assistant has no navigation command, so the owner opens this
+  file in the assistant's own browser themselves. Production code never reads anything on this page -
+  the "Clicked" text and the data attribute are here so a person can SEE that the click landed, and
+  so a gated harness could check it without production knowing it exists.
+
+  Entirely self-contained: no network, no remote script, no stylesheet, no image, no font.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Assistant browser smoke</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 3rem; color: #1b1b1b; }
+    h1 { font-size: 1.25rem; font-weight: 600; }
+    p  { color: #555; max-width: 34rem; line-height: 1.5; }
+    .row { margin-top: 2rem; display: flex; gap: 1rem; align-items: center; }
+    button {
+      font: inherit; padding: 0.6rem 1.4rem; border: 1px solid #888; border-radius: 6px;
+      background: #f6f6f6; cursor: pointer;
+    }
+    button[data-clicked="yes"] { background: #d8f5d8; border-color: #3a7d3a; }
+    .state { font-weight: 600; min-width: 11rem; }
+    .state[data-state="clicked"] { color: #2a6b2a; }
+  </style>
+</head>
+<body>
+  <h1>Assistant browser smoke</h1>
+  <p>
+    This page is local and does nothing but record a click. Tell the assistant
+    <strong>click Login</strong>; approve the confirmation it shows you; then look here.
+    The button should turn green and the text beside it should read <strong>Clicked</strong>.
+  </p>
+
+  <div class="row">
+    <button id="login" type="button">Login</button>
+    <span id="login-state" class="state" data-state="waiting">Not clicked yet</span>
+  </div>
+
+  <div class="row">
+    <button id="other" type="button">Sign up</button>
+    <span id="other-state" class="state" data-state="waiting">Not clicked yet</span>
+  </div>
+
+  <p>
+    The second button is here to prove the click went to the one you asked for. If
+    <em>Sign up</em> also turns green, something resolved the wrong control.
+  </p>
+
+  <script>
+    // Inline, so nothing is fetched. Each button records its own click in a data attribute and in
+    // visible text - one for a person to read, one for a harness to check.
+    for (const id of ["login", "other"]) {
+      const button = document.getElementById(id);
+      const state = document.getElementById(id + "-state");
+      button.addEventListener("click", () => {
+        button.dataset.clicked = "yes";
+        state.dataset.state = "clicked";
+        state.textContent = "Clicked";
+      });
+    }
+  </script>
+</body>
+</html>

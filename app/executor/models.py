@@ -12,6 +12,23 @@ SHORTCUT = "shortcut"    # target: a keyboard shortcut, e.g. ExecutorAction(SHOR
 SCROLL = "scroll"        # target: "up N" or "down N" wheel notches, e.g. ExecutorAction(SCROLL, "down 3")
 REFRESH = "refresh"      # no target: refreshes the active window, e.g. ExecutorAction(REFRESH)
 WINDOW_CONTROL = "window_control"  # target: minimize | maximize | restore | close (the active window)
+# click_target: click a control the USER NAMED, found by Phase 5 screen observation.
+#   target  = the configured app whose window to look in, or "" to use the one app opened this session
+#   control = the user's own word for the control, e.g. ExecutorAction(CLICK_TARGET, "calculator",
+#             control="Seven")
+# WHERE it is on screen is never in the action: that is resolved locally, at execution time, from the
+# accessibility tree - and re-resolved after the confirmation. See app/verifier/observation.py.
+CLICK_TARGET = "click_target"
+# The assistant's OWN browser, which is not an app in executor.apps and never the owner's Chrome.
+OPEN_BROWSER = "open_browser"    # no target: there is one assistant browser, or none
+CLOSE_BROWSER = "close_browser"  # no target
+
+# A RESERVED context selector, usable wherever an app name is (e.g. ExecutorAction(CLICK_TARGET,
+# ASSISTANT_BROWSER, control="Login")). It names the live assistant browser session, and it is
+# recognised BEFORE configured apps and before Memory's application aliases - so no alias and no
+# remembered name can redefine it, and "chrome" can never come to mean it. It is runtime context,
+# not an app.
+ASSISTANT_BROWSER = "assistant browser"
 
 
 class Outcome(str, Enum):
@@ -70,9 +87,19 @@ class Unresolved:
 
 @dataclass(frozen=True, repr=False)
 class ExecutorAction:
-    """One thing the Executor should do, e.g. ExecutorAction(OPEN_APP, "notepad")."""
+    """One thing the Executor should do, e.g. ExecutorAction(OPEN_APP, "notepad").
+
+    `control` is the user's own word for an on-screen control, and it is a SEPARATE FIELD rather than
+    part of `target` on purpose. `target` is what `log_label` reports, and `log_label` is used in two
+    places that must not see it: the Executor's own result log, and app/planner/logic.plan_summary(),
+    whose summaries travel to the model inside a ReplanRequest. Keeping the control name out of
+    `target` keeps it out of both by construction, and out of `description` and `repr` as well - so
+    the only place it appears is the confirmation the user reads and the plan they are shown, both of
+    which are their own words coming back to them.
+    """
     kind: str
     target: str = ""
+    control: str = ""
 
     @property
     def description(self) -> str:

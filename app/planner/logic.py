@@ -34,7 +34,7 @@ A correction happens only because a person asked for one, at most once per reque
 """
 from uuid import uuid4
 
-from app.brain.models import (ARGS_FOR_KIND, SCROLL_DIRECTIONS, WINDOW_OPERATIONS, ClickArgs,
+from app.brain.models import (ARGS_FOR_KIND, SCROLL_DIRECTIONS, WINDOW_OPERATIONS, ClickArgs, CloseBrowserArgs, OpenBrowserArgs, ClickTargetArgs,
                               CloseAppArgs, Intent, NeedsClarification, OpenAppArgs, RefreshArgs,
                               ScrollArgs, ShortcutArgs, TypeTextArgs, Understood, WindowControlArgs,
                               previous_action_context)
@@ -87,7 +87,10 @@ def _step(number: int, intent: Intent, frontend, resolve) -> PlanStep | PlanRefu
     target = _target(intent.args)
     if isinstance(target, PlanRefusal):
         return target
-    action = ExecutorAction(intent.kind, target)      # WE build it; the model never does
+    # WE build it; the model never does. `control` is the one field a named click adds, and it carries
+    # the user's own words through unchanged - the model chose them, from what the user typed.
+    control = intent.args.control if isinstance(intent.args, ClickTargetArgs) else ""
+    action = ExecutorAction(intent.kind, target, control.strip() if isinstance(control, str) else "")
     resolution = resolve(action)
     if isinstance(resolution, Unresolved):
         return PlanRefusal(PLAN_UNRESOLVED, resolution.message)   # the Executor's own wording
@@ -101,6 +104,12 @@ def _target(args) -> str | PlanRefusal:
     one author. Anything the type system cannot guarantee is checked here."""
     if isinstance(args, (OpenAppArgs, CloseAppArgs)):
         return args.app.strip() if isinstance(args.app, str) else ""
+    if isinstance(args, (OpenBrowserArgs, CloseBrowserArgs)):
+        return ""                      # args-free, like refresh: there is one assistant browser
+    if isinstance(args, ClickTargetArgs):
+        # The app, which may be empty: the Executor then uses the one app this session opened, if
+        # there is exactly one. The control name is NOT part of the target - see ExecutorAction.
+        return args.app.strip().lower() if isinstance(args.app, str) else ""
     if isinstance(args, ClickArgs):
         if isinstance(args.x, bool) or isinstance(args.y, bool):
             return PlanRefusal(PLAN_WRONG_ARGS, "I need whole-number screen coordinates to click.")

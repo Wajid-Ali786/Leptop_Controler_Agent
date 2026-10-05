@@ -28,6 +28,7 @@ import pytest
 from app.brain import cost_controls
 from app.brain import logic as brain
 from app.brain.models import (ARGS_FIELDS, ARGS_FOR_KIND, INTERPRETATION_KINDS, MAX_APP, MAX_BECAUSE,
+                              ClickTargetArgs, CloseBrowserArgs, OpenBrowserArgs,
                               MAX_INTENTS, MAX_KEYS, MAX_MESSAGE, MAX_MISSING, MAX_QUESTION,
                               MAX_RESTATED, MAX_WHAT, MAX_WHY, RISK_FLOOR_NAMES,
                               NEUTRAL_ARGS_VALUES, NEUTRAL_INTERPRETATION_VALUES,
@@ -38,7 +39,7 @@ from app.brain.models import (ARGS_FIELDS, ARGS_FOR_KIND, INTERPRETATION_KINDS, 
                               PreviousActionContext, RefreshArgs, ScrollArgs, ShortcutArgs,
                               TypeTextArgs, Understood, WindowControlArgs, interpretation_schema,
                               previous_action_context, schema_complexity)
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
+from app.executor.models import (CLOSE_BROWSER, OPEN_BROWSER, CLICK_TARGET, CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
                                  WINDOW_CONTROL)
 from app.planner.models import (MAX_PLAN_STEPS, ClarificationContinuation, FailureContext,
                                 PlanStepSummary, ReplanRequest)
@@ -177,7 +178,10 @@ def test_the_schema_stays_inside_anthropics_documented_complexity_limits():
     counts = schema_complexity(schema())
     assert counts["optional"] <= DOCUMENTED_OPTIONAL_LIMIT, counts
     assert counts["unions"] <= DOCUMENTED_UNION_LIMIT, counts
-    assert counts == {"optional": 0, "unions": 0, "properties": 19}, "flat by construction"
+    # 20 since Phase 5 Slice 3 added `control` for click_target. What matters is unchanged and is
+    # asserted above: still zero optional parameters and zero unions, so the documented limits of 24
+    # and 16 are not approached by adding a field - only the flat property count moves.
+    assert counts == {"optional": 0, "unions": 0, "properties": 20}, "flat by construction"
 
 
 def test_every_property_is_required_and_nothing_else_is_allowed():
@@ -1081,6 +1085,10 @@ def test_a_good_reply_becomes_the_typed_contracts():
     (SCROLL, {"direction": "down", "notches": 3}, ScrollArgs("down", 3)),
     (REFRESH, {}, RefreshArgs()),
     (WINDOW_CONTROL, {"operation": "minimize"}, WindowControlArgs("minimize")),
+    (CLICK_TARGET, {"control": "Seven", "app": "calculator"},
+     ClickTargetArgs(control="Seven", app="calculator")),
+    (OPEN_BROWSER, {}, OpenBrowserArgs()),
+    (CLOSE_BROWSER, {}, CloseBrowserArgs()),
 ])
 def test_every_kind_builds_its_own_typed_args_shape(kind, fields, expected):
     outcome = validate(reply(intents=[intent(kind=kind, **fields)]))
@@ -1089,6 +1097,15 @@ def test_every_kind_builds_its_own_typed_args_shape(kind, fields, expected):
     assert type(built) is ARGS_FOR_KIND[kind]
     if expected is not None:
         assert built == expected
+
+
+def test_this_file_covers_every_kind_there_is():
+    """The list above is written out rather than derived, so that each kind's FIELDS are stated
+    explicitly. The cost is that adding a capability can silently leave it uncovered - which is what
+    happened when click_target arrived - so the list's completeness is asserted here instead."""
+    cases = test_every_kind_builds_its_own_typed_args_shape.pytestmark[0].args[1]
+    covered = {case[0] for case in cases}
+    assert covered == set(ARGS_FOR_KIND), set(ARGS_FOR_KIND) - covered
 
 
 def test_a_placeholder_field_for_another_kind_makes_the_whole_reply_invalid():
@@ -1108,7 +1125,9 @@ def test_the_canonical_form_of_every_kind_is_accepted():
                          (CLICK, {"x": 5, "y": 6}), (TYPE_TEXT, {"text": "hi"}),
                          (SHORTCUT, {"keys": "ctrl+c"}),
                          (SCROLL, {"direction": "down", "notches": 3}), (REFRESH, {}),
-                         (WINDOW_CONTROL, {"operation": "minimize"})]:
+                         (WINDOW_CONTROL, {"operation": "minimize"}),
+                         (CLICK_TARGET, {"control": "Seven", "app": "calculator"}),
+                         (OPEN_BROWSER, {}), (CLOSE_BROWSER, {})]:
         outcome = validate(reply(intents=[intent(kind=kind, **fields)]))
         assert isinstance(outcome, Understood), f"{kind}: {getattr(outcome, 'detail', outcome)}"
         assert type(outcome.intents[0].args) is ARGS_FOR_KIND[kind]

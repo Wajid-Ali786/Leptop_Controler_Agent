@@ -44,10 +44,14 @@ Every other function here performs a real action on the computer, so nothing may
 app/executor/logic.py, which routes every action through app/safety first (CLAUDE.md rule 5).
 """
 import ctypes
+import re
 import secrets
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass
 
 _WINDOWS_ELEVATION_REQUIRED = 740  # ERROR_ELEVATION_REQUIRED
 _WINDOWS_ACCESS_DENIED = 5         # ERROR_ACCESS_DENIED - e.g. the window belongs to an elevated app
@@ -137,6 +141,32 @@ def request_close(handle: int) -> None:
     if error == _WINDOWS_ACCESS_DENIED:
         raise WindowCloseError("it runs with administrator rights, and the assistant doesn't run elevated")
     raise WindowCloseError(f"Windows refused the request (error {error})")
+
+
+def activate_window(handle: int) -> bool:
+    """Ask Windows to bring the window `handle` to the front, with SetForegroundWindow and nothing else.
+
+    Returns whether Windows ACCEPTED the request. Acceptance is not arrival: SetForegroundWindow can
+    return true and the window still not end up in front, and Windows may refuse outright when another
+    process owns the foreground. So the caller verifies the foreground separately, by handle - this
+    function never polls, because waiting belongs in logic alongside the emergency-stop checkpoints.
+
+    DELIBERATELY ONE API. No SwitchToThisWindow, no BringWindowToTop, no AttachThreadInput, no
+    ShowWindow, no synthetic Alt+Tab. Those are the ways to force a foreground change past the rules
+    Windows applies on purpose, and a refusal here is a refusal worth reporting rather than defeating:
+    the caller's answer is to ask the user, which is the behaviour this replaced."""
+    if sys.platform != "win32":
+        raise WindowControlError("bringing a window to the front is only supported on Windows")
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    if not user32.IsWindow(handle):
+        raise WindowGoneError("the window is already closed")
+    return bool(user32.SetForegroundWindow(handle))
 
 
 # --- window ownership -------------------------------------------------------------------
@@ -409,6 +439,340 @@ def request_window_state(handle: int, operation: str) -> None:
     if error == _WINDOWS_ACCESS_DENIED:
         raise WindowControlError("it runs with administrator rights, and the assistant doesn't run elevated")
     raise WindowControlError(f"Windows refused the request (error {error})")
+
+
+# --- Assistant-owned browser session (Phase 5 DOM layer, Build Plan Section 6.5) ----------------------
+# PLAYWRIGHT LIVES HERE AND NOWHERE ELSE, and the reason is not symmetry with pywinauto - it is the
+# opposite of it. UI Automation can only READ, so it sits in the Verifier's adapter. Playwright can read
+# AND click, so it belongs in the one file allowed to control this computer. The DECISION about which
+# element the user meant is still the Verifier's, as a pure function over what this module hands back
+# (app/verifier/observation.py), so no module both decides and acts.
+#
+# NOT THE USER'S BROWSER. The session is started by us, with Playwright's own temporary profile, and it
+# is owned ONLY because this registry has it. There is no launch_persistent_context, no user-data-dir,
+# no Default or Profile N, no storage_state and no cookie import - so the user's Chrome profile, their
+# logins, their cookies and their history are not reachable from here at all. A title is not ownership.
+#
+# WHAT LEAVES THIS MODULE: opaque ids and structure. No Playwright object, no accessible name, no page
+# text, no HTML, no URL, no form value. The accessible name the user gave is matched INSIDE this module
+# and dropped, exactly as the UIA layer does.
+
+# The interactive roles a named target may resolve to, verified against this Playwright's own AriaRole
+# list (82 roles; these nine are all present). A target is a NAME - "Login" - and the user should never
+# have to say "button", so the name is tried against each of these and the matches are combined.
+# Deliberately only interactive roles: a heading called Login is not something to click.
+DOM_ROLES = ("button", "link", "checkbox", "radio", "textbox", "combobox", "option", "menuitem", "tab")
+
+_browser_sessions: dict[str, "_BrowserSession"] = {}
+_browser_lock = threading.Lock()
+
+
+class BrowserError(ExecutorAdapterError):
+    """A browser session could not be started, found or read."""
+
+
+# What an element_token stands for, inside this module only.
+#
+# Slice 1 minted a random token that referred to NOTHING - it was a placeholder, so there was nothing
+# to re-resolve from. This is the smallest change that fixes that: the token maps to the SEMANTIC
+# DESCRIPTION that found the element, which is the user's own word plus a role, plus a fingerprint of
+# the page it was found on.
+#
+# NOTE WHAT IS NOT STORED. `name` is the normalised word the USER asked for, handed in by the caller -
+# it is not an accessible name read back off the page. No selector, no XPath, no element handle and no
+# URL is kept: `page_identity` is a one-way digest, so a changed page can be detected without the
+# address ever being retained, returned or logged.
+@dataclass(frozen=True)
+class _DomLocatorDescription:
+    page_id: str
+    role: str
+    name: str                         # the USER's normalised word, never read from the page
+    page_identity: str                # sha256 of the page's URL, truncated; the URL itself is not kept
+
+
+@dataclass
+class _BrowserSession:
+    """The live Playwright objects for one assistant-owned browser. PRIVATE TO THIS MODULE.
+
+    Nothing here is ever returned, logged or put in a model. Callers hold `session_id` and `page_id`
+    strings; this is what those strings mean, and only this module can look them up."""
+    runtime: object                   # the Playwright context manager
+    browser: object
+    context: object
+    pages: dict                       # page_id -> Page
+    tokens: dict                      # element_token -> _DomLocatorDescription
+
+
+def browser_open_session(channel: str, launch_timeout_seconds: float,
+                         headed: bool = False) -> tuple[str, str]:
+    """Start an assistant-owned, NON-PERSISTENT browser and return (session_id, page_id).
+
+    `channel` drives the INSTALLED browser - "chrome" uses the Chrome already on this computer, so no
+    Playwright browser binary has to be downloaded. The context is non-persistent, which is what keeps
+    the user's own profile out of reach: Playwright makes a throwaway one.
+
+    `headed` asks for a VISIBLE window. It defaults to False because Playwright's own default is
+    headless and the gated smokes were written against that; the user-facing OPEN_BROWSER path passes
+    True, because a browser the user is expected to navigate themselves has to be one they can see.
+
+    A partial failure leaves NOTHING in the registry and closes whatever had been started, so a caller
+    can never be handed, or later find, a half-built session."""
+    playwright_module = _playwright()
+    runtime = browser = context = None
+    try:
+        runtime = playwright_module.sync_playwright().start()
+        browser = runtime.chromium.launch(channel=channel, headless=not headed,
+                                          timeout=max(1.0, launch_timeout_seconds) * 1000)
+        context = browser.new_context()           # non-persistent, no storage_state, no user-data-dir
+        context.set_default_timeout(max(1.0, launch_timeout_seconds) * 1000)
+        page = context.new_page()
+    except Exception as exc:
+        _abandon(runtime, browser, context)
+        raise BrowserError(f"a browser session could not be started ({type(exc).__name__})") from None
+    session_id, page_id = secrets.token_hex(16), secrets.token_hex(8)
+    with _browser_lock:
+        _browser_sessions[session_id] = _BrowserSession(runtime=runtime, browser=browser,
+                                                        context=context, pages={page_id: page},
+                                                        tokens={})
+    return session_id, page_id
+
+
+def browser_close_session(session_id: str) -> bool:
+    """Close the session and make its id unusable. True if there was one to close.
+
+    The registry entry is removed FIRST, under the lock, so a caller racing with this cannot look the
+    session up and act on objects that are about to be torn down."""
+    with _browser_lock:
+        session = _browser_sessions.pop(session_id, None)
+    if session is None:
+        return False
+    _abandon(session.runtime, session.browser, session.context)
+    return True
+
+
+def browser_sessions() -> list:
+    """Every live assistant-browser session, as opaque (session_id, page_id) pairs.
+
+    THE SESSION REGISTRY IS THE MEMORY. There is no second store: a session is "the assistant's
+    browser" because this registry has it, exactly as a window is "ours" because the ownership token
+    is on it. Nothing live comes out - only the ids a caller may hold."""
+    with _browser_lock:
+        return sorted((session_id, page_id)
+                      for session_id, session in _browser_sessions.items()
+                      for page_id in session.pages)
+
+
+def browser_session_exists(session_id: str) -> bool:
+    """Whether the registry still has this session. The ONLY ownership test there is."""
+    with _browser_lock:
+        return session_id in _browser_sessions
+
+
+def dom_query(session_id: str, page_id: str, normalized_name: str,
+              query_timeout_seconds: float) -> list:
+    """Every interactive control in that page whose accessible name IS the user's target.
+
+    Returns DomElement - role, tag, state, an opaque token - and NO NAME, so an unmatched label cannot
+    be returned, logged or sent anywhere. The accessible name is matched here and discarded.
+
+    MATCHING IS WHOLE-STRING AND CASE-INSENSITIVE, done with an anchored case-insensitive regular
+    expression rather than Playwright's `exact=True`. That is not a shortcut: Playwright documents
+    `exact=True` as "case-sensitive and whole-string", and its default as "case-insensitive and
+    searches for a substring" - so one would refuse "login" for a button called "Login", and the other
+    would accept "Log" for it. A regex gives whole-string AND case-insensitive, and `exact` is
+    documented as ignored when a pattern is passed, so it is not passed at all.
+
+    Raises BrowserError for an unknown session or page - never a guess at a different one."""
+    with _browser_lock:
+        session = _browser_sessions.get(session_id)
+        page = session.pages.get(page_id) if session is not None else None
+    if session is None:
+        raise BrowserError("that browser session is not open")
+    if page is None:
+        raise BrowserError("that page is not part of this browser session")
+    if not isinstance(normalized_name, str) or not normalized_name.strip():
+        return []
+
+    timeout = max(1.0, query_timeout_seconds) * 1000
+    observed_at = time.time()
+    matches = _dom_matches(page, normalized_name, timeout)
+    identity = _page_identity(page)
+    found = []
+    for role, locator in matches:
+        element = _dom_element(session_id, page_id, role, locator, observed_at, timeout)
+        with _browser_lock:
+            # The token is only meaningful while this session lives, and it dies with it.
+            session.tokens[element.element_token] = _DomLocatorDescription(
+                page_id=page_id, role=role, name=normalized_name, page_identity=identity)
+        found.append(element)
+    return found
+
+
+def _dom_matches(page, normalized_name: str, timeout: float) -> list:
+    """Every (role, locator) in the top-level document whose accessible name IS `normalized_name`.
+
+    THE ONLY MATCHING IMPLEMENTATION, used by the query and again by the action, so the two can never
+    disagree about what "the Login button" means. Whole-string and case-insensitive, by anchored
+    pattern - see dom_query for why Playwright's own `exact` flag is not what is wanted."""
+    wanted = re.compile(rf"^{re.escape(normalized_name)}$", re.IGNORECASE)
+    matches = []
+    try:
+        for role in DOM_ROLES:
+            locator = page.get_by_role(role, name=wanted)
+            for index in range(locator.count()):
+                matches.append((role, locator.nth(index)))
+    except Exception as exc:
+        raise BrowserError(f"that page's controls could not be read ({type(exc).__name__})") from None
+    return matches
+
+
+def _page_identity(page) -> str:
+    """A one-way fingerprint of the page's address, so "is this still the same page?" can be answered
+    without the address itself ever being kept, returned or logged."""
+    import hashlib
+
+    try:
+        return hashlib.sha256(str(page.url).encode("utf-8", "replace")).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+# --- The one DOM action -------------------------------------------------------------------------------
+# Outcomes rather than exceptions for the ordinary refusals, so the caller can report each honestly
+# without parsing a message - and so no selector, name or URL has to travel in one. BrowserError stays
+# for the genuinely exceptional: a session that is gone, or Playwright failing.
+
+DOM_CLICKED = "clicked"
+DOM_GONE = "gone"                    # nothing answers to that name here any more
+DOM_AMBIGUOUS = "ambiguous"          # more than one does now
+DOM_ROLE_CHANGED = "role_changed"    # one does, but it is a different kind of control
+DOM_PAGE_CHANGED = "page_changed"    # the page itself is not the one that was confirmed
+DOM_FRAMES_UNREAD = "frames_unread"  # not here, and parts of the page are frames we do not read
+
+
+def dom_click(session_id: str, page_id: str, element_token: str,
+              action_timeout_seconds: float) -> str:
+    """Re-resolve the token's target and click it with Playwright. Returns one of the DOM_* outcomes.
+
+    RE-RESOLUTION IS THE POINT, not a formality. An ElementHandle taken before the user answered a
+    confirmation may be detached by the time they have; a locator is lazy and re-queries on use, which
+    is why the token stands for a DESCRIPTION rather than a handle. The description is re-run here,
+    and the click happens only if it still names exactly one control, of the same kind, on the same
+    page.
+
+    The click is Playwright's ordinary locator action, so its actionability checks apply: it waits for
+    the element to be visible, enabled and stable, scrolls it into view, and verifies the element
+    actually receives the event rather than something layered over it. `force` is never passed -
+    passing it would skip exactly those checks."""
+    with _browser_lock:
+        session = _browser_sessions.get(session_id)
+        if session is None:
+            raise BrowserError("that browser session is not open")
+        page = session.pages.get(page_id)
+        description = session.tokens.get(element_token)
+    if page is None:
+        raise BrowserError("that page is not part of this browser session")
+    if description is None or description.page_id != page_id:
+        raise BrowserError("that target is not one I found on this page")
+
+    if _page_identity(page) != description.page_identity:
+        return DOM_PAGE_CHANGED
+
+    timeout = max(1.0, action_timeout_seconds) * 1000
+    matches = _dom_matches(page, description.name, timeout)
+    if not matches:
+        return DOM_FRAMES_UNREAD if _page_has_child_frames(page) else DOM_GONE
+    if len(matches) > 1:
+        return DOM_AMBIGUOUS
+    role, locator = matches[0]
+    if role != description.role:
+        return DOM_ROLE_CHANGED
+    try:
+        locator.click(timeout=timeout)
+    except Exception as exc:
+        raise BrowserError(f"the click could not be delivered ({type(exc).__name__})") from None
+    return DOM_CLICKED
+
+
+def dom_page_has_frames(session_id: str, page_id: str) -> bool:
+    """Whether the page has child frames this slice does not look inside.
+
+    Used so a miss can be reported as "I did not look everywhere" rather than "it is not there" -
+    Page.frames includes the main frame, so more than one means there are children."""
+    with _browser_lock:
+        session = _browser_sessions.get(session_id)
+        page = session.pages.get(page_id) if session is not None else None
+    if page is None:
+        raise BrowserError("that browser session or page is not open")
+    try:
+        return _page_has_child_frames(page)
+    except Exception as exc:
+        raise BrowserError(f"that page could not be read ({type(exc).__name__})") from None
+
+
+def _page_has_child_frames(page) -> bool:
+    """Page.frames includes the main frame, so more than one means there are children."""
+    try:
+        return len(page.frames) > 1
+    except Exception:
+        return False
+
+
+def _dom_element(session_id: str, page_id: str, role: str, locator, observed_at: float, timeout: float):
+    """One matched control as structure. Anything unreadable degrades to a safe default rather than
+    failing the whole query - a missing bounding box is not a reason to refuse to find a button."""
+    from app.verifier.models import DomElement
+
+    def safe(read, default):
+        try:
+            value = read()
+            return default if value is None else value
+        except Exception:
+            return default
+
+    box = safe(lambda: locator.bounding_box(timeout=timeout), None)
+    bounds = None
+    if isinstance(box, dict):
+        bounds = safe(lambda: (int(box["x"]), int(box["y"]),
+                               int(box["x"] + box["width"]), int(box["y"] + box["height"])), None)
+    tag = str(safe(lambda: locator.evaluate("node => node.tagName", timeout=timeout), "")).lower()
+    # Whether it IS a password box - never what is in it. There is no code path here that asks for a
+    # value, and DomElement has no field that could hold one.
+    is_password = tag == "input" and str(
+        safe(lambda: locator.get_attribute("type", timeout=timeout), "")).lower() == "password"
+    return DomElement(
+        session_id=session_id,
+        page_id=page_id,
+        role=role,
+        tag=tag,
+        element_token=secrets.token_hex(8),
+        enabled=bool(safe(lambda: locator.is_enabled(timeout=timeout), True)),
+        visible=bool(safe(lambda: locator.is_visible(timeout=timeout), True)),
+        bounds=bounds,
+        is_password=is_password,
+        observed_at=observed_at,
+    )
+
+
+def _abandon(runtime, browser, context) -> None:
+    """Tear down whatever exists, in reverse order, never raising. Used by both close and the
+    partial-launch path, so there is one teardown rather than two that can disagree."""
+    for closer in (lambda: context.close(), lambda: browser.close(), lambda: runtime.stop()):
+        try:
+            closer()
+        except Exception:
+            continue
+
+
+def _playwright():
+    """Playwright, imported lazily - importing this module must never load a browser stack, and an
+    offline test cannot even reach the import (safety_guards.BROWSER_LIBRARIES)."""
+    try:
+        import playwright.sync_api as sync_api
+    except Exception as exc:
+        raise BrowserError(
+            f"browser automation is unavailable on this computer ({type(exc).__name__})") from None
+    return sync_api
 
 
 # --- Global emergency-stop hotkey -------------------------------------------------------------

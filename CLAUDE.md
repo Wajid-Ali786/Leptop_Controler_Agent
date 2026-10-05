@@ -59,9 +59,50 @@ git log, git show) are fine. Stage files (git add) only when the owner explicitl
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 5 — Screen Understanding. DESIGN/AUDIT ONLY; NOT STARTED.
-  The Phase 5 audit must define coherent verifier/screen-observation privacy and test-isolation
-  boundaries BEFORE expanding observation capability (see /docs/phase4-closeout.md Limitation G).
+Current phase: 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE.
+  The privacy and test-isolation boundaries required before expanding observation capability
+  (/docs/phase4-closeout.md Limitation G) were defined in Slice 1 and are in force: structural reads
+  are redirected offline, content reads are refused, and pywinauto is blocked at import.
+  Slice 1 — observation foundation + local UIA target resolution: DONE (2026-10-03).
+  Slice 2 — UIA re-identification + safe action-target bridge: DONE (2026-10-04), owner-run real UIA
+    smoke passed (Calculator "Seven": resolved, confirmed, re-identified, one click, 7 displayed).
+  Slice 3 — Brain + Planner wiring for a named click: DONE (2026-10-04), owner-run typed-console
+    smoke passed ("open calculator" then "click seven").
+  Auto-focus inter-slice — a named click brings its own owned window to the front after the
+    confirmation: DONE (2026-10-04). SetForegroundWindow only; a refusal is a retryable message and
+    never an escalation, a minimized window is refused rather than restored, and every other action
+    keeps the manual focus hand-over.
+  DOM Slice 1 — assistant-owned ephemeral browser session + read-only DOM resolution: DONE
+    (2026-10-04). NOT yet validated against a real browser: everything offline is faked, including
+    Playwright, so channel="chrome" launching, the role allowlist matching real page semantics and
+    get_by_role's behaviour are all UNPROVEN until a gated real_browser run. Playwright lives only in
+    app/executor/adapter.py (it can click, unlike UIA); the decision is a pure function in
+    app/verifier/observation.py. The owner's own Chrome profile is unreachable: non-persistent
+    context, no user-data-dir, no storage state, no cookie import. Real browser access needs the
+    real_browser marker AND RUN_REAL_BROWSER_TEST=1 - real_desktop does NOT grant it. No DOM action,
+    no navigation, and no UIA->DOM orchestration yet: a later slice must first audit how a Playwright
+    page maps to the top-level window UIA reads.
+  DOM Slice 2 — one authorized DOM click: DONE (2026-10-05). Playwright locator.click() behind the
+    Executor adapter, never a coordinate conversion and never a JS/dispatch click. The element token
+    now maps (inside the adapter only) to the semantic description that found it, so the target is
+    re-resolved AFTER the confirmation; a changed page, a vanished control, a duplicate or a changed
+    role all click nothing. The page's URL is fingerprinted inside the adapter and never returned or
+    logged. NOT yet validated against a real browser. The click cannot be interrupted mid-call: the
+    emergency stop is checked immediately before and immediately after, which is the honest guarantee.
+  Assistant-browser wiring — the DOM primitive reachable from the typed console: DONE (2026-10-05).
+    Two args-free kinds (open_browser / close_browser), parsed deterministically from "open/close
+    assistant browser" so they cost no model call. `app="assistant browser"` is a RESERVED context
+    selector recognised before configured apps and before Memory aliases; `app="chrome"` still means
+    the owner's configured personal Chrome and routes to UIA. One assistant browser at a time, headed
+    (the user navigates it themselves — there is no navigation command). A named click chooses its
+    context: one candidate is used, and an owned app window beside a live browser page REFUSES and
+    names both rather than preferring either. NOT yet validated end to end from the real console.
+  Layers 1 and 2 of the frozen five-layer hierarchy exist. For an explicitly selected
+  assistant-browser page, page-content targets route straight to DOM; HWND mapping is not required
+  for that scoped workflow, and browser chrome plus native window controls remain UIA territory. OCR,
+  vision and coordinate fallback are later slices; exact UIA accessible-name matching is
+  authoritative, so "7" does not find a control called "Seven", and control-name aliases are
+  deliberately NOT built on Phase 4's application aliases.
 Phase 0 — Foundation: COMPLETE (Done-when checklist passed 2026-09-16; tagged v0.1).
 Phase 1 — Basic Computer Control: COMPLETE (Done-when verified 2026-09-20).
   Verified by TWO runs of scripts/phase1_checklist.py, because the real-desktop and

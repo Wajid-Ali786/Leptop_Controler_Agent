@@ -132,13 +132,15 @@ Measured real-desktop behavior and known open decisions: docs/step4 Section 4, i
 import logging
 import re
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from app.executor import adapter, emergency_stop, shortcuts
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError, TypingInterruptedError
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, RESOLVE_BAD_FORMAT,
+from app.executor.models import (ASSISTANT_BROWSER, CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER,
+                                 OPEN_APP, OPEN_BROWSER, REFRESH, RESOLVE_BAD_FORMAT,
                                  RESOLVE_NO_TARGET, RESOLVE_OUT_OF_RANGE, RESOLVE_SETTINGS,
                                  RESOLVE_UNKNOWN_APP, RESOLVE_UNKNOWN_KIND, RESOLVE_UNWANTED_TARGET,
                                  SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL, ActionResult,
@@ -147,11 +149,14 @@ from app.safety.logic import Confirm, authorize
 from app.safety.models import Action, RiskLevel
 from app.verifier import logic as verifier
 from app.verifier import observation
-from app.verifier.models import (ActionTarget, ActiveTarget, Ambiguous, NotEligible, NotFound, Observed,
-                                 Screen, Stale, Target, Unavailable, WindowExpectation, WindowInfo)
+from app.verifier.models import (ActionTarget, ActiveTarget, Ambiguous, DomTarget, Found,
+                                 FramesNotSupported, NotEligible, NotFound, Observed, Screen, Stale,
+                                 Target, Unavailable, WindowExpectation, WindowInfo, normalize_name)
 from config.settings import SettingsError, get_setting
 
 log = logging.getLogger(__name__)
+
+_clock = time.monotonic   # replaced in tests that need the activation deadline to pass instantly
 
 OfferRetry = Callable[[ActionResult], bool]
 
@@ -258,6 +263,31 @@ def _resolve_click(action: ExecutorAction) -> Resolved | Unresolved:
                           f"I can't click at '{target}': give whole-number screen coordinates "
                           f"as x, y (e.g. 500, 300).")
     return Resolved((int(match.group(1)), int(match.group(2))))
+
+
+def _resolve_click_target(action: ExecutorAction) -> Resolved | Unresolved:
+    """The grammar-and-config half of a named click: is there a control name, and is the app one we
+    have? Side-effect free like every other resolver - no window is looked for here, because which
+    window is open is a fact about the desktop and belongs in the preparer."""
+    control = action.control.strip() if isinstance(action.control, str) else ""
+    if not control:
+        return Unresolved(RESOLVE_NO_TARGET, "What should I click? Name the button or field.")
+    app = action.target.strip().lower() if isinstance(action.target, str) else ""
+    if not app:
+        return Resolved((control, ""))      # which context, is answered from this session's records
+    if app == ASSISTANT_BROWSER:
+        # RESERVED, and checked FIRST - before configuration and before Memory's aliases get a say.
+        # It names runtime context, so no configured app and no remembered alias can redefine it.
+        return Resolved((control, ASSISTANT_BROWSER))
+    try:
+        apps = _configured_apps()
+    except SettingsError as exc:
+        return Unresolved(RESOLVE_SETTINGS, str(exc))
+    if app not in apps:
+        return Unresolved(RESOLVE_UNKNOWN_APP,
+                          f"I don't know an app called '{action.target.strip()}'. "
+                          f"Apps I can click in: {', '.join(sorted(apps))}.")
+    return Resolved((control, app))
 
 
 def _resolve_scroll(action: ExecutorAction) -> Resolved | Unresolved:
@@ -794,6 +824,431 @@ def _prepare_target_click(action: ExecutorAction, target: Target, observed: Obse
         return _send_click(action, x, y, f'"{named}"', _TARGET)
 
     return _Prepared(run, safety_action)
+
+
+# --- click a control the user named (Phase 5 Slice 3) -------------------------------------------------
+# This is the wiring, not a new capability. It answers one question the Brain is deliberately not
+# allowed to answer - WHICH WINDOW - and then hands Slice 2's bridge exactly what it already takes.
+#
+# WHERE THE WINDOW COMES FROM, and why it is not the one in front. A window being visible says nothing
+# about whether the user meant it, so the only windows considered are the ones this session OPENED and
+# can still prove it owns: the same _session_windows records and the same ownership token that close_app
+# requires. That record is only ever written after the Verifier confirmed the window appeared and the
+# token was read back, which is why an open that failed, or one that could not be proved, cannot put a
+# window within reach of a click.
+#
+# It refuses rather than choosing whenever that leaves more than one answer. Two Notepads open and no
+# app named is not a 50/50 guess worth taking.
+
+# --- the assistant's own browser: open and close ------------------------------------------------------
+# Lifecycle only. Opening mirrors open_app (LOW - starting something changes no data), and closing
+# mirrors close_app (a MEDIUM code constant), so no new risk policy is invented here.
+
+def _resolve_open_browser(action: ExecutorAction) -> Resolved | Unresolved:
+    return _no_target(action, "open_browser")
+
+
+def _resolve_close_browser(action: ExecutorAction) -> Resolved | Unresolved:
+    return _no_target(action, "close_browser")
+
+
+def _no_target(action: ExecutorAction, kind: str) -> Resolved | Unresolved:
+    """These kinds take nothing: there is one assistant browser, or there is none."""
+    if isinstance(action.target, str) and action.target.strip():
+        return Unresolved(RESOLVE_UNWANTED_TARGET,
+                          f"'{kind.replace('_', ' ')}' doesn't take anything after it.")
+    return Resolved(None)
+
+
+def _prepare_open_browser(action: ExecutorAction):
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    if adapter.browser_sessions():
+        return _result(action, False, "The assistant browser is already open, so I didn't open "
+                                      "another one.")
+    try:
+        channel, launch_timeout = _browser_launch_settings()
+    except SettingsError as exc:
+        return _result(action, False, str(exc))
+
+    def run() -> ActionResult:
+        emergency_stop.check()
+        try:
+            # headed: the user is the one who will put a page in it, so they have to be able to see it.
+            adapter.browser_open_session(channel, launch_timeout, True)
+        except adapter.BrowserError as exc:
+            return _result(action, False, f"I couldn't open the assistant browser ({exc}).")
+        return _result(action, True, "Opened the assistant browser. It's mine, not your usual Chrome: "
+                                     "no profile, no tabs, no saved logins. Put a page in it and tell "
+                                     "me what to click.")
+
+    return _Prepared(run)
+
+
+def _prepare_close_browser(action: ExecutorAction):
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    sessions = adapter.browser_sessions()
+    if not sessions:
+        return _result(action, False, "The assistant browser isn't open, so there was nothing to "
+                                      "close.")
+    safety_action = Action(action.description, minimum_level=_CLOSE_RISK,
+                           minimum_reason=_CLOSE_RISK_REASON)
+
+    def run() -> ActionResult:
+        emergency_stop.check()
+        # Only sessions in the adapter's own registry - the configured personal Chrome is a launched
+        # application with a window token, is in no part of this registry, and cannot be reached here.
+        closed = sum(1 for session_id, _page in sessions if adapter.browser_close_session(session_id))
+        if not closed:
+            return _result(action, False, "The assistant browser was already gone.")
+        return _result(action, True, "Closed the assistant browser.")
+
+    return _Prepared(run, safety_action)
+
+
+def _browser_launch_settings() -> tuple[str, float]:
+    channel = get_setting("browser.channel")
+    if not isinstance(channel, str) or not channel.strip():
+        raise SettingsError(f"Setting 'browser.channel' must be a browser name, got {channel!r}.")
+    timeout = get_setting("browser.launch_timeout_seconds")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise SettingsError(f"Setting 'browser.launch_timeout_seconds' must be a positive number, "
+                            f"got {timeout!r}.")
+    return channel.strip(), float(timeout)
+
+
+def _prepare_named_click(action: ExecutorAction):
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message, log_message=f"{_TARGET}: {resolution.reason}")
+    control, app = resolution.value
+    context = _context_for_named_click(app)
+    if isinstance(context, str):
+        return _result(action, False, context, log_message=f"{_TARGET}: no single context to use")
+    if isinstance(context, _BrowserPageContext):
+        # Layer 2. The SAME preparer the DOM entry point uses - there is one DOM path, not a second.
+        return _prepare_dom_click(action, DomTarget(control, context.session_id, context.page_id))
+
+    window = context.window
+    target = Target(control, window.handle)
+    found = observation.resolve_target(target)
+    if not isinstance(found, Found):
+        message, why = _refused(control, found)
+        return _result(action, False, message, log_message=f"{_TARGET}: {why}")
+    # Found. From here it is Slice 2's path, unchanged: it builds the confirmation, re-identifies the
+    # control after the user answers, and sends the one click. The only thing added is one step in
+    # front of that run - bringing the owned window forward - which is why Slice 2's preparer is
+    # COMPOSED rather than edited: the coordinate click's run must stay exactly as it was.
+    prepared = _prepare_target_click(action, target, found.observed)
+    if isinstance(prepared, ActionResult):
+        return prepared
+    return _Prepared(_activate_then(action, window, prepared.run), prepared.safety_action)
+
+
+def _activate_then(action: ExecutorAction, window: WindowInfo, run):
+    """Run `run` only once the owned window is genuinely in front.
+
+    WHY THIS IS AFTER THE CONFIRMATION, and must be. The user answers the confirmation in the console,
+    so the console has to stay in front until they have typed it - activating the target first would
+    take the keyboard away from the very prompt being answered. Afterwards is also the one moment
+    Windows is most likely to allow the change at all: our process is the foreground process and it
+    just received the last input event, which are two of the documented conditions under which
+    SetForegroundWindow is permitted."""
+    def activate_then_run() -> ActionResult:
+        emergency_stop.check()
+        refusal = _bring_owned_window_forward(action, window)
+        if refusal is not None:
+            return refusal                 # nothing was clicked, and the result says to try again
+        return run()
+    return activate_then_run
+
+
+def _bring_owned_window_forward(action: ExecutorAction, window: WindowInfo) -> ActionResult | None:
+    """None once `window` is in front; otherwise the result explaining why nothing was clicked.
+
+    `window` is the one the ownership token already proved, so no title is matched and no other window
+    can be brought forward by this path. A refusal here is RETRYABLE on purpose: putting a window in
+    front is something the user can do in a second, and the existing retry offer then asks them to."""
+    name = action.target.strip() or "that app"
+    try:
+        state = verifier.window_state(window.handle)
+    except verifier.VerifierUnavailableError as exc:
+        return _result(action, False, f"Didn't click: I can't check {name}'s window ({exc}).",
+                       log_message=f"{_TARGET}: the window state could not be read ({exc})")
+    if state is None:
+        return _result(action, False, f"Didn't click: {name}'s window isn't open any more.",
+                       log_message=f"{_TARGET}: the window closed before it could be brought forward")
+    if state.minimized:
+        # Deliberately NOT restored. Un-minimising someone's window is a change to their desktop that
+        # nobody asked for, and the mechanism for it would have to reach a background window, which
+        # window_control does not do. Asking is the honest option.
+        return _result(action, False,
+                       f"{name} is minimized, so I can't click in it. Bring it back up and say that "
+                       f"again.", retryable=True,
+                       log_message=f"{_TARGET}: the owned window is minimized")
+
+    try:
+        accepted = adapter.activate_window(window.handle)
+    except adapter.WindowGoneError:
+        return _result(action, False, f"Didn't click: {name}'s window isn't open any more.",
+                       log_message=f"{_TARGET}: the window closed during activation")
+    except adapter.ExecutorAdapterError as exc:
+        return _result(action, False, f"I couldn't bring {name} to the front ({exc}), so I didn't "
+                                      f"click. Put it in front and say that again.", retryable=True,
+                       log_message=f"{_TARGET}: activation failed ({exc})")
+
+    # SetForegroundWindow's own answer is not proof - it can report success and the window still not be
+    # in front - so the foreground is read back by HANDLE until it is ours or the time runs out.
+    try:
+        settle, poll = _activation_settings()
+    except SettingsError as exc:
+        return _result(action, False, str(exc), log_message=f"{_TARGET}: {exc}")
+    deadline = _clock() + settle
+    while True:
+        try:
+            front = verifier.active_target().window
+        except verifier.VerifierUnavailableError as exc:
+            return _result(action, False, f"Didn't click: I can't check which window is in front "
+                                          f"({exc}).",
+                           log_message=f"{_TARGET}: the foreground could not be read ({exc})")
+        if front is not None and front.handle == window.handle:
+            return None
+        if _clock() >= deadline:
+            return _result(action, False,
+                           f"I couldn't bring {name} to the front, so I didn't click. Windows can "
+                           f"refuse that while another window has it. Put {name} in front and say "
+                           f"that again.", retryable=True,
+                           log_message=f"{_TARGET}: foreground not acquired (accepted={accepted})")
+        if emergency_stop.wait(poll):      # interruptible: never a raw sleep
+            emergency_stop.check()         # raises EmergencyStopError
+
+
+def _activation_settings() -> tuple[float, float]:
+    """How long to wait for the foreground, and how often to look.
+
+    The poll interval is the Verifier's existing one rather than a second new setting: "how often to
+    re-read the desktop" is already answered there, and answering it twice is how two numbers drift."""
+    settle = get_setting("executor.activation_settle_seconds")
+    if isinstance(settle, bool) or not isinstance(settle, (int, float)) or settle <= 0:
+        raise SettingsError(f"Setting 'executor.activation_settle_seconds' must be a positive number, "
+                            f"got {settle!r}.")
+    poll = get_setting("verifier.poll_interval_seconds")
+    if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
+        raise SettingsError(f"Setting 'verifier.poll_interval_seconds' must be a positive number, "
+                            f"got {poll!r}.")
+    return float(settle), float(poll)
+
+
+# Two DIFFERENT kinds of place a named click can happen, as two different types - so an opaque
+# browser session id can never be handled as though it were a window handle, or the reverse.
+#
+# HWND JUSTIFICATION. For this first vertical, an explicitly selected assistant-browser page routes
+# page-content targets directly to DOM. HWND mapping is not required for that scoped workflow.
+# Browser chrome and native window controls remain UIA territory.
+
+
+@dataclass(frozen=True)
+class _AppWindowContext:
+    """A window this session opened and can still prove it owns. Resolved through UI Automation."""
+    app: str
+    window: WindowInfo
+
+
+@dataclass(frozen=True)
+class _BrowserPageContext:
+    """A page in the assistant's own browser. Resolved through the DOM.
+
+    Opaque ids only - there is no window handle here, because a page is not a window and this slice
+    maps neither to the other."""
+    session_id: str
+    page_id: str
+
+
+def _context_for_named_click(app: str) -> "_AppWindowContext | _BrowserPageContext | str":
+    """WHERE a named click should happen, or a message saying why there is no single answer.
+
+    The one rule: when the user did not say, there has to be exactly ONE candidate. Two is not a
+    preference to apply quietly - it is a question to ask, which is why a live assistant browser
+    beside an owned app window refuses rather than choosing either."""
+    sessions = adapter.browser_sessions()
+    if app == ASSISTANT_BROWSER:
+        if not sessions:
+            return ("I don't have an assistant browser open, so there's no page to click in. Say "
+                    "'open assistant browser' first.")
+        if len(sessions) > 1:
+            return ("I have more than one assistant browser page open, so I don't know which you "
+                    "mean.")
+        session_id, page_id = sessions[0]
+        return _BrowserPageContext(session_id=session_id, page_id=page_id)
+
+    with _session_lock:
+        opened = {name: list(groups) for name, groups in _session_windows.items() if groups}
+    if app and app not in opened:
+        return (f"I haven't opened {app} in this session, so I don't have a window of it I can prove "
+                f"is mine to click in. Open it first.")
+    if not app:
+        candidates = sorted(opened) + ([ASSISTANT_BROWSER] if sessions else [])
+        if not candidates:
+            return ("I haven't opened anything yet in this session, so I don't know which window you "
+                    "mean. Open the app first, or say which app to click in.")
+        if len(candidates) > 1:
+            if sessions:
+                # The mixed case: an app window AND a page. Naming the reserved selector matters,
+                # because without it the user has no words for the browser.
+                return (f"I've opened more than one thing in this session "
+                        f"({', '.join(candidates)}), so I don't know which one you mean. Say which - "
+                        f"for example 'in {ASSISTANT_BROWSER}', or the app's name.")
+            return (f"I've opened more than one app in this session ({', '.join(sorted(opened))}), so "
+                    f"I don't know which one you mean. Say which app to click in.")
+        if candidates == [ASSISTANT_BROWSER]:
+            session_id, page_id = sessions[0]
+            return _BrowserPageContext(session_id=session_id, page_id=page_id)
+        app = candidates[0]
+
+    try:
+        expectation = verifier.expect_window(app)
+        windows = [window for group in opened[app] for window in _ours_now(group, expectation)]
+    except SettingsError as exc:
+        return str(exc)
+    except verifier.VerifierUnavailableError as exc:
+        return f"I can't check {app}'s windows right now ({exc})."
+    if not windows:
+        return (f"I opened {app} earlier, but I can't find a window of it that I can still prove is "
+                f"mine, so I won't click in it.")
+    if len(windows) > 1:
+        return (f"I have {len(windows)} {app} windows open from this session, so I don't know which "
+                f"one you mean.")
+    return _AppWindowContext(app=app, window=windows[0])
+
+
+# --- click a control the user named, in the assistant's own browser (Phase 5 DOM Slice 2) -------------
+# Layer 2 of the frozen hierarchy gets an action, and it reuses everything layer 1 already proved: the
+# same prepare -> authorize -> run seam, the same yes-only MEDIUM confirmation, the same emergency-stop
+# checkpoints, the same honest UNVERIFIED result.
+#
+# NO NEW ACTION KIND, deliberately. Adding one would mean adding it to the Brain's vocabulary, which
+# this slice must not do - and two tests already hold ARGS_FOR_KIND and _PREPARERS to the same set. So
+# this is an entry point rather than a dispatch entry, and the result's ExecutorAction carries the
+# user's word in `control` with an EMPTY target, so log_label stays empty and nothing leaks.
+#
+# WHAT IS NOT HERE. No Playwright: the library lives in the adapter, and this module only sequences.
+# No URL, no selector, no accessible name read back off the page - the only name in play is the one
+# the caller was given by the user, which is why the confirmation may say it.
+
+_DOM_CLICK_RISK = RiskLevel.MEDIUM
+_DOM_CLICK_RISK_REASON = ("click on a page control - always needs confirmation (what the control does "
+                          "can't be known from its name)")
+_DOM = "dom target"          # how this path is described in LOGS: a layer, never a name or an address
+
+
+def click_dom_target(target: DomTarget, confirm: Confirm | None = None, *,
+                     risk_floor: RiskLevel = RiskLevel.LOW) -> ActionResult:
+    """Click the control the user named, in an assistant-owned browser page.
+
+    `target` carries the user's own words and the opaque session/page the caller already opened. There
+    is no command for this yet and no Brain wiring: the local primitive is built and proved first."""
+    emergency_stop.check()
+    # An empty target keeps log_label empty; `control` is the user's own word, shown but never logged.
+    action = ExecutorAction(CLICK_TARGET, "", target.name.strip() if isinstance(target, DomTarget)
+                            and isinstance(target.name, str) else "")
+    return _authorize_and_run(action, _prepare_dom_click(action, target), confirm, risk_floor)
+
+
+def _prepare_dom_click(action: ExecutorAction, target: DomTarget):
+    if not isinstance(target, DomTarget) or not isinstance(target.name, str) or not target.name.strip():
+        return _result(action, False, "I need the name of something to click.")
+    named = target.name.strip()
+    try:
+        query_timeout = _browser_query_timeout()
+    except SettingsError as exc:
+        return _result(action, False, str(exc), log_message=f"{_DOM}: {exc}")
+
+    try:
+        elements = adapter.dom_query(target.session_id, target.page_id,
+                                     normalize_name(target.name), query_timeout)
+        has_frames = adapter.dom_page_has_frames(target.session_id, target.page_id)
+    except adapter.BrowserError as exc:
+        return _result(action, False, f"Didn't click '{named}': {exc}.",
+                       log_message=f"{_DOM}: the page could not be read ({exc})")
+
+    found = observation.resolve_dom_target(target, elements, has_frames)
+    if not isinstance(found, Found):
+        message, why = _dom_refused(named, found)
+        return _result(action, False, message, log_message=f"{_DOM}: {why}")
+
+    token = found.observed.runtime_id          # the opaque element token; meaningless outside the adapter
+    safety_action = Action(f'click "{named}" in the assistant browser',
+                           minimum_level=_DOM_CLICK_RISK, minimum_reason=_DOM_CLICK_RISK_REASON)
+
+    def run() -> ActionResult:
+        emergency_stop.check()                 # last checkpoint before the input is sent
+        try:
+            outcome = adapter.dom_click(target.session_id, target.page_id, token, query_timeout)
+        except adapter.BrowserError as exc:
+            return _result(action, False, f"I couldn't click '{named}': {exc}.",
+                           log_message=f"{_DOM}: the click failed ({exc})")
+        finally:
+            # Playwright's click is a blocking call into its driver and cannot be interrupted part
+            # way. The honest guarantee is therefore before and after, not during - and checking
+            # afterwards is what stops a plan continuing past a stop pressed while it ran.
+            emergency_stop.check()
+        if outcome != adapter.DOM_CLICKED:
+            message, why = _dom_stale(named, outcome)
+            return _result(action, False, message, log_message=f"{_DOM}: {why}")
+        return _result(action, True, f"Clicked \"{named}\" in the assistant browser. I can't check "
+                                     f"what the click did.", outcome=Outcome.UNVERIFIED,
+                       log_message=f"{_DOM}: clicked")
+
+    return _Prepared(run, safety_action)
+
+
+def _dom_refused(named: str, found) -> tuple[str, str]:
+    """Why a DOM target was not clicked, before the confirmation: what the USER is told, and what a LOG
+    may keep. Two sentences because they have different audiences - the log never gets the name."""
+    if isinstance(found, Ambiguous):
+        return found.message, f"ambiguous ({len(found.candidates)} matches)"
+    if isinstance(found, FramesNotSupported):
+        return found.reason, "not found, and the page has frames that are not read"
+    if isinstance(found, NotFound):
+        return found.message, "no such control on that page"
+    if isinstance(found, Unavailable):
+        return f"Didn't click '{named}': {found.reason}", "the page could not be observed"
+    return f"Didn't click '{named}': I couldn't find it.", "unrecognised resolution"
+
+
+def _dom_stale(named: str, outcome: str) -> tuple[str, str]:
+    """Why a re-resolution after the confirmation refused. Every branch clicked NOTHING."""
+    if outcome == adapter.DOM_PAGE_CHANGED:
+        return (f"That page changed while you were answering, so I didn't click '{named}'. Ask again "
+                f"if you still want it.", "the page changed after the confirmation")
+    if outcome == adapter.DOM_AMBIGUOUS:
+        return (f"There is more than one '{named}' on that page now, so I'm not going to guess which "
+                f"one you meant.", "ambiguous after the confirmation")
+    if outcome == adapter.DOM_ROLE_CHANGED:
+        return (f"The '{named}' on that page isn't the same kind of control any more, so I didn't "
+                f"click it.", "the control's role changed after the confirmation")
+    if outcome == adapter.DOM_FRAMES_UNREAD:
+        return (f"'{named}' isn't in the main part of that page any more, and the rest of it is "
+                f"frames I can't read yet - so I didn't click.", "frames unread after the confirmation")
+    return (f"'{named}' wasn't there any more by the time you answered, so I didn't click.",
+            "gone after the confirmation")
+
+
+def _browser_query_timeout() -> float:
+    """One timeout for reading a page and for clicking in it.
+
+    Deliberately not a second setting. A click waits for actionability where a query only reads, so
+    these are not quite the same concept - but two numbers that drift apart are worse than one that is
+    slightly generous, and if a real click needs longer than a real query, a separate
+    browser.action_timeout_seconds is the first thing to add."""
+    value = get_setting("browser.query_timeout_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise SettingsError(f"Setting 'browser.query_timeout_seconds' must be a positive number, "
+                            f"got {value!r}.")
+    return float(value)
 
 
 def _refused(named: str, found) -> tuple[str, str]:
@@ -1556,10 +2011,14 @@ def _session_group_containing(handle: int) -> _SessionGroup | None:
 # --- Helpers ----------------------------------------------------------------------------
 
 _RESOLVERS = {OPEN_APP: _resolve_open_app, CLOSE_APP: _resolve_close_app, CLICK: _resolve_click,
+              CLICK_TARGET: _resolve_click_target,
+              OPEN_BROWSER: _resolve_open_browser, CLOSE_BROWSER: _resolve_close_browser,
               SCROLL: _resolve_scroll, SHORTCUT: _resolve_shortcut, REFRESH: _resolve_refresh,
               WINDOW_CONTROL: _resolve_window_control, TYPE_TEXT: _resolve_type_text}
 
 _PREPARERS = {OPEN_APP: _prepare_open_app, CLOSE_APP: _prepare_close_app, CLICK: _prepare_click,
+              CLICK_TARGET: _prepare_named_click,
+              OPEN_BROWSER: _prepare_open_browser, CLOSE_BROWSER: _prepare_close_browser,
               TYPE_TEXT: _prepare_type_text, SHORTCUT: _prepare_shortcut, SCROLL: _prepare_scroll,
               REFRESH: _prepare_refresh, WINDOW_CONTROL: _prepare_window_control}
 

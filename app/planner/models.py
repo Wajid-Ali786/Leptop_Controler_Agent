@@ -12,8 +12,9 @@ own and cannot be confused with a run of it.
 from dataclasses import dataclass, field
 
 from app.brain.models import Interpretation, PreviousActionContext
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
-                                 WINDOW_CONTROL, ExecutorAction)
+from app.executor.models import (CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, OPEN_APP,
+                                 OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL,
+                                 ExecutorAction)
 from app.safety.models import RiskLevel
 
 # A plan stays short enough for a person to read before accepting it, and short enough that a wrong
@@ -88,8 +89,10 @@ class FrontEnd:
         return kind in self.may_plan
 
 
-ALL_KINDS = frozenset({OPEN_APP, CLOSE_APP, CLICK, TYPE_TEXT, SHORTCUT, SCROLL, REFRESH,
-                       WINDOW_CONTROL})
+ALL_KINDS = frozenset({OPEN_APP, CLOSE_APP, CLICK, CLICK_TARGET, TYPE_TEXT, SHORTCUT, SCROLL, REFRESH,
+                       WINDOW_CONTROL, OPEN_BROWSER, CLOSE_BROWSER})
+# click_target is deliberately NOT here: like a coordinate click it needs the target window in front,
+# so in voice mode it would act on the console the user is talking to. Phase 3's limitation, unchanged.
 NO_HANDOVER_KINDS = frozenset({OPEN_APP, CLOSE_APP})
 
 TYPED_CONSOLE = FrontEnd(name="typed console", may_plan=ALL_KINDS)

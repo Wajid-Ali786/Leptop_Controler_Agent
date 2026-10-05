@@ -26,8 +26,8 @@ import logging
 import re
 from dataclasses import dataclass
 
-from app.executor.models import CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL, \
-    ExecutorAction
+from app.executor.models import ASSISTANT_BROWSER, CLICK, CLOSE_APP, CLOSE_BROWSER, OPEN_APP, \
+    OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL, ExecutorAction
 
 EMPTY = "empty"          # nothing but whitespace
 UNKNOWN = "unknown"      # not a command
@@ -52,6 +52,8 @@ HELP = """Commands (one per line; the command word is not case-sensitive):
   shortcut <keys>               shortcut ctrl+a
   scroll up|down <notches>      scroll down 3
   refresh                       refresh the active window
+  open assistant browser        the assistant's OWN browser (not your Chrome)
+  close assistant browser       close it again
   minimize [window]             the active window; also maximize, restore
   help                          this list
   exit                          leave the console"""
@@ -82,6 +84,10 @@ def parse(text: str) -> ExecutorAction | CommandRefusal:
     if verb == TYPE_VERB:  # everything after "type" is text, so it is never split into words
         return _parse_type(rest)
     target = " ".join(rest.split())  # runs of whitespace count as one; the target's own case is kept
+    # The canonical lifecycle forms are RECOGNISED HERE, before the app verbs, so they cost no model
+    # call at all - and so "assistant browser" can never be looked up as an app name or an alias.
+    if verb in ("open", "close") and target.lower() == ASSISTANT_BROWSER:
+        return _parsed(ExecutorAction(OPEN_BROWSER if verb == "open" else CLOSE_BROWSER))
     if verb == "close":
         if not target:
             return _refuse(AMBIGUOUS, AMBIGUOUS_CLOSE)

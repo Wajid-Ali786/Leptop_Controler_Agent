@@ -20,7 +20,8 @@ import logging
 import time
 
 from app.verifier import adapter
-from app.verifier.models import (ActionTarget, Ambiguous, Found, NotEligible, NotFound, Observed,
+from app.verifier.models import (ActionTarget, Ambiguous, DomElement, DomTarget, Found,
+                                 FramesNotSupported, NotEligible, NotFound, Observed,
                                  ObservationSource, Stale, Target, Unavailable, normalize_name)
 from config.settings import SettingsError, get_setting
 
@@ -250,3 +251,86 @@ def _usable(bounds) -> bool:
     return (isinstance(bounds, tuple) and len(bounds) == 4
             and all(isinstance(value, int) and not isinstance(value, bool) for value in bounds)
             and bounds[2] > bounds[0] and bounds[3] > bounds[1])
+
+
+# --- Layer 2: the browser DOM (Phase 5 DOM Slice 1) ---------------------------------------------------
+# PURE. This function performs no browser IO, holds no Playwright object and cannot act - it is handed
+# the structural matches that app/executor/adapter.dom_query() already filtered, and it decides what
+# they mean. That split exists because Playwright can click as well as read: the library stays in the
+# one module allowed to control this computer, and the judgement stays here, so no module both decides
+# and acts.
+#
+# It is deliberately NOT wired to the UIA layer yet. The frozen hierarchy (UIA first, DOM second) is
+# still binding, but the mapping between a Playwright page and the top-level window UIA reads has not
+# been designed, and inventing one here would be guessing which window a page belongs to. Orchestration
+# is a later slice, after that mapping is audited.
+
+
+def resolve_dom_target(target: DomTarget,
+                       elements, has_frames: bool = False
+                       ) -> Found | Ambiguous | NotFound | FramesNotSupported | Unavailable:
+    """Which page control the user meant, out of the matches already found for their word.
+
+    Found when exactly one matched. Ambiguous when more than one did - across different roles too,
+    because two things called Login are two things called Login whether one is a button and the other
+    a link. Nothing is chosen.
+
+    A miss is reported two different ways on purpose. NotFound means the top-level document really has
+    no such control. FramesNotSupported means it has none AND the page has child frames this slice does
+    not look inside - "I did not find it" and "I did not look everywhere it could be" are different
+    claims, and a later layer must not act on the second as though it were the first."""
+    if not isinstance(target, DomTarget) or not isinstance(target.name, str) or not target.name.strip():
+        return NotFound("I need the name of something to look for.")
+    if not isinstance(target.session_id, str) or not target.session_id \
+            or not isinstance(target.page_id, str) or not target.page_id:
+        return Unavailable("I don't have a browser page to look in.")
+    if elements is None:
+        return Unavailable("I couldn't read that page.")
+
+    matches = tuple(e for e in elements
+                    if isinstance(e, DomElement)
+                    and e.session_id == target.session_id and e.page_id == target.page_id)
+    _log_dom(len(matches), bool(has_frames))
+
+    if len(matches) == 1:
+        return Found(_observed_from_dom(matches[0]))
+    if len(matches) > 1:
+        return Ambiguous(tuple(_observed_from_dom(match) for match in matches),
+                         f"There are {len(matches)} things called '{target.name.strip()}' on that "
+                         f"page, so I'm not going to guess which one you mean.")
+    if has_frames:
+        return FramesNotSupported(
+            f"I couldn't find '{target.name.strip()}' on that page, but parts of it are embedded "
+            f"frames I can't read yet - so it may be in there. I'm not going to say it isn't there.")
+    return NotFound(f"I couldn't find anything called '{target.name.strip()}' on that page.")
+
+
+def _observed_from_dom(element: DomElement) -> Observed:
+    """A DOM match as the one observation shape every layer shares, so the provenance travels with it.
+
+    `window_handle` is 0: a page is not a window, and this slice has no mapping between the two. Saying
+    0 is honest; inventing a handle would be the beginning of guessing which window a page is in."""
+    return Observed(
+        source=ObservationSource.DOM,
+        window_handle=0,
+        control_type=element.role,
+        observed_at=element.observed_at,
+        runtime_id=element.element_token,
+        automation_id="",
+        class_name=element.tag,
+        bounds=element.bounds,
+        enabled=element.enabled,
+        focused=False,
+        offscreen=not element.visible,
+        is_password=element.is_password,
+        patterns=(),
+    )
+
+
+def _log_dom(candidates: int, has_frames: bool) -> None:
+    """Counts and layer metadata only - never a name, never page text, never a URL or a domain."""
+    log.info("Observation: source=%s resolution=%s candidates=%d frames_unread=%s escalation=false",
+             ObservationSource.DOM.value,
+             "found" if candidates == 1 else "ambiguous" if candidates > 1
+             else "frames_unread" if has_frames else "not_found",
+             candidates, str(bool(has_frames)).lower())

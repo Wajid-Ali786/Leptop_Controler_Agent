@@ -176,6 +176,10 @@ OPT_IN_GATES = {
                  f"Real Claude API call - set {REAL_API_OPT_IN}=1 to run (uses the .env key, costs a few tokens)"),
     "real_desktop": (REAL_DESKTOP_OPT_IN,
                      f"Opens real windows - set {REAL_DESKTOP_OPT_IN}=1 to run (closes only what it opened)"),
+    "real_browser": ("RUN_REAL_BROWSER_TEST",
+                     "Starts a real assistant-owned browser (its own profile, and the page may reach "
+                     "the network) - set RUN_REAL_BROWSER_TEST=1 to run. real_desktop does NOT grant "
+                     "this: a browser can reach a profile, cookies and the network."),
     "real_clipboard": (REAL_CLIPBOARD_OPT_IN,
                        f"Replaces your clipboard's contents - set {REAL_CLIPBOARD_OPT_IN}=1 to run"),
     "real_elevated": (REAL_ELEVATED_OPT_IN,

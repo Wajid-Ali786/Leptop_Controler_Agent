@@ -573,11 +573,17 @@ def test_the_result_keeps_its_uia_provenance(world):
 
 
 def test_the_coordinate_layer_is_still_unimplemented():
-    """19. Declared in the frozen hierarchy, produced by nothing."""
+    """19. Declared in the frozen hierarchy, produced by nothing.
+
+    DOM was removed from this list when layer 2 was built; the point of the test is unchanged, and it
+    is the coordinate fallback in particular that must never be reached for while a higher layer
+    works."""
     module = code_of_module(settings.PROJECT_ROOT / "app" / "verifier" / "observation.py")
-    for later in ("ObservationSource.DOM", "ObservationSource.OCR", "ObservationSource.VISION",
+    for later in ("ObservationSource.OCR", "ObservationSource.VISION",
                   "ObservationSource.COORDINATE"):
         assert later not in module, f"{later} is a later slice"
+    # the UIA bridge in particular must still never relabel its own evidence
+    assert "COORDINATE" not in code_of(observation._action_target)
 
 
 def test_the_target_name_can_only_come_from_the_user(world):

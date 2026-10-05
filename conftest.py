@@ -24,6 +24,7 @@ PhysicalBoundaryEscaped = safety_guards.PhysicalBoundaryEscaped
 PhysicalDesktopEscaped = safety_guards.PhysicalDesktopEscaped
 PhysicalAudioEscaped = safety_guards.PhysicalAudioEscaped
 PhysicalListenerEscaped = safety_guards.PhysicalListenerEscaped
+PhysicalBrowserEscaped = safety_guards.PhysicalBrowserEscaped
 ProviderEscaped = safety_guards.ProviderEscaped
 RealDatabaseEscaped = safety_guards.RealDatabaseEscaped
 
@@ -32,7 +33,7 @@ def pytest_configure(config):
     """Register the real markers here too, so a test file outside tests/ can still be marked."""
     for marker, gate in sorted({**safety_guards.DESKTOP_EXEMPT, **safety_guards.AUDIO_EXEMPT,
                                 **safety_guards.MICROPHONE_EXEMPT, **safety_guards.MODEL_EXEMPT,
-                                **safety_guards.PROVIDER_EXEMPT,
+                                **safety_guards.PROVIDER_EXEMPT, **safety_guards.BROWSER_EXEMPT,
                                 **safety_guards.DATABASE_EXEMPT}.items()):
         config.addinivalue_line("markers", f"{marker}: uses this computer or the network for real; "
                                            f"needs {gate}=1 as well as this marker")
@@ -119,6 +120,17 @@ def no_live_input_state(request, monkeypatch):
     if safety_guards.exempt(request.node, safety_guards.DESKTOP_EXEMPT):
         return
     safety_guards.install_verifier_input_guard(verifier_adapter, monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def no_real_browser(request, monkeypatch):
+    """Refuse every boundary that could start or read a real browser, and block Playwright at import.
+
+    Its own marker and gate rather than real_desktop's: a browser session can reach the user's profile,
+    their cookies and the network, and a test permitted to move the mouse was never permitted that."""
+    if safety_guards.exempt(request.node, safety_guards.BROWSER_EXEMPT):
+        return
+    safety_guards.install_browser_guard(executor_adapter, monkeypatch)
 
 
 @pytest.fixture(autouse=True)

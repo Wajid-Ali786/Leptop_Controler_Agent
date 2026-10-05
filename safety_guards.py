@@ -56,6 +56,14 @@ class ProviderEscaped(PhysicalBoundaryEscaped):
     """It would have sent a real HTTP request - the path the Anthropic client uses."""
 
 
+class PhysicalBrowserEscaped(PhysicalBoundaryEscaped):
+    """An offline test reached a real browser session.
+
+    Separate from PhysicalDesktopEscaped on purpose, and the reason is the consequence, not tidiness: a
+    browser session can reach a PROFILE, COOKIES and the NETWORK. Desktop input cannot. A test that is
+    allowed to move the mouse has not thereby been allowed to open a browser."""
+
+
 class RealDatabaseEscaped(PhysicalBoundaryEscaped):
     """It would have opened a SQLite database inside the repository - the user's own memory or usage
     ledger - instead of the test's own temporary copy."""
@@ -70,6 +78,12 @@ DESKTOP_EXEMPT = {
     "real_elevated": "RUN_ELEVATED_TEST",
     "real_clipboard": "RUN_REAL_CLIPBOARD_TEST",
     "real_voice_console": "RUN_REAL_VOICE_CONSOLE_TEST",
+}
+
+# A browser is its own consequence class: profile, cookies and network, none of which desktop input
+# touches. So it gets its own marker and its own gate, and real_desktop does NOT imply it.
+BROWSER_EXEMPT = {
+    "real_browser": "RUN_REAL_BROWSER_TEST",
 }
 
 AUDIO_EXEMPT = {
@@ -130,6 +144,7 @@ DESKTOP_BOUNDARIES = (
     "window_token",          # GetPropW on another process's window
     "untag_window",          # RemovePropW on another process's window
     "click",
+    "activate_window",       # SetForegroundWindow on another process's window
     "send_character",
     "send_shortcut",
     "release_keys",
@@ -441,6 +456,50 @@ VERIFIER_CONTENT_READS = (
 )
 
 UIA_LIBRARIES = ("pywinauto",)
+
+# --- Browser ------------------------------------------------------------------------------------------
+# Playwright is DUAL-USE: the same object that reads a page can click it. So the library is blocked at
+# import for an ordinary test, and each adapter boundary that could reach a real browser is refused
+# individually - the same shape as the desktop and UIA guards, with its own sentinel and its own gate.
+
+BROWSER_LIBRARIES = ("playwright",)
+
+BROWSER_BOUNDARIES = (
+    "browser_open_session",   # launches a real Chrome process
+    "browser_close_session",
+    "dom_query",              # reads a real page's accessibility tree
+    "dom_click",              # CLICKS a real page - the one DOM action there is
+)
+
+# browser_sessions() and browser_session_exists() are deliberately NOT in that list: they read this
+# process's own registry and touch no browser, no page and no network. Refusing them would force
+# every test about the CHOICE of context to fake a function that cannot escape anywhere.
+
+
+def install_browser_guard(executor_adapter, monkeypatch) -> None:
+    """Refuse every boundary that could reach a real browser, and block the library at import.
+
+    Not a parallel framework: the same marker-and-gate rule, the same sentinel family, and the same
+    refuser shape as the desktop guard. A test that is ABOUT one of these replaces it with a fake in
+    its own body, which runs after this fixture."""
+    for name in BROWSER_BOUNDARIES:
+        monkeypatch.setattr(executor_adapter, name, _browser_refuser(name), raising=False)
+    monkeypatch.setattr(sys, "meta_path",
+                        [RefuseLibraries({library: (PhysicalBrowserEscaped, "real browser access",
+                                                    BROWSER_EXEMPT)
+                                          for library in BROWSER_LIBRARIES}),
+                         *sys.meta_path])
+
+
+def _browser_refuser(name: str):
+    def refuse(*args, **kwargs):
+        raise PhysicalBrowserEscaped(
+            f"offline test attempted REAL BROWSER access: it reached "
+            f"app.executor.adapter.{name}(), which can start a browser process, read a real page or "
+            f"reach the network. Install a fake in the test, or mark the test real_browser AND set "
+            f"RUN_REAL_BROWSER_TEST=1. No argument is shown: one of them can be a page's own text or "
+            f"the user's command.")
+    return refuse
 
 
 def install_verifier_input_guard(verifier_adapter, monkeypatch) -> None:

@@ -214,6 +214,66 @@ class UiaElement:
     patterns: tuple[str, ...] = ()
 
 
+# --- Phase 5 DOM Slice 1: the browser DOM layer's evidence --------------------------------------------
+# Layer 2 of the frozen hierarchy (Build Plan Section 6.5). The same rules as the UIA layer, for the
+# same reasons, with one addition that comes from the page being the OPEN INTERNET.
+#
+# WHO READS, WHO DECIDES. UI Automation can only read, so app/verifier/adapter.py reads it. Playwright
+# can read AND click, so the library lives in app/executor/adapter.py - the one file allowed to control
+# this computer - and only the DECISION lives here, as a pure function over evidence it is handed. The
+# rule that generalises: whoever owns the library reads, observation decides, the Executor acts.
+#
+# PAGE CONTENT IS UNTRUSTED (Sensitivity.UNTRUSTED, declared above). A page can say "ignore previous
+# instructions" or "click Delete"; none of it can become intent, because intent and evidence are
+# different types and only the user's own DomTarget.name can become an action. That type boundary is
+# the whole defence - there is no detector, and there does not need to be one.
+#
+# These types deliberately have NO field for an accessible name, page text, HTML, a URL, an href, a
+# form value or a selector. Nothing can leak through a field that does not exist.
+
+
+@dataclass(frozen=True)
+class DomTarget:
+    """What the USER asked to find, and in which assistant-owned page.
+
+    `name` is the user's own words, exactly as with a UIA Target. The session and page are opaque ids
+    minted by the Executor's adapter; they are not a URL, and they are not a window title."""
+    name: str
+    session_id: str
+    page_id: str
+
+
+@dataclass(frozen=True)
+class DomElement:
+    """One matched page control, as structure.
+
+    `element_token` is opaque OUTSIDE the adapter that made it: it stands for a re-resolvable locator
+    description, and never a CSS selector, an XPath, an accessible name or a live Playwright object. In
+    this read-only slice nothing acts on it; it exists so the later action slice has an identity to
+    re-resolve, rather than a handle that silently detaches."""
+    session_id: str
+    page_id: str
+    role: str                                # one of adapter.DOM_ROLES
+    tag: str = ""                            # the element's tag name, e.g. "button"
+    element_token: str = ""
+    enabled: bool = True
+    visible: bool = True
+    bounds: tuple[int, int, int, int] | None = None
+    is_password: bool = False                # SECRET: structural only; the value is never requested
+    observed_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class FramesNotSupported:
+    """The target was not found in the top-level document, and the page has child frames that this
+    slice does not look inside.
+
+    Deliberately NOT NotFound. "I did not find it" and "I did not look everywhere it could be" are
+    different claims, and reporting the second as the first would be a false negative that a later
+    layer might act on."""
+    reason: str
+
+
 # --- Phase 5 Slice 2: re-identified, action-ready evidence --------------------------------------------
 # An Observed is evidence about a MOMENT. By the time the user has read a confirmation and answered it,
 # that moment has passed: the window may have moved, the list may have scrolled, the button may have been

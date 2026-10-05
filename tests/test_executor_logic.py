@@ -404,21 +404,52 @@ def test_only_each_modules_logic_uses_its_adapter(package, allowed):
     assert offenders == [], f"Only {', '.join(allowed)} may use {package}.adapter: {offenders}"
 
 
-def test_only_executor_adapter_controls_the_computer():
+# Which file may reach which library, named one by one. An earlier version of this rule listed the
+# controlling libraries and then skipped BOTH adapters, which meant app/verifier/adapter.py could have
+# imported pyautogui or Playwright and nothing would have failed. The hole was found when the Phase 5
+# DOM layer needed "the Verifier imports no Playwright" to be a rule rather than a hope.
+LIBRARY_HOMES = {
+    # subprocess launches apps, pyautogui sends input: the Executor's adapter, and nowhere else.
+    "subprocess": "app/executor/adapter.py",
+    "pyautogui": "app/executor/adapter.py",
+    # Playwright is DUAL-USE - the same object reads a page and clicks it - so it belongs with the
+    # things that act, NOT with pywinauto. The Verifier must not be able to reach it at all.
+    "playwright": "app/executor/adapter.py",
+    # pywinauto is UI Automation: it can only READ, and reading the desktop is the Verifier's job.
+    "pywinauto": "app/verifier/adapter.py",
+}
+
+
+def test_each_controlling_library_has_exactly_one_home():
+    """Only app/executor/adapter.py may control this computer, and only app/verifier/adapter.py may
+    read it through UI Automation. Checked per library, so one file's allowance is not another's."""
     root = settings.PROJECT_ROOT
-    allowed = root / "app" / "executor" / "adapter.py"
-    # pywinauto is UI Automation - it READS the screen, and reading the desktop is the Verifier
-    # adapter's job (Phase 5 layer 1). It is allowed there and nowhere else; it can still only be
-    # reached through app/verifier/observation.py, and an offline test cannot even import it.
-    reader = root / "app" / "verifier" / "adapter.py"
-    controllers = ("subprocess", "pyautogui", "playwright")
-    offenders = [
-        f"{path.relative_to(root)}: {module}"
-        for path in (root / "app").rglob("*.py") if path not in (allowed, reader)
-        for module, _ in _imports(path)
-        if module.split(".")[0] in (*controllers, "pywinauto")
-    ]
-    assert offenders == [], f"Only app/executor/adapter.py may control the computer: {offenders}"
+    offenders = []
+    for path in (root / "app").rglob("*.py"):
+        here = path.relative_to(root).as_posix()
+        for module, _name in _imports(path):
+            library = module.split(".")[0]
+            home = LIBRARY_HOMES.get(library)
+            if home is not None and here != home:
+                offenders.append(f"{here}: {library} (only {home} may import it)")
+    assert offenders == [], offenders
+
+
+def test_the_verifier_cannot_reach_any_acting_library():
+    """The rule that matters for the DOM layer, stated directly rather than inferred from the map."""
+    root = settings.PROJECT_ROOT
+    for path in (root / "app" / "verifier").rglob("*.py"):
+        imported = {module.split(".")[0] for module, _ in _imports(path)}
+        for acting in ("playwright", "pyautogui", "subprocess"):
+            assert acting not in imported, f"{path.name} imports {acting}"
+
+
+def test_neither_the_brain_nor_the_planner_reaches_a_browser():
+    root = settings.PROJECT_ROOT
+    for module_name in ("brain", "planner"):
+        for path in (root / "app" / module_name).rglob("*.py"):
+            imported = {module.split(".")[0] for module, _ in _imports(path)}
+            assert "playwright" not in imported, f"{module_name}/{path.name} imports playwright"
 
 
 def test_only_adapters_use_the_windows_api_through_ctypes():

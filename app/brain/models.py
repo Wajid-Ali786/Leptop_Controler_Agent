@@ -14,8 +14,8 @@ Two rules shape everything below:
 """
 from dataclasses import dataclass
 
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
-                                 WINDOW_CONTROL)
+from app.executor.models import (CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, OPEN_APP,
+                                 OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL)
 from app.safety.models import RiskLevel
 
 # The scroll directions and window operations the Executor implements, named here so an Intent cannot
@@ -56,6 +56,21 @@ class ClickArgs:
 
 
 @dataclass(frozen=True)
+class ClickTargetArgs:
+    """Click a control the user named. WHAT, and in which app - never where.
+
+    There is deliberately no x or y here, and none on the wire for this kind either: the schema's
+    coordinate fields belong to `click` and must be neutral for this one, so a reply that tries to
+    position a named click is rejected rather than trimmed. The position is found locally, from the
+    accessibility tree, at the moment of acting.
+
+    `app` may be empty: that means the user did not say which app, and the Executor then uses the one
+    app this session opened - if there is exactly one. It never falls back to whatever is in front."""
+    control: str
+    app: str = ""
+
+
+@dataclass(frozen=True)
 class TypeTextArgs:
     """`text` is kept verbatim: it is what the user wants typed, so it is never trimmed, re-spaced or
     normalised. It is also the one field that must never reach a log or a context summary."""
@@ -77,6 +92,20 @@ class ScrollArgs:
 
 
 @dataclass(frozen=True)
+class OpenBrowserArgs:
+    """Open the assistant's OWN browser. Takes nothing: there is one, or there is none.
+
+    Deliberately not OpenAppArgs. The assistant browser is not an entry in executor.apps and is not
+    started by launching an executable, and `open chrome` must keep meaning the owner's own Chrome -
+    so giving these the same shape would make the two indistinguishable on the wire."""
+
+
+@dataclass(frozen=True)
+class CloseBrowserArgs:
+    """Close the assistant's own browser. Takes nothing."""
+
+
+@dataclass(frozen=True)
 class RefreshArgs:
     """Refresh acts on the active window and takes nothing."""
 
@@ -86,8 +115,8 @@ class WindowControlArgs:
     operation: str   # one of WINDOW_OPERATIONS
 
 
-ActionArgs = (OpenAppArgs | CloseAppArgs | ClickArgs | TypeTextArgs | ShortcutArgs | ScrollArgs
-              | RefreshArgs | WindowControlArgs)
+ActionArgs = (OpenAppArgs | CloseAppArgs | ClickArgs | ClickTargetArgs | TypeTextArgs | ShortcutArgs
+              | ScrollArgs | RefreshArgs | WindowControlArgs | OpenBrowserArgs | CloseBrowserArgs)
 
 # Which args shape belongs to which Executor kind. The Planner uses this to reject an Intent whose
 # args do not match its kind, so a mismatch cannot reach the Executor.
@@ -95,11 +124,14 @@ ARGS_FOR_KIND = {
     OPEN_APP: OpenAppArgs,
     CLOSE_APP: CloseAppArgs,
     CLICK: ClickArgs,
+    CLICK_TARGET: ClickTargetArgs,
     TYPE_TEXT: TypeTextArgs,
     SHORTCUT: ShortcutArgs,
     SCROLL: ScrollArgs,
     REFRESH: RefreshArgs,
     WINDOW_CONTROL: WindowControlArgs,
+    OPEN_BROWSER: OpenBrowserArgs,
+    CLOSE_BROWSER: CloseBrowserArgs,
 }
 
 
@@ -229,6 +261,7 @@ MAX_BECAUSE = 200
 MAX_WHAT = 80
 MAX_MESSAGE = 200
 MAX_APP = 40
+MAX_CONTROL = 60          # a button or field label the user typed, not a sentence
 MAX_KEYS = 40
 MAX_INTENTS = 5           # mirrors app/planner/models.MAX_PLAN_STEPS; a test holds them together
 
@@ -248,11 +281,16 @@ ARGS_FIELDS = {
     OPEN_APP: ("app",),
     CLOSE_APP: ("app",),
     CLICK: ("x", "y"),
+    CLICK_TARGET: ("control", "app"),
     TYPE_TEXT: ("text",),
     SHORTCUT: ("keys",),
     SCROLL: ("direction", "notches"),
     REFRESH: (),
     WINDOW_CONTROL: ("operation",),
+    # Args-free, exactly like refresh - so these two kinds add NO wire field, and the flat schema's
+    # property count does not move. Only the `kind` enum grows.
+    OPEN_BROWSER: (),
+    CLOSE_BROWSER: (),
 }
 
 # --- One canonical wire form per kind -----------------------------------------------------------------
@@ -273,6 +311,7 @@ ARGS_FIELDS = {
 
 NEUTRAL_ARGS_VALUES = {
     "app": "",
+    "control": "",
     "x": 0,
     "y": 0,
     "text": "",
@@ -350,7 +389,12 @@ def interpretation_schema(max_type_characters: int) -> dict:
             "why": bounded("one short line, shown to the user beside this step", MAX_WHY),
             "risk_floor": {"type": "string", "enum": list(RISK_FLOOR_NAMES),
                            "description": "advisory; the safety gate may raise it, never lower it"},
-            "app": bounded("app name for open_app and close_app, otherwise empty", MAX_APP),
+            "app": bounded("app name for open_app, close_app, and optionally click_target; "
+                           "otherwise empty", MAX_APP),
+            "control": bounded("for click_target, the user's own words for the button or field to "
+                               "click, copied exactly; otherwise empty", MAX_CONTROL),
+            # These two belong to `click` alone. For click_target they must be 0: a named click's
+            # position is found on this computer, and a reply that fills them in is rejected.
             "x": {"type": "integer", "description": "click x, a whole number; otherwise 0"},
             "y": {"type": "integer", "description": "click y, a whole number; otherwise 0"},
             "text": bounded("exactly what to type for type_text, otherwise empty",

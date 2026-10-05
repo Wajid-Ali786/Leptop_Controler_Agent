@@ -30,13 +30,15 @@ from app.brain.models import (ARGS_FIELDS, ARGS_FOR_KIND, INTERPRETATION_FIELDS,
                               NEUTRAL_ARGS_VALUES, NEUTRAL_INTERPRETATION_VALUES, is_neutral,
                               INTERPRETATION_KINDS, MAX_APP, MAX_BECAUSE, MAX_INTENTS, MAX_KEYS,
                               MAX_MESSAGE, MAX_MISSING, MAX_QUESTION, MAX_RESTATED, MAX_WHAT,
-                              MAX_WHY, NEEDS_CLARIFICATION, NOT_A_COMMAND, NOT_SUPPORTED,
+                              MAX_CONTROL, MAX_WHY, NEEDS_CLARIFICATION, NOT_A_COMMAND, NOT_SUPPORTED,
                               RISK_FLOOR_NAMES, SCROLL_DIRECTIONS, UNDERSTOOD, WINDOW_OPERATIONS,
-                              ClickArgs, Intent, Interpretation, NeedsClarification, NotACommand,
-                              NotSupported, RefreshArgs, ScrollArgs, ShortcutArgs, TypeTextArgs,
+                              ClickArgs, ClickTargetArgs, CloseBrowserArgs, Intent, Interpretation,
+                              NeedsClarification, NotACommand, NotSupported, OpenBrowserArgs,
+                              RefreshArgs, ScrollArgs, ShortcutArgs, TypeTextArgs,
                               Understood, WindowControlArgs)
 from app.executor import commands
-from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
+from app.executor.models import (ASSISTANT_BROWSER, CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER,
+                                 OPEN_APP, OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
                                  WINDOW_CONTROL, ExecutorAction, Unresolved)
 
 
@@ -136,12 +138,18 @@ separate program decides whether an action is allowed and then performs it.
 
 What the computer can actually do, and nothing else:
 - open_app, close_app: start or close one of the apps the user has configured
-- click: click a screen position
+- click: click an exact screen position, in numbers
+- click_target: click a button or field the user NAMED, rather than coordinates. Put their own \
+words in `control`, copied exactly, and leave x and y at 0 - this computer finds where the \
+control is, and you never say where anything is on screen. Set `app` to the app they named, to \
+exactly "assistant browser" for the assistant's own browser, or leave it empty
 - type_text: type text into the window in front
 - shortcut: press a key combination such as ctrl+c
 - scroll: scroll up or down a number of notches
 - refresh: refresh the window in front
 - window_control: minimize, maximize, restore or close the window in front
+- open_browser, close_browser: the assistant's OWN browser, not the user's Chrome ("open \
+chrome" is open_app)
 
 How to answer:
 - understood: the request maps onto those capabilities. Give 1 to 5 intents, in the order they should \
@@ -417,6 +425,18 @@ def _args(kind: str, item: dict, where: str, max_type_characters: int):
         if isinstance(values["notches"], bool) or not isinstance(values["notches"], int):
             return InterpretationError(BAD_ARGS, f"{where}.notches")
         return ScrollArgs(direction=values["direction"], notches=values["notches"])
+    if kind == CLICK_TARGET:
+        control = _text(values["control"], MAX_CONTROL, f"{where}.control")
+        if isinstance(control, InterpretationError):
+            return control
+        app = _text(values["app"], MAX_APP, f"{where}.app")
+        if isinstance(app, InterpretationError):
+            return app
+        return ClickTargetArgs(control=control, app=app)
+    if kind == OPEN_BROWSER:
+        return OpenBrowserArgs()
+    if kind == CLOSE_BROWSER:
+        return CloseBrowserArgs()
     if kind == REFRESH:
         return RefreshArgs()
     if values["operation"] not in WINDOW_OPERATIONS:
