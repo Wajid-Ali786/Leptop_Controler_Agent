@@ -146,19 +146,54 @@ class FakeLocator:
         return "button"
 
 
+
+    # --- delayed render (added with the readiness fix) -----------------------------------------------
+    def or_(self, other):
+        """Playwright's Locator.or_: match either. The production matcher combines all the allowed
+        roles with this so it can wait ONCE across all of them."""
+        combined = FakeLocator(self._controls + other._controls, self._page)
+        return combined
+
+    @property
+    def first(self):
+        return FakeLocator(self._controls[:1], self._page)
+
+    def wait_for(self, state=None, timeout=None):
+        """The one bounded readiness wait. Records that it happened, and how long it was allowed."""
+        assert timeout is not None, "the readiness wait must be bounded"
+        assert state == "attached", f"unexpected wait state {state!r}"
+        self._page.wait_calls.append(timeout)
+        self._page.waits += 1
+        if not self._page.is_ready():
+            raise RuntimeError("Timeout waiting for locator")
+
+
 class FakePage:
     def __init__(self, controls):
         self.controls = controls
         self.frames = [object()]
         self.clicks = []
+        self.waits = 0
+        self.ready_after_waits = 0
+        self.wait_calls = []
 
     @property
     def url(self):
         return "about:blank"
 
+
+    # --- delayed render (added with the readiness fix) -----------------------------------------------
+    def is_ready(self) -> bool:
+        """Whether the controls have "rendered" yet. ready_after_waits=0 means immediately."""
+        return self.waits >= self.ready_after_waits
+
+    @property
+    def visible_controls(self):
+        return self.controls if self.is_ready() else []
+
     def get_by_role(self, role, name=None, exact=None):
-        return FakeLocator([c for c in self.controls if c["role"] == role
-                            and name.fullmatch(" ".join(c["name"].split()))], self)
+        return FakeLocator([c for c in self.visible_controls if c["role"] == role
+                            and name.search(" ".join(c["name"].split()))], self)
 
 
 def web(name, role="button"):

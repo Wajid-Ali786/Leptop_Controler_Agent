@@ -59,7 +59,43 @@ git log, git show) are fine. Stage files (git add) only when the owner explicitl
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
-Current phase: 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE.
+Current work: USABILITY PLAN (started 2026-10-06). Phase 5 and Phase 6 work is STOPPED by the owner
+  after the first real day of use. The whole-project weakness audit of 2026-10-06 produced a ranked
+  five-slice plan; build from that, not from the Phase 5 slice list below.
+  Slice 1 — console prompt states: DONE (2026-10-06). One rule set for every nested prompt, in
+    app/console.classify_answer(): a command typed at ANY prompt is queued unchanged and run once by
+    the loop instead of being consumed; exit/help work at every prompt and end whatever was pending;
+    cancel/no/stop abandon explicitly and say what they abandoned; a mistyped "yes" at the PLAN prompt
+    only is re-asked once. The Medium-and-above confirmation keeps its exception - only the exact word
+    "yes" approves, there is no re-ask there, and a command typed there denies the action first and is
+    then queued as a new root command with its own gate. A clarification answer that cannot be the
+    missing value ("yes" to "which browser?") is re-asked once locally without cashing the single
+    Brain round, and an application choice question now names the configured apps. MAX_CLARIFICATIONS
+    is still 1 and the allowance is still 3 per root command. A front end with no console loop
+    (app/voice_console.py) is bit-identical: one `if not handoff` in classify_answer.
+  Slice 2 — `open <app>` means available-and-in-front: DONE (2026-10-06). The launch decision is
+    frozen: if exactly ONE usable window already exists, do not launch again - activate it. Three
+    cases: nothing usable open -> launch, wait, own it exactly as before; one already open -> no launch
+    and NO window wait, bring it forward, and it stays UNOWNED; launched but no new window proved ->
+    look at what is actually there before reporting a failure, which is what fixes "chrome was
+    started, but no new window appeared within 15 seconds" while Chrome was open all along. More than
+    one pre-existing window REFUSES with the count, activates none and launches nothing; selection
+    among several is deferred. There is now exactly ONE activation path, `_activate_to_front`, shared
+    with the named click; a minimized window is still reported and never restored. "Available but not
+    in front" is Outcome.NEEDS_USER - no new status, and the model forbids retrying into it.
+    THE OWNERSHIP BOUNDARY DID NOT MOVE. A window that existed before the command never receives the
+    ownership token. `_found_windows` records only that open_app selected it (app + handle, no token
+    field, separate type); no ownership check reads it, close_app cannot reach it, and a named click
+    still refuses an app that only appears there. A handle plus a title re-check is NOT an identity -
+    Windows reuses handle numbers - so it is deliberately the weakest honest representation.
+    CONSEQUENCE OF THE FROZEN RULE, recorded deliberately: the assistant can no longer acquire an
+    OWNED window for an app the user already has open. For Chrome specifically that means `close
+    chrome` will keep refusing and named clicks in the owner's Chrome stay blocked until Slice 3
+    decides what an explicitly selected but unowned window may be used for.
+  Slices 3-5 (per-capability authorization, named targets for type/refresh/scroll/shortcut, assistant
+    browser navigation): NOT STARTED.
+
+Phase 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE; PAUSED (see Current work above).
   The privacy and test-isolation boundaries required before expanding observation capability
   (/docs/phase4-closeout.md Limitation G) were defined in Slice 1 and are in force: structural reads
   are redirected offline, content reads are refused, and pywinauto is blocked at import.
@@ -97,6 +133,20 @@ Current phase: 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE.
     (the user navigates it themselves — there is no navigation command). A named click chooses its
     context: one candidate is used, and an owned app window beside a live browser page REFUSES and
     names both rather than preferring either. NOT yet validated end to end from the real console.
+  DOM readiness fix: DONE (2026-10-05), after the owner's console smoke hit a transient false
+    NotFound (one attempt missed 'Login'; the identical target succeeded seconds later). Cause was
+    NOT case - production normalises, so both attempts passed the same string - but that
+    locator.count() is an instantaneous snapshot and nothing waited. DOM discovery now runs under ONE
+    shared bounded deadline from browser.query_timeout_seconds: scan, and if nothing matched, one
+    Playwright wait across all allowed roles combined with or_(), then one more scan. Worst case stays
+    about the configured timeout, not nine times it; the same matcher serves initial resolution and
+    post-confirmation re-resolution. Matching semantics are unchanged.
+  KNOWN LIMITATION, recorded and deliberately not fixed: generic foreground-window actions (refresh,
+    scroll, shortcut, window_control) do not distinguish the owner's personal Chrome from the
+    assistant's Chrome - both are chrome.exe + Chrome_WidgetWin_1, and refresh identity deliberately
+    excludes the title. The user's foreground selection plus the existing Safety confirmation remains
+    authoritative. window_control close still refuses the assistant browser, because it has no
+    ownership token.
   Layers 1 and 2 of the frozen five-layer hierarchy exist. For an explicitly selected
   assistant-browser page, page-content targets route straight to DOM; HWND mapping is not required
   for that scoped workflow, and browser chrome plus native window controls remain UIA territory. OCR,

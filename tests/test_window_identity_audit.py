@@ -16,7 +16,8 @@ import pytest
 
 from app.executor import logic as executor_logic
 from app.executor.models import CLOSE_APP, OPEN_APP, ExecutorAction
-from tests.test_executor_close_app import USERS_NOTEPAD, FakeDesktop, close_app, open_app, world  # noqa: F401
+from tests.test_executor_close_app import (USERS_NOTEPAD, FakeDesktop, close_app,  # noqa: F401
+                                            open_app, users_notepad, world)
 
 REFUSAL = "I only close windows I opened in this session"
 
@@ -92,6 +93,7 @@ def test_a_handle_that_stops_matching_the_pattern_is_lost(world):
     """FOUND: find_open() requires the title pattern too, so a window renamed out of the pattern is
     treated as gone even though the handle still exists."""
     open_app("notepad")
+    users_notepad(world)          # a stranger, so losing ours degrades to a refusal not "already closed"
     [handle] = [h for group in owned() for h in group]
     world.desktop.update(handle, title="something else entirely")
     result = close_app("notepad")
@@ -171,8 +173,8 @@ def test_a_window_hidden_and_reshown_under_a_new_handle_is_lost(world):
 
 def test_a_stranger_and_a_stable_owned_window(world):
     """6: only the owned handle is asked to close."""
-    stranger = world.desktop.add("Untitled - Notepad", "Notepad")
     open_app("notepad")
+    stranger = world.desktop.add("Untitled - Notepad", "Notepad")   # after the open, since Slice 2
     ours = [h for group in owned() for h in group]
     assert close_app("notepad").ok
     closed = [handle for kind, handle in world.calls if kind == "close"]
@@ -184,8 +186,8 @@ def test_a_stranger_and_an_owned_window_whose_handle_changed(world):
 
     FOUND: no. The refusal is returned and nothing is closed. Losing ownership degrades to refusing,
     never to closing something else - which is the behaviour that must survive any future fix."""
-    stranger = world.desktop.add("Untitled - Notepad", "Notepad")
     open_app("notepad")
+    stranger = world.desktop.add("Untitled - Notepad", "Notepad")   # after the open, since Slice 2
     [ours] = [h for group in owned() for h in group]
     newcomer = replace(world, ours)
     result = close_app("notepad")

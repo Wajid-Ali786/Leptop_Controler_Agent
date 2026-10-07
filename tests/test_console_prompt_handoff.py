@@ -251,11 +251,15 @@ def test_a_brain_eligible_command_is_also_handed_back():
 
 def test_handing_a_command_back_spends_nothing_on_the_abandoned_prompt():
     """12. _ask_text returning None is what the callers already treat as "no answer", which cancels -
-    so no interpretation, no replan request, nothing billed."""
+    so no interpretation, no replan request, nothing billed.
+
+    Slice 1 moved the queuing itself one level down, into _read_answer, which is now the single place
+    any nested prompt reads a line; _ask_text still turns a non-answer into None. The behavioural half
+    of this claim is tested above and below - this is only the structural note."""
     import inspect
-    source = inspect.getsource(console._ask_text)
-    assert "prompts.pending.put(answer)" in source
-    assert "return None" in source
+    source = inspect.getsource(console._read_answer)
+    assert "prompts.pending.put(line)" in source
+    assert "return line if meaning is Answer.ANSWER else None" in inspect.getsource(console._ask_text)
     correction_site = inspect.getsource(console._offer_correction)
     assert "if not correction or not correction.strip():" in correction_site
     assert "session.cancel(context)" in correction_site, "a cancelled correction must not replan"
@@ -280,26 +284,67 @@ def test_a_command_at_a_safety_confirmation_does_not_confirm_anything():
         assert allowed is False, f"{typed!r} confirmed a MEDIUM action"
 
 
-def test_the_safety_confirmation_has_no_command_handoff_at_all():
-    """14. Structural, not incidental: _confirm never sees the slot and cannot requeue anything, so the
-    yes-only boundary has exactly one meaning."""
+def test_the_safety_confirmation_denies_before_it_queues_anything():
+    """14, REWRITTEN IN SLICE 1 ON THE OWNER'S INSTRUCTION, and the rewrite is the risk here, so it is
+    worth being exact about what changed and what did not.
+
+    This test used to assert that _confirm could not see the slot AT ALL - no `pending` parameter, no
+    mention of the detector. Slice 1's brief reverses that deliberately: a command typed at a Medium
+    confirmation must cancel the pending action AND be queued unchanged, instead of being silently
+    thrown away as "not yes".
+
+    So the structural claim is gone, and the claim that actually protects the gate is made
+    behaviourally instead, which is stronger: the denial is decided FIRST and does not depend on the
+    handoff, so no line and no amount of queuing can return True. tests/test_console_prompts.py pins
+    the same property through the real safety gate with a real action."""
     import inspect
     source = inspect.getsource(console._confirm)
-    assert "pending" not in source and "is_fresh_command" not in source
-    signature = inspect.signature(console._confirm)
-    assert list(signature.parameters) == ["read", "write"], signature
+    # Still true, and still the whole rule: one comparison against the exact word, and one read.
+    assert "if meaning is Answer.YES:\n            return True" in source
+    assert source.count("_read_answer(") == 1, "a second read is a second chance"
+    assert "NEAR_MISS" not in source, "Rule 4's re-ask must not reach the safety confirmation"
+    assert "_plan_answer" not in source, "the plan prompt's re-asking routine is not reused here"
+    # The one `return True` in the whole function, so there is no other way out.
+    tree = ast.parse(inspect.getsource(console._confirm).strip())
+    returns_true = [node for node in ast.walk(tree) if isinstance(node, ast.Return)
+                    and isinstance(node.value, ast.Constant) and node.value.value is True]
+    assert len(returns_true) == 1, "more than one way for the confirmation to say yes"
 
 
-def test_only_the_two_information_prompts_consult_the_slot():
-    """The handoff is narrow by construction: exactly two functions mention it."""
+def _strip_prose(tree):
+    """Drop every docstring, so a rule about what the code DOES is never satisfied or broken by prose
+    that merely describes it. A body left empty gets a `pass`, or the result will not unparse.
+
+    This test originally searched the raw source and "found" is_fresh_command inside _is_short_slip's
+    DOCSTRING, which only explains that the detector runs first. Tenth time in this project that a
+    substring has matched an explanation rather than code."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)) \
+                and node.body and isinstance(node.body[0], ast.Expr) \
+                and isinstance(node.body[0].value, ast.Constant) \
+                and isinstance(node.body[0].value.value, str):
+            node.body.pop(0)
+            if not node.body and not isinstance(node, ast.Module):
+                node.body.append(ast.Pass())
+    return tree
+
+
+def _callers_of(name, exclude):
+    """Every function in app/console.py whose CODE calls `name`."""
     import inspect
-    source = inspect.getsource(console)
-    users = [node.name for node in ast.walk(ast.parse(source))
-             if isinstance(node, ast.FunctionDef) and "is_fresh_command(" in ast.unparse(node)
-             and node.name != "is_fresh_command"]
-    assert sorted(users) == ["_ask_text", "_offer_retry", "offer_retry"], users
-    assert "offer_retry" in users and "_offer_retry" in users, (
-        "offer_retry is the closure inside _offer_retry, so both names appear")
+    tree = _strip_prose(ast.parse(inspect.getsource(console)))
+    return sorted(node.name for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef) and node.name not in exclude
+                  and any(isinstance(call, ast.Call) and ast.unparse(call.func) == name
+                          for call in ast.walk(node)))
+
+
+def test_exactly_one_function_decides_what_a_prompt_answer_means():
+    """The handoff is narrow by construction. It used to be "two functions mention the detector"; now
+    it is ONE - classify_answer - which is a tighter invariant, not a looser one. No prompt interprets a
+    line for itself, so there is a single place the rule set can be read or broken."""
+    assert _callers_of("is_fresh_command", {"is_fresh_command"}) == ["classify_answer"]
+    assert _callers_of("classify_answer", {"classify_answer"}) == ["_read_answer"]
 
 
 # --- D. Exactly once, through the real loop -----------------------------------------------------------

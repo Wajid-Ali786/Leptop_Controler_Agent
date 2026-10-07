@@ -465,10 +465,29 @@ def test_the_emergency_stop_during_the_wait_stops_everything(world):
 
 
 def test_the_wait_is_interruptible_rather_than_a_raw_sleep():
-    """21. Proved against the code: a raw sleep could not be interrupted by the stop."""
-    code = code_of(executor._bring_owned_window_forward)
-    assert "emergency_stop.wait" in code
-    assert "time.sleep" not in code and "sleep(" not in code
+    """21. Proved against the code: a raw sleep could not be interrupted by the stop.
+
+    Slice 2 extracted the mechanism into _activate_to_front so that open_app and the named click share
+    ONE activation path, so that is where the wait now lives. The property is unchanged, and it is
+    checked across BOTH halves so neither can gain a raw sleep."""
+    mechanism = code_of(executor._activate_to_front)
+    assert "emergency_stop.wait" in mechanism
+    for code in (mechanism, code_of(executor._bring_owned_window_forward)):
+        assert "time.sleep" not in code and "sleep(" not in code
+
+
+def test_there_is_exactly_one_activation_path():
+    """Slice 2's requirement: open_app reuses the auto-focus activation rather than writing a second
+    one. Only the shared mechanism may call activate_window, and only it may read the foreground back."""
+    # Parsed from the module's code with docstrings stripped: a prose mention of activate_window
+    # (there are several) must not satisfy or break a rule about who CALLS it.
+    tree = ast.parse(code_of_module(settings.PROJECT_ROOT / "app" / "executor" / "logic.py"))
+    callers = sorted(node.name for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)
+                     and any(isinstance(call, ast.Call)
+                             and ast.unparse(call.func) == "adapter.activate_window"
+                             for call in ast.walk(node)))
+    assert callers == ["_activate_to_front"], callers
 
 
 def test_the_stop_is_checked_before_activation(world):

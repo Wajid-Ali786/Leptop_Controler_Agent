@@ -22,7 +22,8 @@ from app.listener.models import Transcript
 from app.planner.models import VOICE_CONSOLE, TurnContext
 # The fake desktop lives with the close tests; reusing it is the point - a second fake would be a second
 # opinion about how windows behave.
-from tests.test_executor_close_app import USERS_NOTEPAD, FakeDesktop, close_app, open_app, world  # noqa: F401
+from tests.test_executor_close_app import (USERS_NOTEPAD, FakeDesktop, close_app,  # noqa: F401
+                                            open_app, users_notepad, world)
 
 
 class Screen:
@@ -228,7 +229,9 @@ def test_that_message_is_exactly_what_the_real_session_reported(world):
 # --- 4. Ownership safety must not be weakened ---------------------------------------------------------
 
 def test_a_pre_existing_notepad_is_never_owned(world):
-    """USERS_NOTEPAD is open before the test starts and must stay untouchable."""
+    """A Notepad the user already had open must stay untouchable. Since Slice 2 it is put there
+    explicitly, because its presence is what makes "open notepad" reuse rather than launch."""
+    users_notepad(world)
     assert owned() == []
     result = close_app("notepad")
     assert not result.ok, "the user's own window is not ours to close"
@@ -236,8 +239,8 @@ def test_a_pre_existing_notepad_is_never_owned(world):
 
 
 def test_with_one_owned_and_one_pre_existing_only_the_owned_one_is_closed(world):
-    stranger = world.desktop.add("Untitled - Notepad", "Notepad")
     open_app("notepad")
+    stranger = world.desktop.add("Untitled - Notepad", "Notepad")   # after the open; see users_notepad
     ours = [handle for group in owned() for handle in group]
     result = close_app("notepad")
     assert result.ok, result.message
@@ -271,6 +274,7 @@ def test_previous_action_context_cannot_be_used_as_ownership_proof(world, brain)
     brain(understood(Intent(CLOSE_APP, CloseAppArgs("notepad"))))
     context = session.remember_action(TurnContext(), OPEN_APP, "notepad")
     assert context.previous_action_context.safe_target == "notepad"
+    users_notepad(world)
     assert owned() == [], "nothing is actually owned"
     reply, _context = console.handle_typed_line(
         "could you close it please", context,

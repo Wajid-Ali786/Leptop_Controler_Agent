@@ -128,6 +128,28 @@ class FakeLocator:
         return self._one.get("tag", "button")
 
 
+
+    # --- delayed render (added with the readiness fix) -----------------------------------------------
+    def or_(self, other):
+        """Playwright's Locator.or_: match either. The production matcher combines all the allowed
+        roles with this so it can wait ONCE across all of them."""
+        combined = FakeLocator(self._controls + other._controls, self._page)
+        return combined
+
+    @property
+    def first(self):
+        return FakeLocator(self._controls[:1], self._page)
+
+    def wait_for(self, state=None, timeout=None):
+        """The one bounded readiness wait. Records that it happened, and how long it was allowed."""
+        assert timeout is not None, "the readiness wait must be bounded"
+        assert state == "attached", f"unexpected wait state {state!r}"
+        self._page.wait_calls.append(timeout)
+        self._page.waits += 1
+        if not self._page.is_ready():
+            raise RuntimeError("Timeout waiting for locator")
+
+
 class FakePage:
     """A page of fake controls. `get_by_role` applies the SAME rule the real one documents: a regex
     `name` matches the accessible name, and whitespace in that name is already normalised."""
@@ -138,12 +160,25 @@ class FakePage:
         self.timeouts = []
         self.forbidden = []
         self.url_reads = 0
+        self.waits = 0
+        self.ready_after_waits = 0
+        self.wait_calls = []
+
+
+    # --- delayed render (added with the readiness fix) -----------------------------------------------
+    def is_ready(self) -> bool:
+        """Whether the controls have "rendered" yet. ready_after_waits=0 means immediately."""
+        return self.waits >= self.ready_after_waits
+
+    @property
+    def visible_controls(self):
+        return self.controls if self.is_ready() else []
 
     def get_by_role(self, role, name=None, exact=None):
         assert exact is None, "exact must not be passed: Playwright ignores it for a pattern"
         assert hasattr(name, "search"), "the name must be a compiled pattern, not a string"
-        matched = [c for c in self.controls
-                   if c["role"] == role and name.fullmatch(" ".join(c["name"].split()))]
+        matched = [c for c in self.visible_controls
+                   if c["role"] == role and name.search(" ".join(c["name"].split()))]
         return FakeLocator(matched, self)
 
     # Anything a page could expose that this slice must never touch. Reaching one fails the test.
@@ -724,3 +759,129 @@ def test_no_desktop_audio_or_memory_action_is_on_this_path():
     for forbidden in ("pyautogui", "SetForegroundWindow", "winmm", "speak", "sqlite", "memory"):
         assert forbidden not in code, forbidden
     assert not (settings.PROJECT_ROOT / "data" / "memory.db").exists()
+
+
+# =====================================================================================================
+# READINESS - the confirmed defect: snapshot matching produced a transient false NotFound
+# =====================================================================================================
+# The owner's console run found 'Login' absent, then found the identical target seconds later. The
+# cause was not case: production normalises, so both attempts passed the byte-identical string to the
+# matcher. The cause was that `locator.count()` is an instantaneous snapshot and nothing waited.
+#
+# These tests model what no fake could model before: NOT READY, THEN READY.
+
+CONFIGURED_QUERY_MS = 2000.0          # browser.query_timeout_seconds (2.0) in milliseconds
+
+
+def test_a_target_that_renders_late_is_found_before_the_deadline(session):
+    """1. The defect, reproduced and fixed: empty on the first scan, present after the one wait."""
+    session.ready_after_waits = 1                 # nothing renders until the page has been waited on
+    assert session.visible_controls == [], "the first scan must see an empty page"
+
+    found = _genuine("dom_query")(SESSION, PAGE, "login", 2.0)
+
+    assert len(found) == 1, "a late-rendering control must still be found"
+    assert session.waits == 1, "it waited, once"
+    result = observation.resolve_dom_target(target(), found)
+    assert isinstance(result, Found)
+
+
+def test_a_target_that_never_renders_is_not_found_after_the_bounded_deadline(session):
+    """2. Patience is bounded: it still gives up, and with the existing message."""
+    session.ready_after_waits = 99                # it is never going to appear
+    found = _genuine("dom_query")(SESSION, PAGE, "login", 2.0)
+
+    assert found == []
+    assert session.waits == 1, "it waited once and then stopped - no unbounded retrying"
+    result = observation.resolve_dom_target(target(), found, False)
+    assert isinstance(result, NotFound)
+    assert result.message == "I couldn't find anything called 'Login' on that page."
+
+
+def test_one_shared_deadline_is_used_not_one_per_role(session):
+    """3. Nine roles, ONE wait. Worst case stays about the configured timeout, not nine times it."""
+    session.ready_after_waits = 99
+    _genuine("dom_query")(SESSION, PAGE, "login", 2.0)
+
+    assert len(session.wait_calls) == 1, f"one wait across all roles, got {len(session.wait_calls)}"
+    assert len(executor_adapter.DOM_ROLES) == 9, "the premise: there are nine roles"
+    only = session.wait_calls[0]
+    assert 0 < only <= CONFIGURED_QUERY_MS, only
+    # and the deadline is counted once, before anything is scanned
+    code = code_of_named(EXECUTOR_ADAPTER, "_dom_matches")
+    assert code.count("deadline = ") == 1, code
+    assert "for role in DOM_ROLES" not in code, "the per-role scan belongs to _scan_roles"
+
+
+def test_a_target_that_is_already_there_never_waits(session):
+    """4. The ready case must not become slower."""
+    session.ready_after_waits = 0
+    found = _genuine("dom_query")(SESSION, PAGE, "login", 2.0)
+
+    assert len(found) == 1
+    assert session.waits == 0 and session.wait_calls == [], "nothing should have waited"
+
+
+def test_ambiguity_still_returns_ambiguous_after_a_late_render(session):
+    """5. Readiness does not change what two matches mean."""
+    session.controls = [control("Login"), control("Login", role="link")]
+    session.ready_after_waits = 1
+    found = _genuine("dom_query")(SESSION, PAGE, "login", 2.0)
+
+    assert len(found) == 2
+    result = observation.resolve_dom_target(target(), found)
+    assert isinstance(result, Ambiguous) and len(result.candidates) == 2
+
+
+@pytest.mark.parametrize("asked", ["Login", "login", "LOGIN", "  Login  "])
+def test_case_and_whitespace_handling_is_unchanged_by_the_fix(session, asked):
+    """6 + 7. The semantics the fix must not touch, re-checked through the waiting path."""
+    from app.verifier.models import normalize_name
+    session.ready_after_waits = 1
+    found = _genuine("dom_query")(SESSION, PAGE, normalize_name(asked), 2.0)
+    assert len(found) == 1, asked
+
+
+@pytest.mark.parametrize("asked", ["Log In", "Log", "gin", "Logins", "Log-in"])
+def test_whole_string_matching_is_unchanged_by_the_fix(session, asked):
+    """8. Waiting must not become a second chance for a near miss."""
+    from app.verifier.models import normalize_name
+    session.ready_after_waits = 1
+    found = _genuine("dom_query")(SESSION, PAGE, normalize_name(asked), 2.0)
+    assert found == [], asked
+    assert session.waits == 1, "it waited, and still refused - the wait is not a looser rule"
+
+
+def test_the_matcher_has_no_raw_sleep_and_no_unbounded_wait():
+    """10. Playwright does the waiting, bounded; this adapter polls nothing and sleeps never."""
+    matcher = code_of_named(EXECUTOR_ADAPTER, "_dom_matches")
+    waiter = code_of_named(EXECUTOR_ADAPTER, "_wait_for_any_role")
+    for forbidden in ("sleep", "while ", "for attempt", "range("):
+        assert forbidden not in matcher, f"{forbidden} in _dom_matches"
+        assert forbidden not in waiter, f"{forbidden} in _wait_for_any_role"
+    assert "timeout=max(1.0, remaining_ms)" in waiter, "the wait must be bounded by what is left"
+    assert "wait_for(state='attached'" in waiter.replace('"', "'")
+    assert "or_(" in waiter, "the roles are combined so there is one wait, not nine"
+
+
+def test_the_query_and_the_action_still_share_one_matcher():
+    """2 of the brief: the fix applies to both, because there is still only one implementation."""
+    for name in ("dom_query", "dom_click"):
+        assert "_dom_matches" in code_of_named(EXECUTOR_ADAPTER, name), name
+    root = settings.PROJECT_ROOT / "app"
+    definers = []
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.FunctionDef) and node.name in ("_dom_matches", "_scan_roles"):
+                definers.append(f"{path.relative_to(root).as_posix()}:{node.name}")
+    assert sorted(definers) == ["executor/adapter.py:_dom_matches",
+                                "executor/adapter.py:_scan_roles"], definers
+
+
+def test_the_fakes_can_now_model_not_ready_then_ready(session):
+    """The test-side half of the fix, stated as a test: a fake that is always ready cannot express
+    the state that failed, which is why 4051 tests missed it."""
+    session.ready_after_waits = 1
+    assert session.is_ready() is False and session.visible_controls == []
+    session.waits = 1
+    assert session.is_ready() is True and session.visible_controls == session.controls

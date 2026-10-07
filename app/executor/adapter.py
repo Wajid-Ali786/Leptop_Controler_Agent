@@ -608,22 +608,68 @@ def dom_query(session_id: str, page_id: str, normalized_name: str,
     return found
 
 
-def _dom_matches(page, normalized_name: str, timeout: float) -> list:
+def _dom_matches(page, normalized_name: str, timeout_ms: float) -> list:
     """Every (role, locator) in the top-level document whose accessible name IS `normalized_name`.
 
-    THE ONLY MATCHING IMPLEMENTATION, used by the query and again by the action, so the two can never
-    disagree about what "the Login button" means. Whole-string and case-insensitive, by anchored
-    pattern - see dom_query for why Playwright's own `exact` flag is not what is wanted."""
+    THE ONLY MATCHING IMPLEMENTATION, used by the query and again by the action after a confirmation,
+    so the two can never disagree about what "the Login button" means - including about how long to
+    wait for it. Whole-string and case-insensitive, by anchored pattern; see dom_query for why
+    Playwright's own `exact` flag is not what is wanted. None of that changes here.
+
+    WHY THERE IS A WAIT AT ALL. `locator.count()` is an instantaneous snapshot and does no waiting -
+    Playwright's own documentation flags it as a flakiness source - so a page whose controls have not
+    rendered yet produced a FALSE NotFound. That really happened in the owner's console run: one
+    attempt failed, the identical target succeeded seconds later. Case had nothing to do with it; the
+    query simply had no patience.
+
+    ONE SHARED DEADLINE, counted once, before anything is scanned. Every role and the retry live
+    inside it, so the worst case is about the configured timeout and NOT nine times it. The wait is
+    Playwright's own, over all the allowed roles combined with `or_()`, so this adapter still does no
+    polling of its own and there is no sleep anywhere in it."""
     wanted = re.compile(rf"^{re.escape(normalized_name)}$", re.IGNORECASE)
-    matches = []
+    deadline = time.monotonic() + max(0.0, float(timeout_ms)) / 1000.0
     try:
-        for role in DOM_ROLES:
-            locator = page.get_by_role(role, name=wanted)
-            for index in range(locator.count()):
-                matches.append((role, locator.nth(index)))
+        matches = _scan_roles(page, wanted)
+        if matches:
+            return matches                 # already there: nothing waits, and nothing is slower
+        remaining_ms = (deadline - time.monotonic()) * 1000.0
+        if remaining_ms > 0:
+            _wait_for_any_role(page, wanted, remaining_ms)
+            matches = _scan_roles(page, wanted)
+    except BrowserError:
+        raise
     except Exception as exc:
         raise BrowserError(f"that page's controls could not be read ({type(exc).__name__})") from None
     return matches
+
+
+def _scan_roles(page, wanted) -> list:
+    """One instantaneous pass over the allowed roles. THE matching rule, unchanged by the fix."""
+    matches = []
+    for role in DOM_ROLES:
+        locator = page.get_by_role(role, name=wanted)
+        for index in range(locator.count()):
+            matches.append((role, locator.nth(index)))
+    return matches
+
+
+def _wait_for_any_role(page, wanted, remaining_ms: float) -> None:
+    """Wait ONCE, bounded by what is left of the shared deadline, for any allowed role to attach.
+
+    The roles are combined with Locator.or_() so this is a single Playwright wait rather than nine -
+    which is what keeps the worst case at roughly the configured timeout. `.first` is needed because
+    waiting on a locator that could match several elements is a strict-mode error.
+
+    A timeout here is not an error: it means nothing answered to that name in time, which the caller
+    reports with the existing NotFound wording."""
+    combined = None
+    for role in DOM_ROLES:
+        locator = page.get_by_role(role, name=wanted)
+        combined = locator if combined is None else combined.or_(locator)
+    try:
+        combined.first.wait_for(state="attached", timeout=max(1.0, remaining_ms))
+    except Exception:
+        return
 
 
 def _page_identity(page) -> str:

@@ -139,12 +139,37 @@ class FakeLocator:
         raise AssertionError("the DOM layer does not focus")
 
 
+
+    # --- delayed render (added with the readiness fix) -----------------------------------------------
+    def or_(self, other):
+        """Playwright's Locator.or_: match either. The production matcher combines all the allowed
+        roles with this so it can wait ONCE across all of them."""
+        combined = FakeLocator(self._controls + other._controls, self._page)
+        return combined
+
+    @property
+    def first(self):
+        return FakeLocator(self._controls[:1], self._page)
+
+    def wait_for(self, state=None, timeout=None):
+        """The one bounded readiness wait. Records that it happened, and how long it was allowed."""
+        assert timeout is not None, "the readiness wait must be bounded"
+        assert state == "attached", f"unexpected wait state {state!r}"
+        self._page.wait_calls.append(timeout)
+        self._page.waits += 1
+        if not self._page.is_ready():
+            raise RuntimeError("Timeout waiting for locator")
+
+
 class FakePage:
     def __init__(self, controls, frames=1, url="about:blank"):
         self.controls = controls
         self.frames = [object()] * frames
         self._url = url
         self.clicks = []
+        self.waits = 0
+        self.ready_after_waits = 0
+        self.wait_calls = []
 
     @property
     def url(self):
@@ -154,11 +179,21 @@ class FakePage:
         """TEST helper: pretend the page became a different one."""
         self._url = url
 
+
+    # --- delayed render (added with the readiness fix) -----------------------------------------------
+    def is_ready(self) -> bool:
+        """Whether the controls have "rendered" yet. ready_after_waits=0 means immediately."""
+        return self.waits >= self.ready_after_waits
+
+    @property
+    def visible_controls(self):
+        return self.controls if self.is_ready() else []
+
     def get_by_role(self, role, name=None, exact=None):
         assert exact is None, "exact must not be passed: Playwright ignores it for a pattern"
-        assert hasattr(name, "fullmatch"), "the name must be a compiled pattern"
-        return FakeLocator([c for c in self.controls if c["role"] == role
-                            and name.fullmatch(" ".join(c["name"].split()))], self)
+        assert hasattr(name, "search"), "the name must be a compiled pattern"
+        return FakeLocator([c for c in self.visible_controls if c["role"] == role
+                            and name.search(" ".join(c["name"].split()))], self)
 
     def content(self):
         raise AssertionError("the DOM layer must not read page HTML")
@@ -569,6 +604,47 @@ def test_a_successful_click_is_unverified_not_done(world):
     assert "can't check what the click did" in result.message
     for overclaim in ("logged in", "saved", "sent", "submitted", "worked"):
         assert overclaim not in result.message, overclaim
+
+
+# =====================================================================================================
+# READINESS - the post-confirmation half of the transient-NotFound fix
+# =====================================================================================================
+
+def test_post_confirmation_re_resolution_survives_a_late_render(world):
+    """9 of the readiness brief. The action re-resolves through the SAME matcher, so it inherits the
+    same bounded patience - a page that re-renders while the user is answering does not lose the
+    click."""
+    from app.verifier.models import normalize_name
+    query = genuine("dom_query")
+    found = query(SESSION, PAGE, normalize_name(TARGET), 2.0)
+    assert len(found) == 1
+    token = found[0].element_token
+
+    # the page re-renders while the confirmation is up: empty for one scan, then back
+    world.page.waits = 0
+    world.page.ready_after_waits = 1
+    assert world.page.visible_controls == []
+
+    outcome = genuine("dom_click")(SESSION, PAGE, token, 2.0)
+
+    assert outcome == executor_adapter.DOM_CLICKED, outcome
+    assert world.page.waits == 1, "the action waited, once"
+    assert len(world.page.wait_calls) == 1, "one shared deadline here too"
+    assert [name for name, _role, _timeout in world.page.clicks] == [TARGET]
+
+
+def test_a_control_that_never_comes_back_is_not_clicked(world):
+    """The other side of it: patience is bounded in the action too, and nothing is clicked."""
+    query = genuine("dom_query")
+    found = query(SESSION, PAGE, "login", 2.0)
+    token = found[0].element_token
+
+    world.page.waits = 0
+    world.page.ready_after_waits = 99
+
+    outcome = genuine("dom_click")(SESSION, PAGE, token, 2.0)
+    assert outcome == executor_adapter.DOM_GONE, outcome
+    assert world.page.clicks == [], "nothing was clicked"
 
 
 # =====================================================================================================

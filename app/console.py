@@ -25,6 +25,40 @@ Confirmation. Medium risk and above is asked here, and only the exact answer "ye
 surrounding spaces ignored) allows the action; anything else, including "y", Enter, end of input and
 Ctrl+C, denies it, matching the safety gate, which allows only a literal True.
 
+Prompts. Every question this console asks other than "> " is a NESTED prompt, and they all share one
+vocabulary - classify_answer() decides what a line means, and nothing else interprets one:
+
+  exit / help           always work, at any prompt, and end whatever was pending first.
+  cancel / no / stop    abandon that question and say what was abandoned.
+  a command             is never consumed as an answer. It goes in the loop's one slot UNCHANGED and
+                        runs on the next turn, exactly as if it had been typed at "> " - one
+                        interpretation, with a fresh Brain allowance. The abandoned question spends
+                        nothing. At a yes-or-no prompt "a command" means anything that is not one of
+                        the words above, because such a prompt has exactly one accepting answer; at the
+                        correction prompt, where prose IS the answer, only a line the deterministic
+                        parser recognises is handed back.
+  a mistyped "yes"      at the plan prompt only, is asked again ONCE instead of killing the plan.
+  a short slip          at a yes-or-no prompt, one short word the parser does not recognise ("yas") is
+                        a mistyped answer, not a request: it denies and is NOT queued. Real short
+                        commands are safe because the parser is asked first, not because of the length.
+  yes                   approves, and at a Medium-or-above confirmation it is still the only thing that
+                        does. There is no near-miss there and no handoff that defers the question: the
+                        action is denied first, and the queued line is a new root command with its own
+                        gate, so a command can never become a way to approve or resume one.
+
+A clarification is the one prompt that can ask again on its own: an answer that cannot be the missing
+value ("yes" to "which browser?") is re-asked once, locally, without spending the single Brain round -
+and the question names the applications this console already knows about.
+
+Reporting. run_console writes every reply's message, and it is the ONLY thing that does. Anything that
+happens mid-plan - each step, failed ones included - is reported where it happens, numbered, and the
+plan's own reply then says where it stopped rather than repeating the step. Two layers reporting the
+same outcome is what made every abandonment print twice.
+
+After the user has DECIDED - an explicit cancel, or declining a Medium-or-above confirmation
+(NO_CORRECTION_AFTER) - nothing asks what they would have preferred instead. The correction prompt is
+for a plan that went wrong, not for one they stopped on purpose.
+
 Emergency stop. Every wait here is interruptible, and the flag is never reset from the console: once
 it is set, every command reports it and nothing runs until the assistant is restarted. A stop that
 interrupts an action comes back as STOPPED, carrying how much had already happened. The global hotkey
@@ -63,6 +97,55 @@ from config.settings import SettingsError, get_setting
 
 YES = "yes"  # the only answer that confirms anything
 
+# --- The words every nested prompt understands (Slice 1) ----------------------------------------------
+#
+# Before this slice each mini-prompt had its own idea of what a line meant, so the same typed line was
+# an answer in one place, a command in another and silently discarded in a third. One vocabulary, used
+# by every nested prompt, is what makes the console predictable: see classify_answer().
+EXIT_WORD = "exit"
+HELP_WORD = "help"
+# "abandon this question" - said in the three ways a person actually says it. At a yes-or-no prompt
+# these already meant "not yes"; what changes is that the console now SAYS what it abandoned instead of
+# falling silently through a "not yes" branch.
+ABANDON_WORDS = frozenset({"cancel", "no", "stop"})
+# A near-miss of YES, at the plan prompt only. Derived from YES itself so the two cannot drift apart:
+# nothing longer than YES plus two characters, built only from YES's own letters. "y", "yees", "yse"
+# and "e" are in; a command is not, and is checked for first anyway (see classify_answer).
+_YES_LETTERS = frozenset(YES)
+NEAR_MISS_LIMIT = len(YES) + 2
+# A slip of the finger that is not even a near-miss. The owner typed "yas" at a confirmation: it has an
+# "a", so it was not a mistyped yes, and it fell through to "this must be a command", which queued it
+# and spent a turn reporting that no request could be found in "yas".
+#
+# At a yes-or-no prompt, ONE short word the deterministic parser does not recognise is a mistyped answer
+# rather than a request, so it simply denies. What actually protects a real short command is that
+# is_fresh_command() is asked FIRST, so "help", "exit", "refresh", "minimize" and anything else the
+# parser knows never reach this rule, however short they are.
+#
+# FOUR, not five. A bare "close" is five characters and the parser calls it AMBIGUOUS rather than a
+# command, so at five it was swallowed as noise and the user lost the existing "Close what? Say close
+# <app>..." guidance. Keeping that guidance is worth more than treating "close" as a typo, and "yas" -
+# the slip this rule exists for - is three. The word is not special-cased anywhere: the behaviour falls
+# out of the parser, this limit, and the ordinary handoff.
+SHORT_WORD_LIMIT = 4
+# A clarification asks for a VALUE that is missing - an app, a recipient, which of several. A bare
+# confirmation or refusal cannot be that value, which is knowable here, for free, without asking the
+# model. The owner's real session spent its one clarification round sending "yes" to the provider as
+# the answer to "which browser?".
+UNUSABLE_ANSWERS = frozenset({"yes", "no", "y", "n", "ok", "okay", "sure", "yeah", "yep", "yup",
+                              "nope", "nah"})
+
+# What a question asked for. The shape decides what an unrecognised line MEANS, and that is the whole
+# difference between the prompts:
+#   CLOSED_QUESTION - one accepting answer ("yes"). Anything else is not an answer to the question that
+#                     was asked, so it is handed back to the console loop rather than swallowed.
+#   FREE_TEXT       - prose IS the answer (the correction prompt). Only a line the deterministic parser
+#                     recognises as a command is handed back; "use the other Ali" stays a correction.
+#   CLARIFICATION   - free text, plus the unusable-answer rule above.
+CLOSED_QUESTION = "closed_question"
+FREE_TEXT = "free_text"
+CLARIFICATION = "clarification"
+
 # Actions that land wherever the desktop's focus or pointer is: the user hands focus over first.
 HANDS_OVER = frozenset({CLICK, TYPE_TEXT, SHORTCUT, SCROLL, REFRESH, WINDOW_CONTROL})
 # Actions that don't depend on which window is in front: they name the app, or close windows by name.
@@ -100,6 +183,29 @@ class Status(str, Enum):
     UNAVAILABLE = "unavailable"            # the reasoning service couldn't be reached
     NO_PLAN = "no_plan"                    # no plan could be built, or the reply couldn't be believed
     CANCELLED = "cancelled"                # a plan was shown and the user said no
+
+
+class Answer(str, Enum):
+    """What one line typed at a NESTED prompt means. Decided by classify_answer(), which is pure.
+
+    This is the console's whole answer vocabulary. A prompt reads a line, asks what it means, and acts
+    on the meaning - no prompt interprets a line for itself any more."""
+    NONE = "none"            # nothing was typed: blank, end of input, or Ctrl+C
+    YES = "yes"              # the exact word, and the only thing that ever approves anything
+    EXIT = "exit"            # leave the console, now
+    HELP = "help"            # show the commands, now
+    ABANDON = "abandon"      # cancel / no / stop: drop this question and go back to ">"
+    COMMAND = "command"      # a new thing to do: queued for the loop, never consumed here
+    NEAR_MISS = "near_miss"  # a mistyped "yes" at the plan prompt, which is re-asked once
+    UNUSABLE = "unusable"    # a clarification answer that cannot be the value that was asked for
+    ANSWER = "answer"        # genuine free text. At a CLOSED_QUESTION it simply means "not yes".
+
+
+# The meanings that end the current interaction on the user's say-so. Each one has to be REPORTED -
+# saying nothing is how the old console lost a command without admitting it.
+ABANDONMENTS = (Answer.EXIT, Answer.HELP, Answer.COMMAND, Answer.ABANDON)
+# The ones the console loop has to be told about, because they are not answers at all.
+HANDED_BACK = (Answer.EXIT, Answer.HELP, Answer.COMMAND)
 
 
 @dataclass(frozen=True)
@@ -300,7 +406,7 @@ def run_console(read=input, write=print, focus=None) -> int:
     was_active = hotkey.status().active
     focus = FocusHandover(write) if focus is None else focus
     pending = PendingCommand()
-    confirm, offer_retry = _confirm(read, write), _offer_retry(read, write, pending)
+    confirm, offer_retry = _confirm(read, write, pending), _offer_retry(read, write, pending)
     prompts = Prompts(read=read, write=write, confirm=confirm, offer_retry=offer_retry, pending=pending)
     context = TurnContext()
     while True:
@@ -316,12 +422,15 @@ def run_console(read=input, write=print, focus=None) -> int:
             except (EOFError, KeyboardInterrupt):
                 write("")
                 return 0
+        # A new line is a new root command, so the previous one's abandonment is spent. Done here, in
+        # one place, rather than by whichever prompt happened to set it.
+        pending.begin_root_command()
         word = line.strip().lower()
         if not word:
             continue
-        if word == "exit":
+        if word == EXIT_WORD:
             return 0
-        if word == "help":
+        if word == HELP_WORD:
             write(commands.HELP)
             continue
         focus.note_console_window()
@@ -356,11 +465,52 @@ def run_console(read=input, write=print, focus=None) -> int:
 # ======================================================================================================
 
 PLAN_HEADER = "Plan:"
-PROCEED_PROMPT = f"Proceed? Type {YES} to run it (anything else cancels): "
+PROCEED_PROMPT = f"Proceed? Type {YES} to run it, or cancel: "
 CANCELLED_MESSAGE = "Nothing was run."
 CORRECTION_PROMPT = "Tell me what to do differently, or press Enter to leave it: "
 CLARIFY_PROMPT = "Your answer: "
 NO_ANSWER_MESSAGE = "No answer given, so nothing was done."
+
+# --- Saying what was abandoned (Slice 1, Rule 3) ------------------------------------------------------
+# Every one of these names the thing that is no longer happening. "Nothing was run" on its own left the
+# owner guessing which of the plan, the action and the question had gone.
+PLAN_ABANDONED = "Cancelled the plan. Nothing was run."
+PLAN_ABANDONED_FOR_COMMAND = "Cancelled the plan; I'll do what you just typed instead."
+NEAR_MISS_MESSAGE = f"I didn't catch that. The plan is still waiting - type {YES} to run it, or cancel."
+CONFIRM_ABANDONED = "Cancelled: I did not do that."
+CONFIRM_ABANDONED_FOR_COMMAND = "Cancelled that; I'll do what you just typed instead."
+RETRY_ABANDONED = "Stopped. I won't try that again."
+CORRECTION_ABANDONED = "Left the plan alone."
+CLARIFY_ABANDONED = "Dropped the question, so nothing was done."
+CLARIFY_UNUSABLE = ("That doesn't answer the question - I need the missing detail itself, not yes or no. "
+                    "Asking once more:")
+CLARIFY_GIVEN_UP = ("I still don't have what I need, so I've left that alone. Tell me the whole thing "
+                    "again when you want to.")
+# Candidates the console knows WITHOUT asking anyone: the configured application names. Naming them
+# turns "which browser?" from a guessing game into a choice.
+CLARIFY_CANDIDATES = "I know about: {names}."
+# Which `missing` fields are an application choice. NeedsClarification.missing is the model's own word
+# for the absent field ("app", "recipient", "which_of", ...).
+_APP_MISSING_FIELDS = frozenset({"app", "application", "apps", "app_name", "program", "which_app"})
+# A plan of SEVERAL steps reports the failing step where it happened, numbered like the others, and then
+# says where it stopped. A ONE-step plan does neither: its own message is the whole story and goes back
+# as the reply, so reply.message stays the authoritative outcome for anything that only reads it.
+PLAN_STOPPED_AT = "Stopped at step {number} of {total}."
+PLAN_STOPPED_EARLY = "Stopped at step {number} of {total}; nothing after it was run."
+# Outcomes after which the correction prompt is NOT offered. Three cases, one reason: rewording the
+# request cannot address any of them.
+#
+#   DENIED            - they were shown a Medium-or-above action and said no. A decision, not a failed
+#                       attempt. This is the case the owner's smoke found.
+#   STOPPED           - the emergency stop. Nothing may follow it but a report, and asking a question
+#                       on top of a stop would be the console talking over it.
+#   NOT_HANDED_OVER   - focus never arrived, so no wording of the command would have helped; the window
+#                       is what has to change.
+#
+# Status.RAN with a failed result is deliberately NOT here - that is the machine getting in the way,
+# which is exactly what a correction is for. Suppressing the PROMPT is all this does: the status, the
+# result and the original reason are untouched, and the reason is still reported exactly once.
+NO_CORRECTION_AFTER = (Status.DENIED, Status.STOPPED, Status.NOT_HANDED_OVER)
 PLAN_DONE = "Done: all {count} step{plural} finished."
 # The same sentence would be a lie about a step whose effect nobody can see. A click is SENT, never
 # observed: Outcome.UNVERIFIED is the Executor saying so, and the plan's closing line has to say it
@@ -398,14 +548,85 @@ def is_fresh_command(line: str) -> bool:
     return isinstance(route, brain.BrainEligible) and getattr(route, "parsed", None) is not None
 
 
+def _is_near_miss(word: str) -> bool:
+    """A mistyped YES, and nothing that could be anything else.
+
+    Deliberately narrow: only YES's own letters, and never longer than YES plus two. That admits
+    "y", "e", "yees", "yse" and "yesss" and excludes every abandon word ("no", "stop", "cancel" all
+    contain letters YES does not), every blank line, and anything with a space in it. It cannot swallow
+    a command for a second reason as well: classify_answer asks is_fresh_command FIRST, so a line the
+    parser recognises is handed back before this is ever consulted."""
+    return 0 < len(word) <= NEAR_MISS_LIMIT and word != YES and set(word) <= _YES_LETTERS
+
+
+def _is_short_slip(word: str) -> bool:
+    """One short word, no space in it. Reached only after is_fresh_command() has said no, so it can
+    never catch a command the parser recognises - and a phrase is never a slip, however short."""
+    return len(word) <= SHORT_WORD_LIMIT and len(word.split()) == 1
+
+
+def classify_answer(line, shape: str = CLOSED_QUESTION, *, handoff: bool = True) -> Answer:
+    """What one line typed at a nested prompt means. PURE: nothing runs, nothing is spent, no model
+    call is made - is_fresh_command() routes through the deterministic parser only.
+
+    `shape` is what the question asked for: CLOSED_QUESTION, FREE_TEXT or CLARIFICATION.
+
+    `handoff` is whether the caller owns a console loop that can be handed a line back. Without one -
+    which is what app/voice_console.py and every caller that is not run_console passes - there is
+    nowhere to put a command, nothing to exit from, and no second read to make, so the answer space
+    collapses to exactly what it was before this slice: the exact word yes, or not. That single `if` is
+    why voice behaviour is unchanged.
+
+    THE ORDER IS THE RULE SET, and two steps of it are load-bearing:
+
+      * is_fresh_command() is asked BEFORE _is_near_miss(), so a command can never be read as a
+        mistyped yes (and so Rule 4 cannot swallow one).
+      * at a CLARIFICATION the unusable-answer check comes BEFORE the abandon words, because "yes" and
+        "no" there are the exact case the local re-ask exists for. Treating them as "abandon" would
+        make that rule dead code. "cancel" and "stop" still abandon, and nothing else changes.
+    """
+    if not isinstance(line, str) or not line.strip():
+        return Answer.NONE
+    word = line.strip().lower()
+    if shape == CLOSED_QUESTION and word == YES:
+        # The approval, and the ONE place it is decided. Scoped to the closed question because "yes" is
+        # not an approval at the other two prompts: at a correction it is prose, and at a clarification
+        # it is the unusable answer that cost the owner their one round.
+        return Answer.YES
+    if not handoff:
+        return Answer.ANSWER
+    if word == EXIT_WORD:
+        return Answer.EXIT
+    if word == HELP_WORD:
+        return Answer.HELP
+    if shape == CLARIFICATION and word in UNUSABLE_ANSWERS:
+        return Answer.UNUSABLE
+    if word in ABANDON_WORDS:
+        return Answer.ABANDON
+    if is_fresh_command(line):
+        return Answer.COMMAND
+    if shape == CLOSED_QUESTION:
+        if _is_near_miss(word):
+            return Answer.NEAR_MISS
+        if _is_short_slip(word):
+            return Answer.ANSWER      # a mistyped answer: deny, and do NOT queue it as a request
+        return Answer.COMMAND
+    return Answer.ANSWER
+
+
 @dataclass
 class PendingCommand:
     """One slot for a line typed at a mini-prompt that turned out to be a fresh command.
 
     Owned by run_console. A prompt puts the line here INSTEAD of consuming it, and the loop takes it and
     runs it exactly once: take() empties the slot, so the line can neither run twice nor be left behind.
-    There is no nesting and no queue - one slot, taken before each read."""
+    There is no nesting and no queue - one slot, taken before each read.
+
+    `abandoned` is the other half: once a nested prompt has been abandoned, NOTHING may ask another
+    question about this root command. Without it, "exit" at the retry prompt was queued correctly and
+    the user was then shown the correction prompt instead of leaving - which is what the owner saw."""
     line: str | None = None
+    abandoned: bool = False
 
     def put(self, line: str) -> None:
         self.line = line
@@ -413,6 +634,14 @@ class PendingCommand:
     def take(self) -> str | None:
         line, self.line = self.line, None
         return line
+
+    def abandon(self) -> None:
+        """The user ended this interaction. No further prompt for this root command."""
+        self.abandoned = True
+
+    def begin_root_command(self) -> None:
+        """Called by the loop once per line it is about to handle: the abandonment is spent."""
+        self.abandoned = False
 
 
 @dataclass(frozen=True)
@@ -573,15 +802,52 @@ def _on_interpretation(outcome, text, context, prompts, focus, interpret, fronte
     return _plan_it(outcome, text, context, prompts, focus, interpret, frontend)
 
 
+def _clarification_question(needs) -> list[str]:
+    """The question to show, and the candidates the console already knows.
+
+    A choice question the user cannot answer without guessing is the thing that burned the owner's one
+    clarification round ("which browser?" -> "yes"). When the missing field is an APPLICATION, the
+    configured names are local knowledge: no model call, no desktop read, no Memory lookup. A broken or
+    unreadable configuration simply adds nothing, which is today's behaviour."""
+    lines = [needs.question]
+    if (needs.missing or "").strip().lower() not in _APP_MISSING_FIELDS:
+        return lines
+    try:
+        names = configured_app_names()
+    except SettingsError:
+        return lines
+    if names:
+        lines.append(CLARIFY_CANDIDATES.format(names=", ".join(names)))
+    return lines
+
+
 def _clarify(needs, text, context, prompts, focus, interpret, frontend):
-    """Ask the model's question, take ONE answer, and send it back once."""
+    """Ask the model's question, take ONE USABLE answer, and send it back once.
+
+    The one Brain round is spent on the question (app/planner/logic.begin_clarification), and this is
+    where it is CASHED - at interpret(). So an answer that cannot possibly be the missing value never
+    reaches that line: the question is asked again, locally, at most once, and the round is still there
+    for the real answer. A second unusable answer abandons the root command rather than guessing."""
     started = session.begin_clarification(context, needs, text)
     if isinstance(started, LifecycleRefusal):
         return CommandReply(Status.NO_PLAN, started.message), context
     context = started
-    prompts.write(needs.question)
-    answer = _ask_text(prompts, CLARIFY_PROMPT)
-    if not answer or not answer.strip():
+    for line in _clarification_question(needs):
+        prompts.write(line)
+    meaning, answer = _read_answer(prompts, CLARIFY_PROMPT, CLARIFICATION)
+    if meaning is Answer.UNUSABLE:
+        # ONE local re-ask. No Brain call, no new question, and no loop: straight-line code with a
+        # second read, after which an unusable answer is the end of it.
+        prompts.write(CLARIFY_UNUSABLE)
+        for line in _clarification_question(needs):
+            prompts.write(line)
+        meaning, answer = _read_answer(prompts, CLARIFY_PROMPT, CLARIFICATION)
+        if meaning is Answer.UNUSABLE:
+            return (CommandReply(Status.NO_PLAN, CLARIFY_GIVEN_UP),
+                    session.cancel_clarification(context))
+    if meaning is Answer.ABANDON:
+        return CommandReply(Status.NO_PLAN, CLARIFY_ABANDONED), session.cancel_clarification(context)
+    if meaning is not Answer.ANSWER or not answer.strip():
         return CommandReply(Status.NO_PLAN, NO_ANSWER_MESSAGE), session.cancel_clarification(context)
     continued = session.answer_clarification(context, answer)
     if isinstance(continued, LifecycleRefusal):
@@ -610,11 +876,21 @@ def _offer(context, prompts, focus, interpret, frontend):
     pending = context.pending_plan
     for line in _preview(context):
         prompts.write(line)
-    if not _says_yes(prompts.read, prompts.write, PROCEED_PROMPT):
+    meaning = _plan_answer(prompts)
+    if meaning is not Answer.YES:
         rejected = session.reject_plan(context)
         context = rejected if isinstance(rejected, TurnContext) else context
+        # The plan is dead either way; what differs is what the user is told, and whether there is any
+        # point asking them anything else. _offer_correction asks nothing once the slot is abandoned, so
+        # exit, help, a command and an explicit cancel all go straight back to ">".
+        if meaning is Answer.COMMAND:
+            message = PLAN_ABANDONED_FOR_COMMAND
+        elif meaning in ABANDONMENTS:
+            message = PLAN_ABANDONED
+        else:
+            message = CANCELLED_MESSAGE
         return _offer_correction(context, prompts, focus, interpret,
-                                 CommandReply(Status.CANCELLED, CANCELLED_MESSAGE), frontend)
+                                 CommandReply(Status.CANCELLED, message), frontend)
     accepted = session.accept_plan(context, pending.plan_id)
     if isinstance(accepted, LifecycleRefusal):
         return CommandReply(Status.NO_PLAN, accepted.message), context
@@ -637,9 +913,31 @@ def _run_plan(context, prompts, focus, interpret, frontend):
             continue
         failed = session.fail_plan(context, step.number, reply.message)
         context = failed if isinstance(failed, TurnContext) else context
-        # The step's own reply is carried through: Status.RAN with result.ok False is how this module has
-        # always reported "it reached the Executor and did not work", and the result is what says so.
-        return _offer_correction(context, prompts, focus, interpret, reply, frontend)
+        # The failing step is printed HERE, numbered and in sequence exactly like a successful one, and
+        # the reply that goes back carries a PLAN-LEVEL message instead of a copy of it.
+        #
+        # This is the fix for "every abandonment printed twice". The cause was not a stray print: two
+        # layers each reported the same outcome. _offer_correction wrote outcome.message, and
+        # run_console writes every reply's message, so the step's message appeared once above the
+        # correction prompt and once below it. run_console is now the only thing that reports a reply;
+        # anything that happens mid-plan is reported where it happens.
+        #
+        # Status, action and result are carried through unchanged - Status.DENIED is what tells
+        # _offer_correction that the user said no, and the result is still what says what became of it.
+        if len(steps) == 1:
+            # ONE step IS the plan, so its own message is the whole story. It goes back as the reply
+            # and run_console reports it - once. Nothing is written here, which matters beyond tidiness:
+            # reply.message has to stay the authoritative outcome for a caller that only reads it, and
+            # app/voice_console.py SPEAKS it. Replacing it with "stopped there" would have left the real
+            # reason - an ownership refusal, for instance - printed but never said.
+            return _offer_correction(context, prompts, focus, interpret, reply, frontend)
+        prompts.write(f"{step.number}. {reply.message}")
+        stopped = CommandReply(
+            reply.status,
+            (PLAN_STOPPED_EARLY if step.number < len(steps) else PLAN_STOPPED_AT).format(
+                number=step.number, total=len(steps)),
+            reply.action, reply.result)
+        return _offer_correction(context, prompts, focus, interpret, stopped, frontend)
     plural = "" if len(steps) == 1 else "s"
     if unverified:
         return CommandReply(Status.RAN, PLAN_DONE_UNVERIFIED.format(
@@ -653,7 +951,20 @@ def _offer_correction(context, prompts, focus, interpret, outcome: CommandReply,
     This is NOT the Executor's retry, which repeats the same action when the machine got in the way.
     This asks for a DIFFERENT plan because a person said so, and it never happens on its own.
     """
-    prompts.write(outcome.message)
+    if _abandoned(prompts) or outcome.status in NO_CORRECTION_AFTER:
+        # Two reasons not to ask, and they are the same reason underneath: the USER has already decided.
+        #
+        # _abandoned - they left, asked for help, cancelled, or typed something else to do. Asking
+        # "what should I have done instead?" on top of that is what made `exit` at the retry prompt
+        # produce another question.
+        #
+        # NO_CORRECTION_AFTER - they were shown a Medium-or-above action and declined it. A denial is a
+        # decision, not a failed attempt; this prompt exists for a plan that went wrong, not for one the
+        # user stopped on purpose. Checked on the status here, in one place, so the deterministic and
+        # Brain paths cannot disagree about it.
+        #
+        # This function no longer writes outcome.message: run_console reports every reply exactly once.
+        return outcome, session.cancel(context)
     if not context.budget.may_replan or context.pending_plan is None:
         return outcome, context
     correction = _ask_text(prompts, CORRECTION_PROMPT)
@@ -741,21 +1052,59 @@ def _cannot_use_that_answer() -> str:
     return "I couldn't make sense of that well enough to act on it, so I did nothing."
 
 
-def _ask_text(prompts: Prompts, prompt: str) -> str | None:
-    """A free-text answer. None when there is no answer - end of input, or Ctrl+C."""
+def _read_answer(prompts: Prompts, prompt: str, shape: str) -> tuple[Answer, str]:
+    """Read one line at a nested prompt and say what it means. The ONLY place a nested prompt reads
+    from the keyboard, so the rule set has exactly one implementation.
+
+    Returns (meaning, the line exactly as it was typed). A line that is not an answer at all - exit,
+    help, or a command - is put in the loop's slot UNCHANGED and the interaction is marked abandoned,
+    so nothing asks another question about this root command. Nothing here spends a Brain call: the
+    queued line is interpreted once, later, by the outer loop, exactly as if it had been typed at ">".
+    """
     try:
-        answer = prompts.read(prompt)
+        line = prompts.read(prompt)
     except (EOFError, KeyboardInterrupt):
         prompts.write("")
-        return None
-    if not isinstance(answer, str):
-        return None
-    if prompts.pending is not None and is_fresh_command(answer):
-        # Not an answer: hand it to the console loop and report "no answer", which cancels this
-        # question without spending anything on it.
-        prompts.pending.put(answer)
-        return None
-    return answer
+        return Answer.NONE, ""
+    line = line if isinstance(line, str) else ""
+    meaning = classify_answer(line, shape, handoff=prompts.pending is not None)
+    if meaning in HANDED_BACK:
+        prompts.pending.put(line)        # unchanged: the loop sees what the user actually typed
+    if meaning in ABANDONMENTS:
+        prompts.pending.abandon()
+    return meaning, line
+
+
+def _plan_answer(prompts: Prompts) -> Answer:
+    """The plan prompt, including Rule 4's single re-ask.
+
+    A mistyped yes is not a decision, and the plan is still sitting there unaccepted, so asking again
+    costs nothing - no Brain call, no action, no state change. It happens AT MOST ONCE and that is
+    structural: this is straight-line code with two reads and no loop, and a second near-miss is
+    returned as a plain "not yes"."""
+    meaning, _line = _read_answer(prompts, PROCEED_PROMPT, CLOSED_QUESTION)
+    if meaning is not Answer.NEAR_MISS:
+        return meaning
+    prompts.write(NEAR_MISS_MESSAGE)
+    meaning, _line = _read_answer(prompts, PROCEED_PROMPT, CLOSED_QUESTION)
+    return Answer.ANSWER if meaning is Answer.NEAR_MISS else meaning
+
+
+def _abandoned(prompts: Prompts) -> bool:
+    """Has a nested prompt already been ended by the user? Then nothing may ask them anything else."""
+    return prompts.pending is not None and prompts.pending.abandoned
+
+
+def _ask_text(prompts: Prompts, prompt: str) -> str | None:
+    """A free-text answer for the CORRECTION prompt. None when there is no answer to use.
+
+    Prose is what this prompt is for, so only a line the deterministic parser recognises as a command
+    is handed back - "use the other Ali" is still a correction. cancel/no/stop now end it explicitly
+    instead of becoming a paid model call about the word "no"."""
+    meaning, line = _read_answer(prompts, prompt, FREE_TEXT)
+    if meaning is Answer.ABANDON:
+        prompts.write(CORRECTION_ABANDONED)
+    return line if meaning is Answer.ANSWER else None
 
 
 def _hotkey_line(state) -> str:
@@ -769,12 +1118,32 @@ def _hotkey_line(state) -> str:
 
 # --- Prompts ----------------------------------------------------------------------------------
 
-def _confirm(read, write):
-    """The safety gate's confirmation: only the exact answer "yes" allows the action."""
+def _confirm(read, write, pending=None):
+    """The safety gate's confirmation. THE EXCEPTION, and it does not move: the only value that ever
+    returns True is the exact word "yes" (capitals and surrounding spaces ignored, as it has always
+    been). There is no near-miss re-ask here and no second chance - Rule 4 is the plan prompt only.
+
+    What this slice adds is the OTHER half of "anything else cancels". A command, exit or help typed
+    here used to be read as "not yes" and thrown away; now the action is still denied, exactly as
+    before, and the line is handed to the console loop for the next turn. The denial comes first and
+    does not depend on the handoff: the gate sees False before anything is queued, the cancelled action
+    never resumes (the slot is marked abandoned, so nothing asks a follow-up), and the queued line
+    starts a brand-new root command with its own safety gate. A command can therefore never be a way to
+    approve, defer or resume a Medium-or-above action.
+    """
     def confirm(action, assessment) -> bool:
         write(f"Needs your OK - {assessment.level.name} risk ({assessment.rule}):")
         write(f"  {action.description}")
-        return _says_yes(read, write, f"Type {YES} to go ahead (anything else cancels): ")
+        prompts = Prompts(read=read, write=write, pending=pending)
+        meaning, _line = _read_answer(prompts, f"Type {YES} to go ahead (anything else cancels): ",
+                                      CLOSED_QUESTION)
+        if meaning is Answer.YES:
+            return True
+        if meaning is Answer.COMMAND:
+            write(CONFIRM_ABANDONED_FOR_COMMAND)
+        elif meaning in ABANDONMENTS:
+            write(CONFIRM_ABANDONED)
+        return False
     return confirm
 
 
@@ -785,25 +1154,13 @@ def _offer_retry(read, write, pending=None):
     thrown away. The answer semantics are unchanged: only YES retries, anything else stops."""
     def offer_retry(result) -> bool:
         write(result.message)
-        try:
-            answer = read(f"Try again? Type {YES} to retry (anything else stops): ")
-        except (EOFError, KeyboardInterrupt):
-            write("")
-            return False
-        if pending is not None and is_fresh_command(answer):
-            pending.put(answer)
-            return False                      # stop retrying; the loop runs what was typed
-        return isinstance(answer, str) and answer.strip().lower() == YES
+        prompts = Prompts(read=read, write=write, pending=pending)
+        meaning, _line = _read_answer(prompts, f"Try again? Type {YES} to retry (anything else stops): ",
+                                      CLOSED_QUESTION)
+        if meaning is Answer.ABANDON:
+            write(RETRY_ABANDONED)
+        return meaning is Answer.YES
     return offer_retry
-
-
-def _says_yes(read, write, prompt: str) -> bool:
-    try:
-        answer = read(prompt)
-    except (EOFError, KeyboardInterrupt):  # not an Exception the safety gate would see; deny here
-        write("")
-        return False
-    return isinstance(answer, str) and answer.strip().lower() == YES
 
 
 def _focus_settings() -> tuple[float, float, float]:

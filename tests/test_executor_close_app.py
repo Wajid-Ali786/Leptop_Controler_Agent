@@ -51,6 +51,16 @@ FRAME, CORE = "ApplicationFrameWindow", "Windows.UI.Core.CoreWindow"
 USERS_NOTEPAD = WindowInfo(1, "Claude Code Response.txt - Notepad", "Notepad")
 
 
+def users_notepad(world):
+    """Put the user's own already-open Notepad on the fake desktop, and return its handle.
+
+    Explicit since Slice 2, because WHEN it appears now changes what happens. Before an "open notepad"
+    the command reuses it and launches nothing; after one, it is the stranger that must survive a close
+    of the assistant's own window. Both are real scenarios and they are no longer the same setup."""
+    world.desktop.windows[USERS_NOTEPAD.handle] = USERS_NOTEPAD
+    return USERS_NOTEPAD.handle
+
+
 def yes(*args):
     return True
 
@@ -67,7 +77,12 @@ class FakeDesktop:
 
     def __init__(self, calls):
         self.calls = calls
-        self.windows = {USERS_NOTEPAD.handle: USERS_NOTEPAD}  # the user's own, already open
+        # The desktop starts EMPTY since Slice 2. "open <app>" now means "ensure it is available and
+        # in front", so a pre-existing window MATCHING the app is a precondition that changes what the
+        # command does - it reuses that window instead of launching. A test that wants the user's own
+        # Notepad there says so with users_notepad(), and the ownership tests add it AFTER their open,
+        # which is the only order in which the assistant can own one window while a stranger exists.
+        self.windows = {}
         self.hosted = {}      # frame handle -> content windows inside it
         self.content_of = {}  # frame handle -> its content window while that is still top-level
         # Window properties, as Windows keeps them: attached to the window OBJECT, so they appear when a
@@ -258,15 +273,24 @@ def test_close_an_app_the_assistant_opened(world):
 
 def test_users_own_window_is_untouched_when_closing_the_assistants(world):
     open_app("notepad")
+    users_notepad(world)          # after the open: before it, the open would have reused this window
     assert close_app("  NotePad ").ok
     assert USERS_NOTEPAD.handle in world.desktop.windows
     assert all(handle != USERS_NOTEPAD.handle for _, handle in close_requests(world))
 
 
 def test_most_recently_opened_window_closes_first(world):
-    del world.desktop.windows[USERS_NOTEPAD.handle]
+    """LIFO over the session's own groups, unchanged.
+
+    The SETUP changed with Slice 2: "open notepad" no longer launches a second window while a usable
+    one is open, so the only way to end up owning two is for the first to be unusable at the moment the
+    second is asked for. Cloaking it is exactly that - Windows keeping a window off screen is the same
+    condition the Verifier already refuses to count as "appeared"."""
     open_app("notepad")
+    [one] = world.desktop.handles("Untitled - Notepad")
+    world.desktop.update(one, cloaked=True)
     open_app("notepad")
+    world.desktop.update(one, cloaked=False)
     first, second = world.desktop.handles("Untitled - Notepad")
     assert close_app("notepad").ok
     assert close_app("notepad").ok
@@ -279,6 +303,7 @@ def test_most_recently_opened_window_closes_first(world):
 # --- Session-only scope: windows the assistant didn't open are never closed ---
 
 def test_window_the_assistant_did_not_open_is_left_alone(world):
+    users_notepad(world)
     result = close_app("notepad")
     assert not result.ok and result.outcome is Outcome.FAILED and not result.retryable
     assert result.message == ("I only close windows I opened in this session. 1 notepad window is open, "
@@ -287,6 +312,7 @@ def test_window_the_assistant_did_not_open_is_left_alone(world):
 
 
 def test_several_windows_the_assistant_did_not_open_are_left_alone(world):
+    users_notepad(world)
     world.desktop.add("notes.txt - Notepad", "Notepad")
     result = close_app("notepad")
     assert not result.ok
@@ -296,6 +322,7 @@ def test_several_windows_the_assistant_did_not_open_are_left_alone(world):
 
 def test_forgotten_session_windows_are_not_closed(world):
     open_app("notepad")
+    users_notepad(world)
     logic.forget_session_windows()
     result = close_app("notepad")
     assert not result.ok and "I didn't open them" in result.message
@@ -308,6 +335,7 @@ def test_window_that_appeared_too_late_to_verify_is_not_the_assistants(world, mo
         return 4242
     monkeypatch.setattr(adapter, "launch_app", slow_launch)
     assert not execute(ExecutorAction(OPEN_APP, "notepad")).ok
+    users_notepad(world)
     world.desktop.add("Untitled - Notepad", "Notepad")  # shows up after open_app gave up
     result = close_app("notepad")
     assert not result.ok and "I didn't open them" in result.message
@@ -316,6 +344,7 @@ def test_window_that_appeared_too_late_to_verify_is_not_the_assistants(world, mo
 
 def test_reused_handle_now_belonging_to_another_window_is_not_closed(world):
     open_app("notepad")
+    users_notepad(world)
     handle = world.desktop.handles("Untitled - Notepad")[0]
     world.desktop.windows[handle] = WindowInfo(handle, "Bank statement - Excel", "XLMAIN")  # Windows reused it
     result = close_app("notepad")
@@ -327,7 +356,6 @@ def test_reused_handle_now_belonging_to_another_window_is_not_closed(world):
 # --- Already closed: success, nothing to do, nothing asked ---
 
 def test_nothing_open_at_all_is_already_closed(world):
-    del world.desktop.windows[USERS_NOTEPAD.handle]
     result = close_app("notepad")
     assert result.ok and result.outcome is Outcome.ALREADY_CLOSED
     assert result.message == "notepad is already closed."
@@ -336,7 +364,6 @@ def test_nothing_open_at_all_is_already_closed(world):
 
 def test_window_the_user_already_closed_is_already_closed(world):
     open_app("notepad")
-    del world.desktop.windows[USERS_NOTEPAD.handle]
     world.desktop.close_family(world.desktop.windows[world.desktop.handles("Untitled - Notepad")[0]])
     result = close_app("notepad")
     assert result.ok and result.outcome is Outcome.ALREADY_CLOSED
@@ -426,9 +453,12 @@ def test_still_open_window_stays_the_assistants_to_close_later(world):
 # --- Store apps: a frame plus a same-titled content window (no app is special-cased by name) ---
 
 def test_ordinary_app_is_verified_on_the_first_look_with_no_extra_wait(world):
+    """Three listings since Slice 2, and no WAIT in any of them. open_app decides whether to launch at
+    all by looking first, which is two reads of one desktop state (the handle set and the windows in
+    it), and the Verifier then looks once more for the new window."""
     polls = world.desktop.polls
     open_app("notepad")
-    assert world.desktop.polls - polls == 2  # one snapshot before launching, one look after
+    assert world.desktop.polls - polls == 3
 
 
 def test_store_app_counts_as_opened_only_once_its_frame_is_on_screen(world):

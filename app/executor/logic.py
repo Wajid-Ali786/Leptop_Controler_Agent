@@ -182,6 +182,30 @@ _ENTER_RISK_REASON = ("text contains line breaks - each presses Enter, which can
 _session_windows: dict[str, list["_OwnedWindowGroup"]] = {}
 _session_lock = threading.Lock()
 
+# WINDOWS THE ASSISTANT FOUND, which is NOT the same thing and must never be confused with it.
+#
+# _session_windows above means OWNED: every entry carries an ownership token that was attached and read
+# back, and _ours_now re-checks that token before anything may act. This registry is the opposite - a
+# window that was already on the desktop when "open <app>" was asked for, which open_app selected and
+# brought to the front. The assistant did not create it, so it has NO token and never gets one.
+#
+# What a record here is worth, exactly: a handle number plus the app it matched. That is NOT an
+# identity. Windows reuses handle numbers, so a record here can only ever be re-checked by asking
+# whether a window with that number is still open AND still matches the app's title pattern - which a
+# different window could also satisfy. It is deliberately the weakest honest representation, and
+# NOTHING in this slice grants it any power: no ownership check reads it, close_app cannot reach it,
+# and a named click still refuses an app that only appears here. Slice 3 decides what, if anything,
+# non-destructive actions may do with it.
+_found_windows: dict[str, "_FoundWindow"] = {}
+
+
+@dataclass(frozen=True)
+class _FoundWindow:
+    """One window open_app selected but did not create. There is deliberately no token field: a
+    _FoundWindow cannot be mistaken for an _OwnedWindowGroup, by construction rather than by care."""
+    app: str
+    handle: int
+
 
 @dataclass(frozen=True)
 class _OwnedWindowGroup:
@@ -437,6 +461,32 @@ def execute_with_recovery(action: ExecutorAction, confirm: Confirm | None = None
 
 # --- open_app ---------------------------------------------------------------------------
 
+# --- open_app's four outcomes, in words -----------------------------------------------------------
+# "open <app>" means ENSURE THE APP IS AVAILABLE AND IN FRONT, so the four things that can happen have
+# to be told apart. The old single message claimed a launch had failed whenever no NEW window appeared,
+# which is what reported "chrome was started, but no new window appeared within 15 seconds" while
+# Chrome was open the whole time.
+#
+#   we created it            -> "Opened {name}; its window appeared after ...s."   (unchanged, below)
+#   it was already there     -> _ALREADY_OPEN_IN_FRONT
+#   there but not frontable  -> _AVAILABLE_BUT_MINIMIZED / _AVAILABLE_BUT_NOT_FRONTED
+#   genuinely nothing        -> the Verifier's own "no new window appeared" message (unchanged)
+_ALREADY_OPEN_IN_FRONT = "{name} was already open, so I brought it to the front instead of opening another."
+# A launch DID happen and a single usable window is now there, but nothing proves we made it - a
+# launcher that hands off to a running process ends up here. Reporting it as created would be a lie,
+# and it is the sentence close_app's later refusal has to be consistent with.
+_OPENED_BUT_NOT_PROVABLY_MINE = ("{name} is open and in front. I can't prove I'm the one who opened "
+                                 "that window, so I won't close it automatically.")
+_AVAILABLE_BUT_MINIMIZED = ("{name} is already open but minimized, so I couldn't bring it to the "
+                            "front. Bring it back up and say that again.")
+_AVAILABLE_BUT_NOT_FRONTED = ("{name} is already open, but Windows wouldn't bring it to the front{why}. "
+                              "It's running - put it in front yourself if you need it there.")
+# Deferred, not solved: see _prepare_open_app. Says the count, activates none, launches nothing, asks
+# nothing - choosing between windows the user already had open is Slice 3's problem at the earliest.
+_MANY_ALREADY_OPEN = ("{name} already has {count} windows open and I didn't open any of them, so I "
+                      "don't know which one you mean. I've left them all alone and opened nothing.")
+
+
 def _prepare_open_app(action: ExecutorAction):
     resolution = resolve(action)          # the one target rule; see the note above resolve()
     if isinstance(resolution, Unresolved):
@@ -450,16 +500,46 @@ def _prepare_open_app(action: ExecutorAction):
 
     def run() -> ActionResult:
         try:
-            before = verifier.snapshot_windows(expectation)
+            before, existing = _app_windows_now(expectation)
         except verifier.VerifierUnavailableError as exc:
             return _result(action, False, f"Didn't open {name}: I can't check whether its window appears ({exc}).")
-        try:
-            adapter.launch_app(executable)
-        except adapter.ExecutorAdapterError as exc:
-            return _result(action, False, str(exc))
-        check = verifier.wait_for_new_window(expectation, before)
-        if not check.ok:
-            return _result(action, False, check.message, retryable=check.retryable)
+        if len(existing) > 1:
+            # AMBIGUITY, deferred rather than solved. Nothing is activated and nothing is launched:
+            # choosing between windows the user already had open needs selection machinery that does
+            # not exist, and guessing is how an assistant acts in the wrong window.
+            return _result(action, False, _MANY_ALREADY_OPEN.format(name=name, count=len(existing)),
+                           log_message=f"open_app '{name}': {len(existing)} pre-existing windows, refused")
+        if existing:
+            # ALREADY OPEN. No launch and NO 15-second wait: there is nothing to wait for.
+            return _found_and_fronted(action, name, existing[0], launched=False)
+        return _launch_then_look(action, name, executable, expectation, before)
+
+    return run
+
+
+def _app_windows_now(expectation: WindowExpectation) -> tuple[frozenset[int], list[WindowInfo]]:
+    """(every matching handle, the ones a person could actually act in).
+
+    USABLE means matching the app's title pattern and not cloaked - the same "shown" test
+    verifier.wait_for_new_window already applies to a window that has just appeared, so "is this app
+    available?" gets one answer whether the window is new or was already there.
+
+    Both halves come from one listing, so the handle set and the window list cannot disagree. The
+    handle set is what wait_for_new_window needs as its `before`, and it deliberately includes cloaked
+    windows: a window that is starting up is not usable yet, but it is not new either."""
+    handles = verifier.snapshot_windows(expectation)
+    return handles, [w for w in verifier.find_open(expectation, handles) if not w.cloaked]
+
+
+def _launch_then_look(action: ExecutorAction, name: str, executable: str,
+                      expectation: WindowExpectation, before: frozenset[int]) -> ActionResult:
+    """Nothing usable was open, so launch - and then be honest about what actually appeared."""
+    try:
+        adapter.launch_app(executable)
+    except adapter.ExecutorAdapterError as exc:
+        return _result(action, False, str(exc))
+    check = verifier.wait_for_new_window(expectation, before)
+    if check.ok:
         opened = f"Opened {name}; its window appeared after {check.elapsed_seconds:.1f}s"
         if _remember_opened(name, check.window_handles):
             return _result(action, True, f"{opened}.")
@@ -467,7 +547,67 @@ def _prepare_open_app(action: ExecutorAction):
         # saying so now is better than refusing without explanation when a close is asked for later.
         return _result(action, True, f"{opened}, but I won't be able to close it automatically.")
 
-    return run
+    # No NEW window was proved. That is not the same as "the app isn't there": a launcher that hands
+    # off to a running process, or a window that was created before the snapshot could see it, both
+    # end up here. So look at what IS there before calling it a failure - this is the exact case that
+    # reported "no new window appeared within 15 seconds" while Chrome was open all along.
+    try:
+        _before_again, usable = _app_windows_now(expectation)
+    except verifier.VerifierUnavailableError:
+        return _result(action, False, check.message, retryable=check.retryable)
+    if not usable:
+        return _result(action, False, check.message, retryable=check.retryable)   # a genuine failure
+    if len(usable) > 1:
+        return _result(action, False, _MANY_ALREADY_OPEN.format(name=name, count=len(usable)),
+                       log_message=f"open_app '{name}': {len(usable)} windows after launch, refused")
+    return _found_and_fronted(action, name, usable[0], launched=True)
+
+
+def _found_and_fronted(action: ExecutorAction, name: str, window: WindowInfo, *,
+                       launched: bool) -> ActionResult:
+    """A window we did NOT create: bring it to the front and say exactly what can be proved.
+
+    THE OWNERSHIP BOUNDARY, and the whole point of the slice. This window existed before the command
+    (or appeared without being provably ours), so it gets NO ownership token and never enters
+    _session_windows. _remember_found records only that open_app selected it, in a separate registry
+    that no ownership check reads - so close_app still refuses it, exactly as it refuses any window
+    the user opened themselves."""
+    outcome = _activate_to_front(window.handle)
+    state, detail = outcome.state, outcome.detail
+    if state == _FRONT_IN_FRONT:
+        _remember_found(name, window.handle)
+        return _result(action, True, _ALREADY_OPEN_IN_FRONT.format(name=name) if not launched
+                       else _OPENED_BUT_NOT_PROVABLY_MINE.format(name=name),
+                       log_message=f"open_app '{name}': found an existing window and fronted it "
+                                   f"(launched={launched})")
+    # Available, but not in front. NOT a failure and NOT a full success: the app is there, so saying
+    # it is absent would be false and relaunching it would be wrong.
+    #
+    # Outcome.NEEDS_USER is the closest EXISTING semantics and no new status is invented: the action
+    # cannot finish until the person does something - bring the window up, or click it - which is what
+    # NEEDS_USER has always meant. It also carries the right consequence for free: the model forbids
+    # retryable on it, so nothing loops on an activation Windows has already refused. (Outcome.PARTIAL
+    # would have been the other candidate and is wrong: it requires progress=(sent, total) counting
+    # units of work, which an activation does not have.)
+    _remember_found(name, window.handle)
+    if state == _FRONT_MINIMIZED:
+        reason = _AVAILABLE_BUT_MINIMIZED.format(name=name)
+    elif state == _FRONT_GONE_BEFORE or state == _FRONT_GONE_DURING:
+        # It closed between being listed and being activated. Nothing is available any more, and
+        # relaunching on its own initiative is not this command's job.
+        _forget_found(name)
+        return _result(action, False, f"{name}'s window closed before I could bring it to the front.",
+                       retryable=True, log_message=f"open_app '{name}': the found window closed")
+    elif state == _FRONT_SETTINGS:
+        reason = detail
+    elif state == _FRONT_ERROR:
+        reason = _AVAILABLE_BUT_NOT_FRONTED.format(name=name, why=f" ({detail})")
+    elif state == _FRONT_UNREADABLE_WINDOW or state == _FRONT_UNREADABLE_FOREGROUND:
+        reason = _AVAILABLE_BUT_NOT_FRONTED.format(name=name, why=f" ({detail})")
+    else:
+        reason = _AVAILABLE_BUT_NOT_FRONTED.format(name=name, why="")
+    return _result(action, False, reason, outcome=Outcome.NEEDS_USER,
+                   log_message=f"open_app '{name}': available but not fronted ({state})")
 
 
 def configured_app_names() -> list[str]:
@@ -658,10 +798,40 @@ def _open_session_group(name: str, expectation: WindowExpectation) -> _OwnedWind
     return None
 
 
+def _remember_found(name: str, handle: int) -> None:
+    """Record that open_app selected a window it did NOT create. Grants nothing - see _found_windows.
+
+    One per app, replacing any earlier one: this answers "which window did open_app last put in
+    front?", which is a single answer by definition."""
+    with _session_lock:
+        _found_windows[name] = _FoundWindow(app=name, handle=handle)
+
+
+def _forget_found(name: str) -> None:
+    with _session_lock:
+        _found_windows.pop(name, None)
+
+
+def found_window_handle(name: str) -> int | None:
+    """The handle open_app last selected for `name` without owning it, or None.
+
+    Published for TESTS and for the slice that will decide what may be done with such a window. It is
+    a number, not a permission and not an identity: a caller must still re-check that a window with
+    that number is open and matches the app, and even then it is weaker than ownership. Nothing in the
+    Executor acts on it today."""
+    with _session_lock:
+        found = _found_windows.get(name)
+    return None if found is None else found.handle
+
+
 def forget_session_windows() -> None:
-    """Forget every window opened in this session, so close_app will close none of them."""
+    """Forget every window opened in this session, so close_app will close none of them.
+
+    Also drops the found-window records: they are session state too, and a stale one would outlive the
+    reason it was taken. It never granted anything, so clearing it takes nothing away."""
     with _session_lock:
         _session_windows.clear()
+        _found_windows.clear()
 
 
 # --- click ------------------------------------------------------------------------------
@@ -966,64 +1136,120 @@ def _activate_then(action: ExecutorAction, window: WindowInfo, run):
     return activate_then_run
 
 
-def _bring_owned_window_forward(action: ExecutorAction, window: WindowInfo) -> ActionResult | None:
-    """None once `window` is in front; otherwise the result explaining why nothing was clicked.
+# What happened when ONE window was asked to come to the front. The mechanism's answer, with no
+# message in it, because the two callers say different things about the same outcome: a named click
+# refuses, and open_app reports the app as available but not in front.
+#
+# The two UNREADABLE and the two GONE states are separate only so each caller can keep the exact log
+# line it had before this was extracted - the user-facing text for each pair is identical.
+_FRONT_IN_FRONT = "in_front"
+_FRONT_GONE_BEFORE = "gone_before"              # window_state says it is no longer there
+_FRONT_GONE_DURING = "gone_during"              # it closed during the activation call
+_FRONT_MINIMIZED = "minimized"                  # deliberately NOT restored; see below
+_FRONT_UNREADABLE_WINDOW = "unreadable_window"  # the window's own state could not be read
+_FRONT_UNREADABLE_FOREGROUND = "unreadable_foreground"   # the foreground could not be read
+_FRONT_SETTINGS = "settings"                    # the activation settings are invalid
+_FRONT_ERROR = "error"                          # the activation call itself failed
+_FRONT_REFUSED = "refused"                      # Windows would not give it the foreground
 
-    `window` is the one the ownership token already proved, so no title is matched and no other window
-    can be brought forward by this path. A refusal here is RETRYABLE on purpose: putting a window in
-    front is something the user can do in a second, and the existing retry offer then asks them to."""
-    name = action.target.strip() or "that app"
+
+@dataclass(frozen=True)
+class _Activation:
+    """The result of _activate_to_front. `detail` carries an exception's text and NEVER a window
+    title; `accepted` is what SetForegroundWindow itself claimed, for the log only."""
+    state: str
+    detail: str = ""
+    accepted: bool | None = None
+
+
+def _activate_to_front(handle: int) -> _Activation:
+    """Bring ONE window to the front and verify it got there. THE activation path - there is no other.
+
+    SetForegroundWindow only, exactly as the auto-focus slice decided. A minimized window is REPORTED
+    and never restored: un-minimising someone's window is a change to their desktop that nobody asked
+    for, and the mechanism for it would have to reach a background window, which window_control does
+    not do. Asking is the honest option.
+
+    SetForegroundWindow's own answer is not proof - it can report success and the window still not be
+    in front - so the foreground is read back BY HANDLE until it is ours or the time runs out.
+
+    It returns a state rather than an ActionResult so that one mechanism can serve two intents. The
+    caller owns the wording."""
     try:
-        state = verifier.window_state(window.handle)
+        state = verifier.window_state(handle)
     except verifier.VerifierUnavailableError as exc:
-        return _result(action, False, f"Didn't click: I can't check {name}'s window ({exc}).",
-                       log_message=f"{_TARGET}: the window state could not be read ({exc})")
+        return _Activation(_FRONT_UNREADABLE_WINDOW, str(exc))
     if state is None:
-        return _result(action, False, f"Didn't click: {name}'s window isn't open any more.",
-                       log_message=f"{_TARGET}: the window closed before it could be brought forward")
+        return _Activation(_FRONT_GONE_BEFORE)
     if state.minimized:
-        # Deliberately NOT restored. Un-minimising someone's window is a change to their desktop that
-        # nobody asked for, and the mechanism for it would have to reach a background window, which
-        # window_control does not do. Asking is the honest option.
-        return _result(action, False,
-                       f"{name} is minimized, so I can't click in it. Bring it back up and say that "
-                       f"again.", retryable=True,
-                       log_message=f"{_TARGET}: the owned window is minimized")
-
+        return _Activation(_FRONT_MINIMIZED)
     try:
-        accepted = adapter.activate_window(window.handle)
+        accepted = adapter.activate_window(handle)
     except adapter.WindowGoneError:
-        return _result(action, False, f"Didn't click: {name}'s window isn't open any more.",
-                       log_message=f"{_TARGET}: the window closed during activation")
+        return _Activation(_FRONT_GONE_DURING)
     except adapter.ExecutorAdapterError as exc:
-        return _result(action, False, f"I couldn't bring {name} to the front ({exc}), so I didn't "
-                                      f"click. Put it in front and say that again.", retryable=True,
-                       log_message=f"{_TARGET}: activation failed ({exc})")
-
-    # SetForegroundWindow's own answer is not proof - it can report success and the window still not be
-    # in front - so the foreground is read back by HANDLE until it is ours or the time runs out.
+        return _Activation(_FRONT_ERROR, str(exc))
     try:
         settle, poll = _activation_settings()
     except SettingsError as exc:
-        return _result(action, False, str(exc), log_message=f"{_TARGET}: {exc}")
+        return _Activation(_FRONT_SETTINGS, str(exc))
     deadline = _clock() + settle
     while True:
         try:
             front = verifier.active_target().window
         except verifier.VerifierUnavailableError as exc:
-            return _result(action, False, f"Didn't click: I can't check which window is in front "
-                                          f"({exc}).",
-                           log_message=f"{_TARGET}: the foreground could not be read ({exc})")
-        if front is not None and front.handle == window.handle:
-            return None
+            return _Activation(_FRONT_UNREADABLE_FOREGROUND, str(exc))
+        if front is not None and front.handle == handle:
+            return _Activation(_FRONT_IN_FRONT, accepted=accepted)
         if _clock() >= deadline:
-            return _result(action, False,
-                           f"I couldn't bring {name} to the front, so I didn't click. Windows can "
-                           f"refuse that while another window has it. Put {name} in front and say "
-                           f"that again.", retryable=True,
-                           log_message=f"{_TARGET}: foreground not acquired (accepted={accepted})")
+            return _Activation(_FRONT_REFUSED, accepted=accepted)
         if emergency_stop.wait(poll):      # interruptible: never a raw sleep
             emergency_stop.check()         # raises EmergencyStopError
+
+
+def _bring_owned_window_forward(action: ExecutorAction, window: WindowInfo) -> ActionResult | None:
+    """None once `window` is in front; otherwise the result explaining why nothing was clicked.
+
+    `window` is the one the ownership token already proved, so no title is matched and no other window
+    can be brought forward by this path. A refusal here is RETRYABLE on purpose: putting a window in
+    front is something the user can do in a second, and the existing retry offer then asks them to.
+
+    The mechanism is _activate_to_front; this function is only the click path's wording for it, and
+    every message and log line below is unchanged from the auto-focus slice."""
+    name = action.target.strip() or "that app"
+    outcome = _activate_to_front(window.handle)
+    state, detail = outcome.state, outcome.detail
+    if state == _FRONT_IN_FRONT:
+        return None
+    if state == _FRONT_UNREADABLE_WINDOW:
+        return _result(action, False, f"Didn't click: I can't check {name}'s window ({detail}).",
+                       log_message=f"{_TARGET}: the window state could not be read ({detail})")
+    if state == _FRONT_GONE_BEFORE:
+        return _result(action, False, f"Didn't click: {name}'s window isn't open any more.",
+                       log_message=f"{_TARGET}: the window closed before it could be brought forward")
+    if state == _FRONT_MINIMIZED:
+        return _result(action, False,
+                       f"{name} is minimized, so I can't click in it. Bring it back up and say that "
+                       f"again.", retryable=True,
+                       log_message=f"{_TARGET}: the owned window is minimized")
+    if state == _FRONT_GONE_DURING:
+        return _result(action, False, f"Didn't click: {name}'s window isn't open any more.",
+                       log_message=f"{_TARGET}: the window closed during activation")
+    if state == _FRONT_ERROR:
+        return _result(action, False, f"I couldn't bring {name} to the front ({detail}), so I didn't "
+                                      f"click. Put it in front and say that again.", retryable=True,
+                       log_message=f"{_TARGET}: activation failed ({detail})")
+    if state == _FRONT_SETTINGS:
+        return _result(action, False, detail, log_message=f"{_TARGET}: {detail}")
+    if state == _FRONT_UNREADABLE_FOREGROUND:
+        return _result(action, False, f"Didn't click: I can't check which window is in front "
+                                      f"({detail}).",
+                       log_message=f"{_TARGET}: the foreground could not be read ({detail})")
+    return _result(action, False,
+                   f"I couldn't bring {name} to the front, so I didn't click. Windows can "
+                   f"refuse that while another window has it. Put {name} in front and say "
+                   f"that again.", retryable=True,
+                   log_message=f"{_TARGET}: foreground not acquired (accepted={outcome.accepted})")
 
 
 def _activation_settings() -> tuple[float, float]:

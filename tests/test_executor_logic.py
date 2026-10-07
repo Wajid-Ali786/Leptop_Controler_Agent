@@ -60,7 +60,11 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "CONFIG_PATH", config_path)
     calls = []
     desktop = SimpleNamespace(
-        windows=[WindowInfo(1, "Claude Code Response.txt - Notepad")],  # the user's own, already open
+        # A window the user already had open. Since Slice 2 it deliberately matches NO configured app's
+        # pattern: "open <app>" now means "ensure it is available and in front", so a MATCHING
+        # pre-existing window makes the command reuse it instead of launching. A test that wants that
+        # case says so with already_open(), and a test about launching gets a clear desktop by default.
+        windows=[WindowInfo(1, "Claude Code Response.txt - Visual Studio Code")],
         launches=0,
         window_appears=lambda launch_number: True,
     )
@@ -97,6 +101,15 @@ def open_app(name):
 
 def launches(world):
     return [call for call in world.calls if call[0] == "launch"]
+
+
+def already_open(world, title="Claude Code Response.txt - Notepad", handle=1):
+    """Put a window the USER already had open on the fake desktop, matching an app's pattern.
+
+    Slice 2 made this a meaningful precondition rather than background scenery: "open <app>" reuses
+    such a window instead of launching. Returns the handle so a test can name it."""
+    world.desktop.windows.append(WindowInfo(handle, title))
+    return handle
 
 
 # --- Happy path: safety, launch, then the Verifier confirms the window ---

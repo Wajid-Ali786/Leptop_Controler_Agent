@@ -122,8 +122,8 @@ def test_exact_hwnd_is_no_longer_trusted_once_the_window_object_is_gone(world):
 def test_a_reused_handle_no_longer_singles_out_a_victim(world):
     """Formerly test_a_reused_handle_is_preferred_over_an_untouched_stranger, which found the defect hit
     exactly the window holding the recycled number. Now neither window is touched."""
-    bystander = world.desktop.add("Untitled - Notepad", "Notepad")
     open_app("notepad")
+    bystander = world.desktop.add("Untitled - Notepad", "Notepad")   # after the open, since Slice 2
     [handle] = owned_handles()
     victim = world.desktop.reuse(handle)
     close_app("notepad")
