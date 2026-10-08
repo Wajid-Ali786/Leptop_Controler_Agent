@@ -575,7 +575,9 @@ def test_the_two_contexts_are_different_types():
     """3 of the brief: an opaque session id can never be handled as a window handle."""
     app_fields = set(executor._AppWindowContext.__dataclass_fields__)
     page_fields = set(executor._BrowserPageContext.__dataclass_fields__)
-    assert app_fields == {"app", "window"}
+    # `owned` joined the app context in Slice 3: the PROVENANCE of the window, so the confirmation can
+    # say whether the assistant opened it. It is not a permission and not a handle.
+    assert app_fields == {"app", "window", "owned"}
     assert page_fields == {"session_id", "page_id"}
     assert not app_fields & page_fields, "no field is shared, so neither can stand in for the other"
     assert "handle" not in " ".join(page_fields)
@@ -608,9 +610,9 @@ def test_the_app_context_uses_the_one_uia_path(world):
     calls = []
     real = executor._prepare_target_click
 
-    def recording(action, target, observed):
+    def recording(action, target, observed, context=None):
         calls.append(target.name)
-        return real(action, target, observed)
+        return real(action, target, observed, context)
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(executor, "_prepare_target_click", recording)

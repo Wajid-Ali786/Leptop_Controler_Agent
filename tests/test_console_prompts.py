@@ -26,11 +26,12 @@ import inspect
 import pytest
 
 from app import console
-from app.brain.models import Intent, NeedsClarification, NotACommand, OpenAppArgs, Understood
+from app.brain.models import (CloseAppArgs, Intent, NeedsClarification, NotACommand, OpenAppArgs,
+                              Understood)
 from app.console import (ABANDON_WORDS, CLARIFICATION, CLOSED_QUESTION, FREE_TEXT, Answer,
                          PendingCommand, Prompts, Status, classify_answer, handle_typed_line,
                          run_console)
-from app.executor.models import ActionResult, ExecutorAction, OPEN_APP
+from app.executor.models import ActionResult, CLOSE_APP, ExecutorAction, OPEN_APP
 from app.planner.models import MAX_BRAIN_CALLS, TurnContext
 from app.safety.models import Action, RiskAssessment, RiskLevel
 
@@ -882,8 +883,16 @@ def test_one_layer_owns_the_reporting():
     """1, structurally. run_console writes every reply message, so nothing below it may write the same
     message as well. _offer_correction must not write outcome.message."""
     source = inspect.getsource(console._offer_correction)
-    assert "prompts.write(outcome.message)" not in source, (
-        "two layers report the same outcome again")
+    assert source.count("prompts.write(outcome.message)") == 1, (
+        "the reason is reported more than once, or not at all, by _offer_correction")
+    # AMENDED BY THE SLICE 3 SMOKE FIX. The original claim was "_offer_correction never writes",
+    # which removed the duplicate but also removed the only report that came BEFORE the correction
+    # prompt - so the reason arrived after the question about it. It now writes exactly once, and
+    # only on the path where a question follows; every other path leaves the reporting to
+    # run_console. Still exactly one report either way, which the ordering tests below check
+    # behaviourally.
+    before_prompt = source.index("prompts.write(outcome.message)") < source.index("CORRECTION_PROMPT")
+    assert before_prompt, "the reason is written after the prompt that asks about it"
     assert "write(reply.message)" in inspect.getsource(run_console)
 
 
@@ -932,7 +941,13 @@ def test_a_one_step_plan_reports_its_own_reason_as_the_reply(monkeypatch):
 
 
 def test_the_reply_of_a_failed_one_step_plan_still_explains_itself():
-    """The same invariant at the value, not the printout - this is what voice speaks."""
+    """The same invariant at the value, not the printout - this is what voice speaks.
+
+    SCOPED BY THE SLICE 3 SMOKE FIX: it holds on every path where nothing else has reported the
+    reason. When a correction IS offered and then declined, the reason was printed immediately above
+    that prompt and the closing line is CORRECTION_DECLINED instead, so it is not repeated - see
+    test_the_reason_is_still_reported_exactly_once. The trade-off, named rather than hidden: on that
+    one path app/voice_console.py speaks the closing line, having printed the reason."""
     executed = []
 
     def deny(action, confirm=None, offer_retry=None, *, risk_floor=RiskLevel.LOW):
@@ -941,7 +956,8 @@ def test_the_reply_of_a_failed_one_step_plan_still_explains_itself():
                             "notepad is open, but I didn't open it, so I left it alone.")
 
     import app.console as c
-    script = Script("yes", "")
+    # no budget to replan, so no correction is offered and the reply is the only report there is
+    script = Script("yes")
     prompts = Prompts(read=script.read, write=script.write, pending=PendingCommand())
     saved = c.execute_with_recovery
     c.execute_with_recovery = deny
@@ -951,7 +967,13 @@ def test_the_reply_of_a_failed_one_step_plan_still_explains_itself():
     finally:
         c.execute_with_recovery = saved
     assert executed, "nothing ran, so this proves nothing"
-    assert "I didn't open it" in reply.message, reply.message
+    # The reason reached the USER exactly once. On this path a correction was offered, so it was
+    # printed immediately above that prompt and the reply's closing line does not repeat it.
+    said = [line for line in script.lines if "I didn't open it" in line]
+    assert len(said) == 1, script.lines
+    assert reply.message == console.CORRECTION_DECLINED, reply.message
+    assert reply.result is not None and "I didn't open it" in reply.result.message, (
+        "the reason must still be on the result, for any caller that needs it")
 
 
 # --- 2. A short typo became a command attempt ---------------------------------------------------------
@@ -1369,3 +1391,188 @@ def test_the_retry_offer_is_untouched_by_the_suppression(monkeypatch):
     script = Script(LOOSE, "yes", "no", "", "exit")
     run_console(read=script.read, write=script.write, focus=NoFocus())
     assert any(prompt.startswith("Try again?") for prompt in script.asked), script.asked
+
+
+# ======================================================================================================
+# THE ORDERING REGRESSION THE SLICE 3 SMOKE FOUND
+#
+# Observed four times on the real console:
+#
+#     Proceed? Type yes to run it, or cancel: yes
+#     Tell me what to do differently, or press Enter to leave it: click Sign login
+#     I couldn't find anything called 'Sign in' in that window.
+#
+# The reason came AFTER the question about it. Cause: the "printed twice" fix made run_console the
+# single owner of reply reporting, and _run_plan's ONE-STEP branch returns the step's reply unchanged
+# without printing it - so for a one-step plan nothing was reported before _offer_correction asked.
+# Multi-step plans were never affected: they print the failing step in sequence.
+#
+# The fix is ordering, not eligibility. A target name that was not found IS correctable - the owner's
+# own smoke proved rewording helps - so nothing new joins NO_CORRECTION_AFTER.
+# ======================================================================================================
+
+class Transcript(Script):
+    """Script, plus ONE ordered record of everything the user saw, writes and prompts interleaved.
+
+    The regression is invisible to separate `lines` and `asked` lists: both contained the right
+    strings, in the wrong order relative to each other."""
+
+    def __init__(self, *answers):
+        super().__init__(*answers)
+        self.events = []
+
+    def read(self, prompt=""):
+        self.events.append(("ask", prompt))
+        return super().read(prompt)
+
+    def write(self, text=""):
+        self.events.append(("say", str(text)))
+        return super().write(text)
+
+    def index_of_say(self, needle):
+        return next((i for i, (kind, text) in enumerate(self.events)
+                     if kind == "say" and needle in text), None)
+
+    def index_of_ask(self, needle):
+        return next((i for i, (kind, text) in enumerate(self.events)
+                     if kind == "ask" and needle in text), None)
+
+
+NOT_FOUND = "I couldn't find anything called 'Sign in' in that window."
+
+
+def failing_executor(message=NOT_FOUND, *, fail_target="notepad"):
+    def executor(action, confirm=None, offer_retry=None, *, risk_floor=RiskLevel.LOW):
+        if action.target == fail_target or fail_target is None:
+            return ActionResult(action, False, message)
+        return ActionResult(action, True, f"did {action.kind} {action.target}")
+    return executor
+
+
+def test_the_failure_reason_is_reported_before_the_correction_prompt(monkeypatch):
+    """1. THE REGRESSION, at the owner's exact shape: a one-step plan whose only step failed."""
+    monkeypatch.setattr(console.interpreter, "interpret", Brainless(understood()))
+    monkeypatch.setattr(console, "execute_with_recovery", failing_executor())
+    script = Transcript(LOOSE, "yes", "", "exit")
+    run_console(read=script.read, write=script.write, focus=NoFocus())
+
+    reason = script.index_of_say(NOT_FOUND)
+    prompt = script.index_of_ask(console.CORRECTION_PROMPT)
+    assert reason is not None, script.events
+    assert prompt is not None, "the premise: this failure IS still offered a correction"
+    assert reason < prompt, (
+        f"the reason was reported AFTER the correction prompt:\n"
+        + "\n".join(f"  {kind}: {text}" for kind, text in script.events))
+
+
+def test_the_reason_is_still_reported_exactly_once(monkeypatch):
+    """1. Fixing the order must not bring back the duplicate the previous fix removed."""
+    monkeypatch.setattr(console.interpreter, "interpret", Brainless(understood()))
+    monkeypatch.setattr(console, "execute_with_recovery", failing_executor())
+    script = Transcript(LOOSE, "yes", "", "exit")
+    run_console(read=script.read, write=script.write, focus=NoFocus())
+    said = [text for kind, text in script.events if kind == "say" and NOT_FOUND in text]
+    assert len(said) == 1, said
+
+
+def test_a_multi_step_plan_was_never_affected_and_still_is_not(monkeypatch):
+    """1. The regression guard for the half that always worked: the failing step prints in sequence."""
+    monkeypatch.setattr(console.interpreter, "interpret",
+                        Brainless(understood(open_notepad(), open_notepad())))
+    seen = []
+
+    def one_then_fail(action, confirm=None, offer_retry=None, *, risk_floor=RiskLevel.LOW):
+        seen.append(action.target)
+        if len(seen) == 1:
+            return ActionResult(action, True, "did it")
+        return ActionResult(action, False, NOT_FOUND)
+
+    monkeypatch.setattr(console, "execute_with_recovery", one_then_fail)
+    script = Transcript(LOOSE, "yes", "", "exit")
+    run_console(read=script.read, write=script.write, focus=NoFocus())
+    reason = script.index_of_say(NOT_FOUND)
+    prompt = script.index_of_ask(console.CORRECTION_PROMPT)
+    assert reason is not None and prompt is not None
+    assert reason < prompt, script.events
+    assert len([t for k, t in script.events if k == "say" and NOT_FOUND in t]) == 1
+
+
+def test_an_ownership_refusal_is_reported_before_any_correction_prompt(monkeypatch):
+    """1, the owner's second case: `close chrome` refusing for want of ownership. Same code path, so
+    the same ordering - and the ownership REASON is what has to be visible first."""
+    refusal = ("I only close windows I opened in this session. 1 chrome window is open, but I didn't "
+               "open it, so I left it alone.")
+    monkeypatch.setattr(console.interpreter, "interpret",
+                        Brainless(understood(Intent(CLOSE_APP, CloseAppArgs("chrome"),
+                                                    why="you asked", risk_floor=RiskLevel.LOW))))
+    monkeypatch.setattr(console, "execute_with_recovery",
+                        failing_executor(refusal, fail_target="chrome"))
+    script = Transcript("could you close chrome for me", "yes", "", "exit")
+    run_console(read=script.read, write=script.write, focus=NoFocus())
+    reason = script.index_of_say(refusal)
+    prompt = script.index_of_ask(console.CORRECTION_PROMPT)
+    assert reason is not None, script.events
+    if prompt is not None:
+        assert reason < prompt, script.events
+    assert len([t for k, t in script.events if k == "say" and refusal in t]) == 1
+
+
+@pytest.mark.parametrize("status", sorted(s.value for s in console.NO_CORRECTION_AFTER))
+def test_the_excluded_statuses_are_unchanged(status):
+    """1. "Statuses already in NO_CORRECTION_AFTER stay excluded" - and nothing new joined them.
+    A target name that was not found is Status.RAN with a failed result, and it stays correctable,
+    because the owner's own smoke showed rewording working."""
+    assert set(console.NO_CORRECTION_AFTER) == {Status.DENIED, Status.STOPPED,
+                                                Status.NOT_HANDED_OVER}
+    assert Status.RAN not in console.NO_CORRECTION_AFTER
+
+
+def test_a_denied_action_still_reports_once_and_asks_nothing(monkeypatch):
+    """1. The ordering fix must not start asking after a denial, which Slice 1's follow-up stopped."""
+    monkeypatch.setattr(console.interpreter, "interpret", Brainless(understood()))
+    monkeypatch.setattr(console, "execute_with_recovery", _denying_executor())
+    script = Transcript(LOOSE, "yes", "exit")
+    run_console(read=script.read, write=script.write, focus=NoFocus())
+    assert script.index_of_ask(console.CORRECTION_PROMPT) is None, script.events
+    assert len([t for k, t in script.events if k == "say" and "did not confirm" in t]) == 1
+
+
+# --- the owner's `click Sign login`, traced -----------------------------------------------------------
+
+def test_a_command_typed_at_the_correction_prompt_is_queued_not_consumed(monkeypatch):
+    """THE TRACE the owner asked for. `click Sign login` at the correction prompt was NOT used as
+    correction text: the deterministic parser recognises "click", so Slice 1's handoff queued it and
+    the outer loop ran it as a NEW root command. The plan that appeared immediately afterwards was
+    that command's own plan, with a fresh Brain allowance - not a re-plan of the failed one.
+
+    Pinned because it is the behaviour that made the prompt useful in the real session."""
+    seen = []
+    real = console.handle_typed_line
+
+    def watched(text, context, prompts, **kwargs):
+        seen.append(text)
+        return real(text, context, prompts, **kwargs)
+
+    brain = Brainless(understood(), NotACommand(message="no"))
+    monkeypatch.setattr(console, "handle_typed_line", watched)
+    monkeypatch.setattr(console.interpreter, "interpret", brain)
+    monkeypatch.setattr(console, "execute_with_recovery", failing_executor())
+    script = Transcript(LOOSE, "yes", "click Sign login", "exit")
+    assert run_console(read=script.read, write=script.write, focus=NoFocus()) == 0
+
+    assert seen == [LOOSE, "click Sign login"], seen
+    assert seen.count("click Sign login") == 1, "it ran more than once"
+    assert brain.calls == 2, "one for the plan, one for the queued command - not a replan as well"
+    # and the reason for the ORIGINAL failure still came first
+    assert script.index_of_say(NOT_FOUND) < script.index_of_ask(console.CORRECTION_PROMPT)
+
+
+def test_free_text_at_the_correction_prompt_is_still_a_correction(monkeypatch):
+    """...and the other half: prose there is still the correction, so the prompt keeps its purpose."""
+    brain = Brainless(understood(), understood())
+    monkeypatch.setattr(console.interpreter, "interpret", brain)
+    monkeypatch.setattr(console, "execute_with_recovery", failing_executor())
+    script = Transcript(LOOSE, "yes", "the other one", "cancel", "exit")
+    run_console(read=script.read, write=script.write, focus=NoFocus())
+    assert brain.calls == 2, "the correction did not reach the provider"
+    assert script.asked.count(console.PROCEED_PROMPT) == 2, "no replacement plan was offered"

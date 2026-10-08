@@ -59,8 +59,17 @@ CONFIG = (
     "  app_windows:\n"
     '    notepad: "Notepad$"\n'
     '    chrome: "Chrome$"\n'
+    # Needed by tests/test_found_window_click.py, which borrows this fixture to run a whole named
+    # click through it. Harmless here: Slice 2's own tests never reach the observation layer.
+    "observation:\n"
+    "  snapshot_timeout_seconds: 2.0\n"
 )
 NEW_TITLES = {"notepad.exe": "Untitled - Notepad", "chrome.exe": "New Tab - Google Chrome"}
+# The top-level window class and the owning executable: the structural fingerprint Slice 3 records for
+# a found window and re-checks before clicking in it. Real values, so the fake cannot be kinder than
+# Windows - "Chrome_WidgetWin_1" is what a real Chrome frame reports.
+CLASSES = {"chrome.exe": "Chrome_WidgetWin_1", "notepad.exe": "Notepad"}
+CHROME_CLASS = CLASSES["chrome.exe"]
 CONSOLE = 7           # stands in for "something else is in front"
 USERS_CHROME = 11     # a Chrome window the user already had open
 
@@ -87,6 +96,10 @@ def world(tmp_path, monkeypatch):
         refuse_tags=set(),
         activations=[],
         next_handle=1000,
+        # handle -> owning executable, read back by verifier.process_name. Faked here because it is a
+        # REAL cross-process Win32 read (OpenProcess + QueryFullProcessImageNameW) that is not yet
+        # centrally isolated, and an offline test must not make it.
+        processes={CONSOLE: "python.exe"},
     )
 
     def exists(handle):
@@ -97,7 +110,9 @@ def world(tmp_path, monkeypatch):
         desktop.launches += 1
         if desktop.window_appears:
             desktop.next_handle += 1
-            desktop.windows.append(WindowInfo(desktop.next_handle, NEW_TITLES[executable]))
+            desktop.windows.append(WindowInfo(desktop.next_handle, NEW_TITLES[executable],
+                                              CLASSES[executable]))
+            desktop.processes[desktop.next_handle] = executable
         return 4242
 
     def activate_window(handle):
@@ -141,6 +156,8 @@ def world(tmp_path, monkeypatch):
                                               refuse=desktop.refuse_tags)
     monkeypatch.setattr(verifier_adapter, "list_windows", lambda: list(desktop.windows))
     monkeypatch.setattr(verifier_adapter, "list_child_windows", lambda handle: [])
+    monkeypatch.setattr(verifier_adapter, "process_image_name",
+                        lambda handle: desktop.processes.get(handle))
     monkeypatch.setattr(verifier_adapter, "window_state", window_state)
     monkeypatch.setattr(verifier_adapter, "active_target", active_target)
     monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
@@ -163,9 +180,11 @@ def launches(world):
     return [call for call in world.calls if call[0] == "launch"]
 
 
-def already_open(world, title="Google Chrome", handle=USERS_CHROME, **kwargs):
-    """A window the USER already had open, matching the app's pattern."""
-    world.desktop.windows.append(WindowInfo(handle, title, **kwargs))
+def already_open(world, title="Google Chrome", handle=USERS_CHROME, *, process="chrome.exe",
+                 class_name=CHROME_CLASS, **kwargs):
+    """A window the USER already had open, matching the app's pattern, with a real-shaped fingerprint."""
+    world.desktop.windows.append(WindowInfo(handle, title, class_name, **kwargs))
+    world.desktop.processes[handle] = process
     return handle
 
 
@@ -297,7 +316,8 @@ def handoff(world, monkeypatch, *, windows=1):
     def hands_off(executable):
         world.calls.append(("launch", executable))
         for handle in handles:
-            world.desktop.windows = [w if w.handle != handle else WindowInfo(handle, w.title)
+            world.desktop.windows = [w if w.handle != handle
+                                     else WindowInfo(handle, w.title, w.class_name)
                                      for w in world.desktop.windows]
         return 4242
 
@@ -426,7 +446,7 @@ def test_the_existing_activation_path_is_reused_not_duplicated():
                              for call in ast.walk(node)))
     assert callers == ["_activate_to_front"], callers
     assert "_activate_to_front(window.handle)" in code_of(logic._found_and_fronted)
-    assert "_activate_to_front(window.handle)" in code_of(logic._bring_owned_window_forward)
+    assert "_activate_to_front(window.handle)" in code_of(logic._bring_window_forward)
 
 
 def test_a_minimized_existing_window_is_reported_and_never_restored(world):
@@ -486,11 +506,15 @@ def test_the_found_registry_is_structurally_separate_from_ownership(world):
     found = logic._found_windows["chrome"]
     assert not hasattr(found, "token"), "a found window has somewhere to put a token"
     assert type(found) is not logic._OwnedWindowGroup
-    # and nothing in the ownership path consults it
+    assert "token" not in logic._FoundWindow.__dataclass_fields__
+    # SLICE 3 REWRITE. _context_for_named_click now DOES consult the registry - that is the slice -
+    # so it leaves this list. Every OWNERSHIP path still must not, and that is the enduring claim:
+    # ownership is unchanged, and closing is still gated on it.
     for function in (logic._ours_now, logic._open_session_group, logic._prepare_close_app,
-                     logic._context_for_named_click):
+                     logic._prepare_window_control):
         assert "_found_windows" not in code_of(function), function.__name__
         assert "found_window_handle" not in code_of(function), function.__name__
+        assert "_found_now" not in code_of(function), function.__name__
 
 
 def test_ours_now_is_unchanged():
@@ -514,23 +538,33 @@ def test_the_found_record_is_dropped_when_the_session_is_forgotten(world):
 # LATER COMMANDS (matrix 21) - THE FACT SLICE 3 NEEDS
 # ======================================================================================================
 
-def test_after_an_already_open_success_a_named_click_still_refuses(world):
-    """21, AND THE PRIMARY OUTPUT OF THIS SLICE.
+def test_after_an_already_open_success_a_named_click_can_use_the_found_window(world):
+    """21, INVERTED BY SLICE 3, which is the whole point of that slice.
 
-    It CANNOT find the window, and here is exactly why: _context_for_named_click answers "where may I
-    click?" from _session_windows, which means OWNED. A found window is not in there and deliberately
-    cannot be, so a named click refuses with the same sentence it would use for an app that was never
-    opened at all.
+    Slice 2 pinned the opposite: a found window could not be clicked, because _context_for_named_click
+    answered "where may I click?" from _session_windows, which means OWNED. Slice 3 decided that
+    ownership is the gate for CLOSING, not for clicking, so the found window is now a context.
 
-    That refusal is correct today - clicking in a window whose provenance is unproven is precisely the
-    authorization question Slice 3 exists to decide - and it is the one thing "open chrome" still does
-    not unlock. open_app's own job is done: the app is available and in front."""
+    What did NOT change: it is not owned, it is re-checked structurally before the click, and the
+    confirmation says the assistant did not open it. tests/test_found_window_click.py holds all of
+    that; this one holds the chooser's answer."""
     already_open(world)
     assert open_app().ok
     context = logic._context_for_named_click("chrome")
-    assert isinstance(context, str), f"a found window became clickable: {context!r}"
-    assert "I haven't opened chrome in this session" in context
-    assert "prove" in context
+    assert not isinstance(context, str), f"the found window is still refused: {context!r}"
+    assert context.app == "chrome"
+    assert context.window.handle == USERS_CHROME
+    assert context.owned is False, "a found window was reported as owned"
+    # The compensating guarantee - that USING this context demands a MEDIUM confirmation naming the
+    # window - is deliberately NOT asserted here. A first draft asserted it by building its own
+    # safety Action from the risk constant, which made the test pass even with the confirmation
+    # deleted from production: a tautology, and exactly the "loosened test that proves nothing" the
+    # brief warned about. It lives in tests/test_found_window_click.py, against the object production
+    # actually builds:
+    #   test_the_prepared_click_in_a_found_window_demands_a_medium_confirmation
+    #   test_the_confirmation_names_the_window_and_says_whose_it_is
+    #   test_every_existing_denial_form_still_denies_in_a_found_window
+    # This test's own subject is the chooser's answer, and that is all it claims.
 
 
 def test_a_window_the_assistant_opened_is_still_clickable(world):
@@ -550,7 +584,11 @@ def test_what_a_found_record_is_worth_is_a_handle_and_nothing_more(world):
     handle = logic.found_window_handle("chrome")
     assert handle == USERS_CHROME
     fields = {field for field in logic._FoundWindow.__dataclass_fields__}
-    assert fields == {"app", "handle"}, fields
+    # Slice 3 added the structural fingerprint - executable and top-level window class - so a handle
+    # NUMBER alone never decides where a click goes. Still no token: that is what ownership means and
+    # a found window must never acquire it.
+    assert fields == {"app", "handle", "process", "class_name"}, fields
+    assert "token" not in fields
 
 
 # ======================================================================================================

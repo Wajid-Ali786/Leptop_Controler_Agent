@@ -92,8 +92,28 @@ Current work: USABILITY PLAN (started 2026-10-06). Phase 5 and Phase 6 work is S
     OWNED window for an app the user already has open. For Chrome specifically that means `close
     chrome` will keep refusing and named clicks in the owner's Chrome stay blocked until Slice 3
     decides what an explicitly selected but unowned window may be used for.
-  Slices 3-5 (per-capability authorization, named targets for type/refresh/scroll/shortcut, assistant
-    browser navigation): NOT STARTED.
+  Slice 3 — per-capability authorization: DONE (2026-10-07). Ownership is no longer the gate for
+    CLICKING; it remains the gate for CLOSING. close_app and window_control close are untouched and
+    still require the token. click_target now accepts a named-or-FOUND window, behind the existing
+    MEDIUM confirmation, which is now the authorization and therefore always names the window and says
+    whether the assistant opened it or only found it ("the chrome window I opened (...)" vs "a chrome
+    window I did NOT open (...)"). Every click result names the window it acted in, so provenance
+    stays visible now that it is not a gate.
+    A found window participates in the existing context chooser as an ordinary candidate: it cannot
+    skip the ambiguity rule, and an OWNED window is always preferred over a found one for the same app.
+    BEFORE a click in a found window, four independent facts are re-checked (after the confirmation,
+    before any activation): the handle is still open, it still matches the app's configured title
+    pattern, it is still the same top-level window class, and it is still the same executable - the
+    same structural evidence _window_control_identity and the refresh path already use, and
+    deliberately NOT the window title. It also refuses if the recorded handle no longer matches the
+    one the confirmation named. What this cannot prove: that it is the same window OBJECT. Windows
+    reuses handle numbers, so a second Chrome window created after the first closed could satisfy all
+    four. Only the ownership token rules that out, which is exactly why a found window may be clicked
+    behind a confirmation and may never be closed. An unreadable executable fails closed.
+    `_ours_now` is unchanged and still requires both of its clauses. The DOM path, type_text,
+    shortcut, scroll and refresh are untouched (Slice 4).
+  Slices 4-5 (named targets for type/refresh/scroll/shortcut, assistant browser navigation):
+    NOT STARTED.
 
 Phase 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE; PAUSED (see Current work above).
   The privacy and test-isolation boundaries required before expanding observation capability

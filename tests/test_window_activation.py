@@ -430,7 +430,7 @@ def test_the_wait_is_bounded_by_its_setting(world, monkeypatch):
     monkeypatch.setattr(executor, "_clock", lambda: next(ticks))
     result = executor.execute(named(), always(True))
     assert not result.ok and world.clicks == []
-    assert "monotonic" not in code_of(executor._bring_owned_window_forward)
+    assert "monotonic" not in code_of(executor._bring_window_forward)
     assert "activation_settle_seconds" in code_of(executor._activation_settings)
 
 
@@ -472,7 +472,7 @@ def test_the_wait_is_interruptible_rather_than_a_raw_sleep():
     checked across BOTH halves so neither can gain a raw sleep."""
     mechanism = code_of(executor._activate_to_front)
     assert "emergency_stop.wait" in mechanism
-    for code in (mechanism, code_of(executor._bring_owned_window_forward)):
+    for code in (mechanism, code_of(executor._bring_window_forward)):
         assert "time.sleep" not in code and "sleep(" not in code
 
 
@@ -520,7 +520,7 @@ def test_nothing_restores_a_background_window(world):
     state_reader = code_of_named(EXECUTOR_ADAPTER, "request_window_state")
     assert "PostMessageW" in state_reader, "window control still posts, and still to the active window"
     assert "SetForegroundWindow" not in state_reader
-    activation = code_of(executor._bring_owned_window_forward)
+    activation = code_of(executor._bring_window_forward)
     for forbidden in ("request_window_state", "restore", "SC_RESTORE", "ShowWindow"):
         assert forbidden not in activation, forbidden
 
@@ -608,7 +608,8 @@ def test_the_named_click_is_still_medium_and_confirmed_once(world):
     assert result.ok
     description, level, confirmed = world.prompts[-1]
     assert level is RiskLevel.MEDIUM and confirmed is True
-    assert description == 'click "Seven" in window "Calculator"'
+    assert description == 'click "Seven" in the calculator window I opened ("Calculator")'
+    assert "I opened" in description, "the prompt no longer names the window's provenance"
     assert len(world.prompts) == 1, "activation must not ask a second time"
 
 
@@ -687,6 +688,6 @@ def test_activation_causes_no_provider_request_and_no_memory_write(world):
 def test_activation_plays_no_audio(world):
     """47. The speaker is not on this path at all."""
     own()
-    code = code_of(executor._bring_owned_window_forward) + code_of(executor._activate_then)
+    code = code_of(executor._bring_window_forward) + code_of(executor._activate_then)
     for forbidden in ("speak", "speaker", "winmm", "play"):
         assert forbidden not in code.lower(), forbidden

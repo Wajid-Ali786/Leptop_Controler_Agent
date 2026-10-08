@@ -481,6 +481,10 @@ CONFIRM_ABANDONED = "Cancelled: I did not do that."
 CONFIRM_ABANDONED_FOR_COMMAND = "Cancelled that; I'll do what you just typed instead."
 RETRY_ABANDONED = "Stopped. I won't try that again."
 CORRECTION_ABANDONED = "Left the plan alone."
+# Said after the correction prompt was offered and declined. It must NOT repeat the failure reason:
+# _offer_correction has just printed that immediately above the prompt, and repeating it here is the
+# duplicate the "printed twice" fix removed.
+CORRECTION_DECLINED = "Left it there."
 CLARIFY_ABANDONED = "Dropped the question, so nothing was done."
 CLARIFY_UNUSABLE = ("That doesn't answer the question - I need the missing detail itself, not yes or no. "
                     "Asking once more:")
@@ -967,9 +971,20 @@ def _offer_correction(context, prompts, focus, interpret, outcome: CommandReply,
         return outcome, session.cancel(context)
     if not context.budget.may_replan or context.pending_plan is None:
         return outcome, context
+    # THE REASON FIRST. A question about a failure is unanswerable until the failure has been
+    # reported, and the "printed twice" fix accidentally removed the only report that came before it:
+    # run_console became the single owner of reply reporting, and a ONE-STEP plan returns its step's
+    # reply unchanged without printing it, so nothing was said before this prompt. (A multi-step plan
+    # was never affected - it prints the failing step in sequence.)
+    #
+    # This is the only place the message is written, and it is written only when a question follows
+    # it, so there is still exactly one report either way.
+    prompts.write(outcome.message)
     correction = _ask_text(prompts, CORRECTION_PROMPT)
     if not correction or not correction.strip():
-        return outcome, session.cancel(context)
+        # The reason is on screen directly above; the closing line must not say it again.
+        return (CommandReply(outcome.status, CORRECTION_DECLINED, outcome.action, outcome.result),
+                session.cancel(context))
     corrected = session.correct_plan(context, correction)
     if isinstance(corrected, LifecycleRefusal):
         return CommandReply(outcome.status, corrected.message, outcome.action, outcome.result), context

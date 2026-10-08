@@ -416,10 +416,20 @@ def test_nothing_opened_yet_refuses_rather_than_guessing(world):
 
 
 def test_a_visible_window_we_did_not_open_is_not_a_target(world):
-    """18 + 2 of the brief: never act in an arbitrary window merely because it is visible."""
+    """18 + 2 of the brief: never act in an arbitrary window merely because it is visible.
+
+    SLICE 3 REWRITE. Unchanged behaviour, changed wording. Ownership stopped being the click gate, so
+    the refusal no longer says "I can't prove it's mine" - it says there is no window to click in at
+    all, which is the truth here: this Calculator is neither owned NOR recorded by open_app. Merely
+    being visible on the desktop has never made a window a target and still does not.
+
+    Strengthened rather than loosened: it now also asserts that NOTHING was confirmed, so a future
+    change that quietly made a visible window clickable behind a prompt would fail here too."""
     result = executor.execute(named(app=APP), always(True))
     assert not result.ok and world.clicks == []
-    assert "prove is mine" in result.message
+    assert "I don't have a window of" in result.message, result.message
+    assert "Open it first" in result.message
+    assert world.prompts == [], "a visible stranger reached the confirmation"
 
 
 def test_a_failed_open_cannot_establish_a_window_for_a_named_click(world):
@@ -522,13 +532,18 @@ def test_the_executor_never_consults_application_aliases_for_a_control(world):
 # =====================================================================================================
 
 def test_a_named_click_is_medium_and_names_the_users_own_word(world):
-    """20. And the prompt is the user's words plus the window - never anything read off the screen."""
+    """20. And the prompt is the user's words plus the window - never anything read off the screen.
+
+    SLICE 3 REWRITE of the expected sentence only. The confirmation now also says WHOSE window it is,
+    because with ownership gone as the click gate this sentence is the authorization. Still MEDIUM,
+    still one prompt, still nothing read off the screen in it."""
     own(APP)
     result = executor.execute(named(), always(True))
     assert result.ok
     description, level, confirmed = world.prompts[-1]
     assert level is RiskLevel.MEDIUM and confirmed is True
-    assert description == 'click "Seven" in window "Calculator"'
+    assert description == 'click "Seven" in the calculator window I opened ("Calculator")'
+    assert "I opened" in description, "the prompt no longer says the assistant opened this window"
 
 
 def test_yes_permits_and_anything_else_denies(world):

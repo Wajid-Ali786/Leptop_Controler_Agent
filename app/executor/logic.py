@@ -202,9 +202,17 @@ _found_windows: dict[str, "_FoundWindow"] = {}
 @dataclass(frozen=True)
 class _FoundWindow:
     """One window open_app selected but did not create. There is deliberately no token field: a
-    _FoundWindow cannot be mistaken for an _OwnedWindowGroup, by construction rather than by care."""
+    _FoundWindow cannot be mistaken for an _OwnedWindowGroup, by construction rather than by care.
+
+    `process` and `class_name` are a STRUCTURAL FINGERPRINT taken when the window was recorded, so
+    that a handle number alone never decides where a click goes. The three fields together are the
+    same evidence _window_control_identity and the refresh path already use - handle, executable,
+    top-level window class - and the title is deliberately absent for the same reason it is absent
+    there: titles change by themselves, and Chrome's changes with every page."""
     app: str
     handle: int
+    process: str | None
+    class_name: str
 
 
 @dataclass(frozen=True)
@@ -575,7 +583,7 @@ def _found_and_fronted(action: ExecutorAction, name: str, window: WindowInfo, *,
     outcome = _activate_to_front(window.handle)
     state, detail = outcome.state, outcome.detail
     if state == _FRONT_IN_FRONT:
-        _remember_found(name, window.handle)
+        _remember_found(name, window)
         return _result(action, True, _ALREADY_OPEN_IN_FRONT.format(name=name) if not launched
                        else _OPENED_BUT_NOT_PROVABLY_MINE.format(name=name),
                        log_message=f"open_app '{name}': found an existing window and fronted it "
@@ -589,7 +597,7 @@ def _found_and_fronted(action: ExecutorAction, name: str, window: WindowInfo, *,
     # retryable on it, so nothing loops on an activation Windows has already refused. (Outcome.PARTIAL
     # would have been the other candidate and is wrong: it requires progress=(sent, total) counting
     # units of work, which an activation does not have.)
-    _remember_found(name, window.handle)
+    _remember_found(name, window)
     if state == _FRONT_MINIMIZED:
         reason = _AVAILABLE_BUT_MINIMIZED.format(name=name)
     elif state == _FRONT_GONE_BEFORE or state == _FRONT_GONE_DURING:
@@ -798,13 +806,47 @@ def _open_session_group(name: str, expectation: WindowExpectation) -> _OwnedWind
     return None
 
 
-def _remember_found(name: str, handle: int) -> None:
-    """Record that open_app selected a window it did NOT create. Grants nothing - see _found_windows.
+def _remember_found(name: str, window: WindowInfo) -> None:
+    """Record that open_app selected a window it did NOT create, with its structural fingerprint.
 
     One per app, replacing any earlier one: this answers "which window did open_app last put in
-    front?", which is a single answer by definition."""
+    front?", which is a single answer by definition. The fingerprint is taken HERE, at the moment the
+    window was observed and fronted, so the check before a later click compares against what was
+    actually seen rather than against whatever happens to hold that handle number by then."""
     with _session_lock:
-        _found_windows[name] = _FoundWindow(app=name, handle=handle)
+        _found_windows[name] = _FoundWindow(app=name, handle=window.handle,
+                                            process=verifier.process_name(window.handle),
+                                            class_name=window.class_name)
+
+
+def _found_now(name: str, expectation: WindowExpectation) -> WindowInfo | None:
+    """The window open_app found for `name`, IF every piece of its structural evidence still holds -
+    otherwise None. Raises VerifierUnavailableError.
+
+    WHAT THIS PROVES: a window with that handle is open, it still matches the app's configured title
+    pattern, it is still owned by the same executable, and it is still the same top-level window class.
+    Four independent facts, none of which is the window's title text.
+
+    WHAT IT CANNOT PROVE: that it is the SAME WINDOW OBJECT. Windows reuses handle numbers, so a
+    second Chrome window created after the first closed could take the number and satisfy all four -
+    it is the same program, the same class, and matches the same pattern. Only the ownership token
+    rules that out, and a found window has none by definition. This is why a found window may be
+    clicked - behind a confirmation that names it - and may never be closed."""
+    with _session_lock:
+        found = _found_windows.get(name)
+    if found is None:
+        return None
+    windows = verifier.find_open(expectation, frozenset({found.handle}))
+    if len(windows) != 1:
+        return None                                   # gone, or no longer this app's kind of window
+    window = windows[0]
+    if window.class_name != found.class_name:
+        return None                                   # the same number, a different kind of window
+    # Fail closed: an executable that could not be read when the window was recorded leaves nothing
+    # to compare, so the window is simply not clickable rather than clickable on weaker evidence.
+    if not found.process or verifier.process_name(window.handle) != found.process:
+        return None
+    return window
 
 
 def _forget_found(name: str) -> None:
@@ -941,7 +983,29 @@ def click_target(target: Target, observed: Observed, confirm: Confirm | None = N
     return _authorize_and_run(action, _prepare_target_click(action, target, observed), confirm, risk_floor)
 
 
-def _prepare_target_click(action: ExecutorAction, target: Target, observed: Observed):
+def _describe_window(window: WindowInfo, context: "_AppWindowContext | None") -> str:
+    """How a window is named to the USER, in the confirmation and in the result, so the two agree.
+
+    THE CONFIRMATION IS NOW THE AUTHORIZATION. With ownership no longer the click gate, this sentence
+    is the only thing between a wrong resolution and a wrong click, so it always names the window and
+    - when a context established provenance - says plainly whether the assistant opened it or merely
+    found it. "did NOT open" is deliberately blunt and deliberately not a synonym of "opened".
+
+    The title is shown because it is what lets a person RECOGNISE the window. It is not what proves
+    identity (that is _found_now's fingerprint) and it is never written to the log.
+
+    `context=None` is the bare click_target() primitive, which has no provenance to report, and keeps
+    exactly the wording it had before this slice."""
+    titled = f'"{window.title}"' if window.title else "no readable title"
+    if context is None:
+        return f'window "{window.title}"' if window.title else "a window with no readable title"
+    if context.owned:
+        return f'the {context.app} window I opened ({titled})'
+    return f'a {context.app} window I did NOT open ({titled})'
+
+
+def _prepare_target_click(action: ExecutorAction, target: Target, observed: Observed,
+                          context: "_AppWindowContext | None" = None):
     if not isinstance(target, Target) or not isinstance(target.name, str) or not target.name.strip():
         return _result(action, False, "I need the name of something to click.")
     if not isinstance(observed, Observed):
@@ -957,7 +1021,7 @@ def _prepare_target_click(action: ExecutorAction, target: Target, observed: Obse
     if window is None:
         return _result(action, False, f"Didn't click '{named}': that window isn't open any more.",
                        log_message=f"{_TARGET}: the window is gone")
-    where = f'window "{window.title}"' if window.title else "a window with no readable title"
+    where = _describe_window(window, context)
     # The prompt names the user's own word for the control and the window it is in. Nothing read off the
     # screen goes in here: the accessible labels that made the match never left the verifier's adapter.
     safety_action = Action(f'click "{named}" in {where}',
@@ -991,7 +1055,10 @@ def _prepare_target_click(action: ExecutorAction, target: Target, observed: Obse
             return _result(action, False, f"Something else is in front of '{named}' now, so I didn't click "
                                           f"it - the click would have gone to the wrong window.",
                            log_message=f"{_TARGET}: another window is in front of it")
-        return _send_click(action, x, y, f'"{named}"', _TARGET)
+        # The result names the window it acted in, so provenance stays VISIBLE even now that it is no
+        # longer a gate. `log_what` is still _TARGET, so neither the control name nor the window title
+        # reaches the log.
+        return _send_click(action, x, y, f'"{named}" in {where}', _TARGET)
 
     return _Prepared(run, safety_action)
 
@@ -1112,24 +1179,54 @@ def _prepare_named_click(action: ExecutorAction):
     # control after the user answers, and sends the one click. The only thing added is one step in
     # front of that run - bringing the owned window forward - which is why Slice 2's preparer is
     # COMPOSED rather than edited: the coordinate click's run must stay exactly as it was.
-    prepared = _prepare_target_click(action, target, found.observed)
+    prepared = _prepare_target_click(action, target, found.observed, context)
     if isinstance(prepared, ActionResult):
         return prepared
-    return _Prepared(_activate_then(action, window, prepared.run), prepared.safety_action)
+    return _Prepared(_activate_then(action, context, prepared.run), prepared.safety_action)
 
 
-def _activate_then(action: ExecutorAction, window: WindowInfo, run):
-    """Run `run` only once the owned window is genuinely in front.
+def _found_still_valid(action: ExecutorAction, context: "_AppWindowContext") -> ActionResult | None:
+    """None if the found window's structural evidence STILL holds; otherwise the refusal.
+
+    Run after the confirmation and before anything is activated or clicked, because that is the window
+    in which the user authorized a click. An owned window does not need this: its token was checked
+    when the context was chosen and the token cannot be inherited by another window."""
+    try:
+        expectation = verifier.expect_window(context.app)
+        window = _found_now(context.app, expectation)
+    except SettingsError as exc:
+        return _result(action, False, str(exc), log_message=f"{_TARGET}: {exc}")
+    except verifier.VerifierUnavailableError as exc:
+        return _result(action, False, f"Didn't click: I can't check {context.app}'s window ({exc}).",
+                       log_message=f"{_TARGET}: the found window could not be re-checked ({exc})")
+    if window is None or window.handle != context.window.handle:
+        return _result(action, False,
+                       f"The {context.app} window I was going to click in isn't the same one any "
+                       f"more, so I didn't click. Say that again and I'll look afresh.",
+                       retryable=True,
+                       log_message=f"{_TARGET}: the found window no longer matches its fingerprint")
+    return None
+
+
+def _activate_then(action: ExecutorAction, context: "_AppWindowContext", run):
+    """Run `run` only once the window is genuinely in front.
 
     WHY THIS IS AFTER THE CONFIRMATION, and must be. The user answers the confirmation in the console,
     so the console has to stay in front until they have typed it - activating the target first would
     take the keyboard away from the very prompt being answered. Afterwards is also the one moment
     Windows is most likely to allow the change at all: our process is the foreground process and it
     just received the last input event, which are two of the documented conditions under which
-    SetForegroundWindow is permitted."""
+    SetForegroundWindow is permitted.
+
+    For a window the assistant only FOUND, the structural fingerprint is re-checked first - before any
+    window is activated - because the confirmation the user just answered named THAT window."""
     def activate_then_run() -> ActionResult:
         emergency_stop.check()
-        refusal = _bring_owned_window_forward(action, window)
+        if not context.owned:
+            refusal = _found_still_valid(action, context)
+            if refusal is not None:
+                return refusal             # nothing activated and nothing clicked
+        refusal = _bring_window_forward(action, context.window)
         if refusal is not None:
             return refusal                 # nothing was clicked, and the result says to try again
         return run()
@@ -1207,12 +1304,15 @@ def _activate_to_front(handle: int) -> _Activation:
             emergency_stop.check()         # raises EmergencyStopError
 
 
-def _bring_owned_window_forward(action: ExecutorAction, window: WindowInfo) -> ActionResult | None:
+def _bring_window_forward(action: ExecutorAction, window: WindowInfo) -> ActionResult | None:
     """None once `window` is in front; otherwise the result explaining why nothing was clicked.
 
-    `window` is the one the ownership token already proved, so no title is matched and no other window
-    can be brought forward by this path. A refusal here is RETRYABLE on purpose: putting a window in
-    front is something the user can do in a second, and the existing retry offer then asks them to.
+    `window` is the EXACT one the caller's context already established - by the ownership token, or by
+    the found window's structural fingerprint re-checked a moment ago - so no title is matched here and
+    no other window can be brought forward by this path. (Renamed from _bring_owned_window_forward in
+    Slice 3: the mechanism never cared about ownership, and the caller now may have either kind.)
+    A refusal here is RETRYABLE on purpose: putting a window in front is something the user can do in
+    a second, and the existing retry offer then asks them to.
 
     The mechanism is _activate_to_front; this function is only the click path's wording for it, and
     every message and log line below is unchanged from the auto-focus slice."""
@@ -1278,9 +1378,15 @@ def _activation_settings() -> tuple[float, float]:
 
 @dataclass(frozen=True)
 class _AppWindowContext:
-    """A window this session opened and can still prove it owns. Resolved through UI Automation."""
+    """A window a named click may act in. Resolved through UI Automation.
+
+    `owned` is the PROVENANCE and it is not a permission: True when the ownership token proves this
+    session created the window, False when open_app only found it already on the desktop. From Slice 3
+    both may be clicked; only an owned one may be closed. The flag exists so the confirmation can say
+    which it is, because that sentence is now what authorizes the click."""
     app: str
     window: WindowInfo
+    owned: bool = True
 
 
 @dataclass(frozen=True)
@@ -1312,11 +1418,17 @@ def _context_for_named_click(app: str) -> "_AppWindowContext | _BrowserPageConte
 
     with _session_lock:
         opened = {name: list(groups) for name, groups in _session_windows.items() if groups}
-    if app and app not in opened:
-        return (f"I haven't opened {app} in this session, so I don't have a window of it I can prove "
-                f"is mine to click in. Open it first.")
+        found_apps = sorted(_found_windows)
+    # A window open_app FOUND is a candidate here from Slice 3 on, and it is a candidate on exactly
+    # the same terms as any other - it does not get its own shortcut and it cannot skip the ambiguity
+    # rule below. What it does NOT become is ownership proof: see the two branches further down, where
+    # an owned window is preferred and a found one is re-checked structurally before it is used.
+    available = sorted(set(opened) | set(found_apps))
+    if app and app not in available:
+        return (f"I don't have a window of {app} to click in - I haven't opened it in this session "
+                f"and open_app hasn't put one in front. Open it first.")
     if not app:
-        candidates = sorted(opened) + ([ASSISTANT_BROWSER] if sessions else [])
+        candidates = available + ([ASSISTANT_BROWSER] if sessions else [])
         if not candidates:
             return ("I haven't opened anything yet in this session, so I don't know which window you "
                     "mean. Open the app first, or say which app to click in.")
@@ -1327,8 +1439,12 @@ def _context_for_named_click(app: str) -> "_AppWindowContext | _BrowserPageConte
                 return (f"I've opened more than one thing in this session "
                         f"({', '.join(candidates)}), so I don't know which one you mean. Say which - "
                         f"for example 'in {ASSISTANT_BROWSER}', or the app's name.")
-            return (f"I've opened more than one app in this session ({', '.join(sorted(opened))}), so "
-                    f"I don't know which one you mean. Say which app to click in.")
+            if set(candidates) <= set(opened):
+                return (f"I've opened more than one app in this session ({', '.join(candidates)}), so "
+                        f"I don't know which one you mean. Say which app to click in.")
+            # At least one candidate is a window we only found, so "opened" would be untrue.
+            return (f"More than one app is available to click in ({', '.join(candidates)}), so I "
+                    f"don't know which one you mean. Say which app to click in.")
         if candidates == [ASSISTANT_BROWSER]:
             session_id, page_id = sessions[0]
             return _BrowserPageContext(session_id=session_id, page_id=page_id)
@@ -1336,18 +1452,37 @@ def _context_for_named_click(app: str) -> "_AppWindowContext | _BrowserPageConte
 
     try:
         expectation = verifier.expect_window(app)
-        windows = [window for group in opened[app] for window in _ours_now(group, expectation)]
     except SettingsError as exc:
         return str(exc)
+
+    # OWNED FIRST, always. A window the ownership token proves is preferred over one we merely found,
+    # so "in chrome" can never quietly pick a stranger while a window we opened is sitting there.
+    if app in opened:
+        try:
+            windows = [window for group in opened[app] for window in _ours_now(group, expectation)]
+        except verifier.VerifierUnavailableError as exc:
+            return f"I can't check {app}'s windows right now ({exc})."
+        if len(windows) > 1:
+            return (f"I have {len(windows)} {app} windows open from this session, so I don't know "
+                    f"which one you mean.")
+        if windows:
+            return _AppWindowContext(app=app, window=windows[0], owned=True)
+
+    # Then the ONE window open_app recorded, if its structural evidence still holds. _found_now looks
+    # only at that recorded handle - it never scans for "a chrome window", so this cannot silently
+    # select a different one.
+    try:
+        window = _found_now(app, expectation)
     except verifier.VerifierUnavailableError as exc:
         return f"I can't check {app}'s windows right now ({exc})."
-    if not windows:
+    if window is not None:
+        return _AppWindowContext(app=app, window=window, owned=False)
+
+    if app in opened:
         return (f"I opened {app} earlier, but I can't find a window of it that I can still prove is "
                 f"mine, so I won't click in it.")
-    if len(windows) > 1:
-        return (f"I have {len(windows)} {app} windows open from this session, so I don't know which "
-                f"one you mean.")
-    return _AppWindowContext(app=app, window=windows[0])
+    return (f"The {app} window I had isn't there any more - it closed, or it isn't the same window. "
+            f"Say 'open {app}' again.")
 
 
 # --- click a control the user named, in the assistant's own browser (Phase 5 DOM Slice 2) -------------

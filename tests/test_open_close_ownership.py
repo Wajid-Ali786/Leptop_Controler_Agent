@@ -276,10 +276,18 @@ def test_previous_action_context_cannot_be_used_as_ownership_proof(world, brain)
     assert context.previous_action_context.safe_target == "notepad"
     users_notepad(world)
     assert owned() == [], "nothing is actually owned"
+    screen = Screen()
     reply, _context = console.handle_typed_line(
         "could you close it please", context,
-        console.Prompts(read=Script("yes", ""), write=Screen(), confirm=lambda a, b: True))
-    assert "I only close windows I opened in this session" in reply.message, reply.message
+        console.Prompts(read=Script("yes", ""), write=screen, confirm=lambda a, b: True))
+    # The refusal REACHES THE USER, which is the invariant. Since the Slice 3 smoke's ordering fix it
+    # is printed immediately above the correction prompt rather than carried out as the closing line,
+    # so it is checked on the screen and on the result rather than on the reply's final sentence.
+    printed = [line for line in screen.lines
+               if "I only close windows I opened in this session" in line]
+    assert len(printed) == 1, screen.lines
+    assert reply.result is not None
+    assert "I only close windows I opened in this session" in reply.result.message
 
 
 def test_closing_still_asks_the_medium_safety_question(world, brain):
