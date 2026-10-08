@@ -740,6 +740,49 @@ def dom_click(session_id: str, page_id: str, element_token: str,
     return DOM_CLICKED
 
 
+# What a navigation attempt ended as. Three outcomes, because "it loaded" and "it did not" are not
+# the only possibilities: a page can begin loading and not finish, and claiming either of the other
+# two for that case would be a lie the next click would act on.
+NAVIGATED = "navigated"          # the browser reported the navigation complete
+NAVIGATE_TIMEOUT = "timeout"     # the deadline passed; the page may be PARTLY there
+NAVIGATE_REFUSED = "refused"     # the browser would not navigate at all
+
+
+def browser_navigate(session_id: str, page_id: str, url: str,
+                     navigate_timeout_seconds: float) -> str:
+    """Send one page of a live assistant-browser session to `url`. Returns one of the three outcomes.
+
+    THE URL IS NOT VALIDATED HERE, and that is deliberate: app/executor/logic.py validates the scheme
+    before this is ever called, so that an unacceptable address never reaches a function that can
+    touch the network. This function trusts its caller and does one thing.
+
+    ONE navigation, no retry and no redirect logic of our own - whatever the browser follows, it
+    follows, and the result reports only what the browser said. Bounded by the caller's timeout, never
+    Playwright's own 30-second default.
+
+    The URL is not logged here. The page's own address is still never read back, returned or logged:
+    _page_identity stays the only thing taken from a page, and it is a fingerprint, not an address."""
+    with _browser_lock:
+        session = _browser_sessions.get(session_id)
+        page = session.pages.get(page_id) if session is not None else None
+    if session is None:
+        raise BrowserError("that browser session is not open")
+    if page is None:
+        raise BrowserError("that page is not part of this browser session")
+
+    timeout = max(1.0, float(navigate_timeout_seconds)) * 1000
+    try:
+        page.goto(url, timeout=timeout, wait_until="load")
+    except Exception as exc:                      # Playwright raises its own error types
+        # A timeout is NOT a failure to start: goto may have navigated and then run out of time
+        # waiting for the load event, so the page may be partly there. Only the caller can decide
+        # what to say about that, so the two cases are reported separately.
+        if "imeout" in str(exc):
+            return NAVIGATE_TIMEOUT
+        raise BrowserError("the browser could not open that address") from None
+    return NAVIGATED
+
+
 def dom_page_has_frames(session_id: str, page_id: str) -> bool:
     """Whether the page has child frames this slice does not look inside.
 

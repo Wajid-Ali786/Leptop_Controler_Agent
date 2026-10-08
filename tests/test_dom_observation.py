@@ -747,8 +747,18 @@ def test_the_ordinary_suite_reaches_no_browser_and_no_network(session):
     with pytest.raises(PhysicalBrowserEscaped):
         executor_adapter.browser_open_session("chrome", 1.0)
     code = code_of_module_text(EXECUTOR_ADAPTER)
-    for navigation in ("page.goto", ".goto(", "request.get", "api_request"):
-        assert navigation not in code, f"Slice 1 needs no navigation: {navigation}"
+    # SUPERSEDED BY USABILITY SLICE 5, which added navigation deliberately. This used to assert the
+    # adapter contained no navigation at all - true while DOM Slice 1 only READ pages. The enduring
+    # claim is narrower and stronger: navigation exists in exactly ONE function, that function is in
+    # the central guard, and no OTHER kind of outbound request was added alongside it.
+    assert code.count("page.goto") == 1, "navigation must live in exactly one place"
+    assert code.count(".goto(") == 1
+    navigate_src = code.split("def browser_navigate")[1].split("def ")[0]
+    assert "page.goto" in navigate_src, "the one navigation is not in browser_navigate"
+    from safety_guards import BROWSER_BOUNDARIES
+    assert "browser_navigate" in BROWSER_BOUNDARIES
+    for other in ("request.get", "api_request", "urlopen", "requests.", "httpx"):
+        assert other not in code, f"a second kind of outbound request appeared: {other}"
 
 
 def test_no_desktop_audio_or_memory_action_is_on_this_path():

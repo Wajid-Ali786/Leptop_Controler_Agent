@@ -24,7 +24,7 @@ from app.console import CommandReply, FocusHandover, Status, handle_command, run
 from app.executor import adapter, commands, emergency_stop, hotkey
 from app.executor import logic as executor_logic
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError
-from app.executor.models import CLOSE_BROWSER, OPEN_BROWSER, CLICK, CLICK_TARGET, CLOSE_APP, OPEN_APP, TYPE_TEXT, WINDOW_CONTROL, ActionResult, ExecutorAction, \
+from app.executor.models import CLOSE_BROWSER, NAVIGATE, OPEN_BROWSER, CLICK, CLICK_TARGET, CLOSE_APP, OPEN_APP, TYPE_TEXT, WINDOW_CONTROL, ActionResult, ExecutorAction, \
     Outcome
 from app.safety import logic as safety_logic
 from app.safety.models import Action, RiskAssessment, RiskLevel
@@ -324,7 +324,9 @@ def test_every_action_kind_is_classified_for_hand_over():
     assert console.HANDS_OVER == {CLICK, TYPE_TEXT, "shortcut", "scroll", "refresh", WINDOW_CONTROL}
     # open_browser and close_browser name no window either: one starts the assistant's own
     # browser, the other closes a session by opaque id. Neither depends on what is in front.
-    assert console.NO_HANDOVER == {OPEN_APP, CLOSE_APP, CLICK_TARGET, OPEN_BROWSER,
+    # navigate joined in usability Slice 5: it acts on the assistant's OWN browser session, which
+    # is addressed by an opaque session id and not by whatever window happens to be in front.
+    assert console.NO_HANDOVER == {OPEN_APP, CLOSE_APP, CLICK_TARGET, NAVIGATE, OPEN_BROWSER,
                                    CLOSE_BROWSER}
 
 

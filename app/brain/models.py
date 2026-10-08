@@ -14,7 +14,7 @@ Two rules shape everything below:
 """
 from dataclasses import dataclass
 
-from app.executor.models import (CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, OPEN_APP,
+from app.executor.models import (CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, NAVIGATE, OPEN_APP,
                                  OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL)
 from app.safety.models import RiskLevel
 
@@ -106,6 +106,20 @@ class CloseBrowserArgs:
 
 
 @dataclass(frozen=True)
+class NavigateArgs:
+    """Send the LIVE assistant browser to a web address the user typed.
+
+    `url` is the user's own address, copied, never one the model composed: app/planner/logic.py checks
+    the planned URL against the URL the user actually supplied before any plan is built, and the
+    Executor validates the scheme locally before the browser is touched at all.
+
+    Deliberately its own shape and its own wire field. `text` means "what to type" and `app` means "a
+    configured application name" (40 characters); carrying an address in either would make the schema
+    lie about what the field is, and would route a URL through type_text's length-only logging."""
+    url: str
+
+
+@dataclass(frozen=True)
 class RefreshArgs:
     """Refresh acts on the active window and takes nothing."""
 
@@ -132,6 +146,7 @@ ARGS_FOR_KIND = {
     WINDOW_CONTROL: WindowControlArgs,
     OPEN_BROWSER: OpenBrowserArgs,
     CLOSE_BROWSER: CloseBrowserArgs,
+    NAVIGATE: NavigateArgs,
 }
 
 
@@ -263,6 +278,9 @@ MAX_MESSAGE = 200
 MAX_APP = 40
 MAX_CONTROL = 60          # a button or field label the user typed, not a sentence
 MAX_KEYS = 40
+# A web address the user typed. Long enough for an ordinary link with a query string, short enough
+# that a reply cannot smuggle a document in the field.
+MAX_URL = 300
 MAX_INTENTS = 5           # mirrors app/planner/models.MAX_PLAN_STEPS; a test holds them together
 
 UNDERSTOOD = "understood"
@@ -291,6 +309,7 @@ ARGS_FIELDS = {
     # property count does not move. Only the `kind` enum grows.
     OPEN_BROWSER: (),
     CLOSE_BROWSER: (),
+    NAVIGATE: ("url",),
 }
 
 # --- One canonical wire form per kind -----------------------------------------------------------------
@@ -319,6 +338,7 @@ NEUTRAL_ARGS_VALUES = {
     "direction": "",
     "notches": 0,
     "operation": "",
+    "url": "",
 }
 
 # Which top-level fields each interpretation uses. `kind` is always used; everything else not listed
@@ -400,6 +420,10 @@ def interpretation_schema(max_type_characters: int) -> dict:
             "text": bounded("exactly what to type for type_text, otherwise empty",
                             max_type_characters),
             "keys": bounded("a shortcut such as ctrl+c for shortcut, otherwise empty", MAX_KEYS),
+            # ONE new wire property, and the counts stay inside the documented limits because it
+            # is required like every other: optional and union counts do not move at all.
+            "url": bounded("for navigate, the web address the user themselves gave, copied "
+                           "exactly; otherwise empty", MAX_URL),
             "direction": {"type": "string", "enum": ["", *SCROLL_DIRECTIONS],
                           "description": "scroll direction, otherwise empty"},
             # No ceiling stated: the Executor owns that number and enforces it at the resolve seam, so

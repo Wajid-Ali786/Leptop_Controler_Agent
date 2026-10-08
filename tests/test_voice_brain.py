@@ -129,9 +129,9 @@ def planned(monkeypatch):
     seen = []
     real = console.session.build_plan
 
-    def spy(understood, frontend, resolve):
+    def spy(understood, frontend, resolve, user_text=""):
         seen.append(frontend)
-        return real(understood, frontend, resolve)
+        return real(understood, frontend, resolve, user_text)
 
     monkeypatch.setattr(console.session, "build_plan", spy)
     return seen

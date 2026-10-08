@@ -22,6 +22,9 @@ CLICK_TARGET = "click_target"
 # The assistant's OWN browser, which is not an app in executor.apps and never the owner's Chrome.
 OPEN_BROWSER = "open_browser"    # no target: there is one assistant browser, or none
 CLOSE_BROWSER = "close_browser"  # no target
+# Navigate the LIVE assistant browser session to a URL the user typed. The URL travels in
+# ExecutorAction.url, never in `target` - see the field's note below.
+NAVIGATE = "navigate"
 
 # A RESERVED context selector, usable wherever an app name is (e.g. ExecutorAction(CLICK_TARGET,
 # ASSISTANT_BROWSER, control="Login")). It names the live assistant browser session, and it is
@@ -100,6 +103,13 @@ class ExecutorAction:
     kind: str
     target: str = ""
     control: str = ""
+    # `url` is a SEPARATE FIELD for exactly the reason `control` is, and the reasoning above applies
+    # unchanged: `target` is what log_label reports, and log_label feeds both the Executor's result log
+    # and plan_summary(). A navigation URL must not reach the persistent log, so it never goes in
+    # `target`. It IS shown to the user - the confirmation prints it in full, because reading the
+    # address before it loads is the whole point of asking - but that description is built by the
+    # preparer, not by the `description` property below.
+    url: str = ""
 
     @property
     def description(self) -> str:

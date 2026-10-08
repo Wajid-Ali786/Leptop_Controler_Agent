@@ -245,7 +245,11 @@ def test_the_advisory_floor_is_not_part_of_the_action_contract():
     # `control` carries the user's own word for an on-screen control for click_target, and is a field
     # rather than part of `target` so that log_label and plan_summary cannot see it. It is still not a
     # risk decision, which is what this test is about: the advisory floor stays out of the contract.
-    assert [field.name for field in fields(ExecutorAction)] == ["kind", "target", "control"]
+    # `url` joined in usability Slice 5, for the same privacy reason `control` exists: log_label
+    # reports `target`, so an address that must stay out of the log cannot live there. The point of
+    # this assertion is unchanged - risk_floor is still not a field on the action.
+    assert [field.name for field in fields(ExecutorAction)] == ["kind", "target", "control", "url"]
+    assert "risk_floor" not in [field.name for field in fields(ExecutorAction)]
     assert not any("risk" in field.name or "floor" in field.name
                    for field in fields(ExecutorAction))
     assert not hasattr(ExecutorAction(REFRESH, ""), "risk_floor")

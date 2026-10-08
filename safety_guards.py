@@ -469,6 +469,7 @@ BROWSER_BOUNDARIES = (
     "browser_close_session",
     "dom_query",              # reads a real page's accessibility tree
     "dom_click",              # CLICKS a real page - the one DOM action there is
+    "browser_navigate",       # NETWORK EGRESS: loads an arbitrary website
 )
 
 # browser_sessions() and browser_session_exists() are deliberately NOT in that list: they read this

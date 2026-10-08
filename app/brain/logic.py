@@ -30,15 +30,16 @@ from app.brain.models import (ARGS_FIELDS, ARGS_FOR_KIND, INTERPRETATION_FIELDS,
                               NEUTRAL_ARGS_VALUES, NEUTRAL_INTERPRETATION_VALUES, is_neutral,
                               INTERPRETATION_KINDS, MAX_APP, MAX_BECAUSE, MAX_INTENTS, MAX_KEYS,
                               MAX_MESSAGE, MAX_MISSING, MAX_QUESTION, MAX_RESTATED, MAX_WHAT,
-                              MAX_CONTROL, MAX_WHY, NEEDS_CLARIFICATION, NOT_A_COMMAND, NOT_SUPPORTED,
+                              MAX_CONTROL, MAX_URL, MAX_WHY, NEEDS_CLARIFICATION, NOT_A_COMMAND, NOT_SUPPORTED,
                               RISK_FLOOR_NAMES, SCROLL_DIRECTIONS, UNDERSTOOD, WINDOW_OPERATIONS,
                               ClickArgs, ClickTargetArgs, CloseBrowserArgs, Intent, Interpretation,
-                              NeedsClarification, NotACommand, NotSupported, OpenBrowserArgs,
+                              NavigateArgs, NeedsClarification, NotACommand, NotSupported, OpenBrowserArgs,
                               RefreshArgs, ScrollArgs, ShortcutArgs, TypeTextArgs,
                               Understood, WindowControlArgs)
 from app.executor import commands
 from app.executor.models import (ASSISTANT_BROWSER, CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER,
-                                 OPEN_APP, OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
+                                 NAVIGATE, OPEN_APP, OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT,
+                                 TYPE_TEXT,
                                  WINDOW_CONTROL, ExecutorAction, Unresolved)
 
 
@@ -131,6 +132,23 @@ UNAVAILABLE_MESSAGE = ("I can't reach my reasoning service right now, so I can o
                        "until it's back.")
 
 
+# THE PROMPT'S SIZE BUDGET, and why the number is what it is.
+#
+# This text is sent on EVERY request, so its length is a recurring cost. The limit is asserted in
+# tests/test_brain_provider.py and tests/test_assistant_browser.py, and it is a DISCIPLINE limit, not
+# an affordability one - that distinction was measured rather than assumed:
+#
+#   estimate_input_tokens is ceil(bytes / 2) (BYTES_PER_TOKEN_ESTIMATE = 2), deliberately about twice
+#   the real English count, and claude-sonnet-5-5 input is $2.00 per million tokens. So 4000
+#   characters cost about $0.0040 per request as the budget ACCOUNTS for them and about $0.0020 in
+#   reality, against cost.daily_budget_usd of $1.00. Four hundred more characters cost about $0.0004
+#   accounted per request - four hundredths of a cent.
+#
+# The limit was 4000 and was raised ONCE, knowingly, to 4400 on 2026-10-07, with that measurement on
+# record, when navigation needed room. It is not a licence to pad: the cost of a bigger prompt is
+# negligible, but every sentence here is read by the model on every request, and text that does not
+# change what it produces makes the instructions harder to follow, not easier. Add only what stops the
+# model producing an invalid action.
 SYSTEM_PROMPT = """\
 You are the understanding step of a personal Windows desktop assistant. Your only job is to read what \
 the user asked for and return one structured interpretation of it. You never carry anything out: a \
@@ -150,6 +168,9 @@ exactly "assistant browser" for the assistant's own browser, or leave it empty
 - window_control: minimize, maximize, restore or close the window in front
 - open_browser, close_browser: the assistant's OWN browser, not the user's Chrome ("open \
 chrome" is open_app)
+- navigate: send the assistant's own browser to a web address. Put the address the user typed in \
+`url`, copied exactly. Never invent, complete or guess an address: if they named a site without \
+giving its address, that is needs_clarification. This cannot navigate the user's own Chrome.
 
 How to answer:
 - understood: the request maps onto those capabilities. Give 1 to 5 intents, in the order they should \
@@ -433,6 +454,9 @@ def _args(kind: str, item: dict, where: str, max_type_characters: int):
         if isinstance(app, InterpretationError):
             return app
         return ClickTargetArgs(control=control, app=app)
+    if kind == NAVIGATE:
+        url = _text(values["url"], MAX_URL, f"{where}.url")
+        return url if isinstance(url, InterpretationError) else NavigateArgs(url=url)
     if kind == OPEN_BROWSER:
         return OpenBrowserArgs()
     if kind == CLOSE_BROWSER:

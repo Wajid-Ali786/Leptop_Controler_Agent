@@ -57,6 +57,11 @@ browser:
   channel: chrome                 # the installed Chrome; not Playwright's bundled Chromium
   launch_timeout_seconds: 20.0    # starting a browser is slow; bounded all the same
   query_timeout_seconds: 2.0      # one DOM query. Never Playwright's own 30s default
+  # Its OWN setting, not a reuse. query_timeout_seconds (2.0s) is a per-query bound and far too
+  # short for a page load; launch_timeout_seconds has the right magnitude but means "how long
+  # starting a browser may take", so tying navigation to it would let a future launch retune
+  # silently retune navigation as well.
+  navigate_timeout_seconds: 20.0  # one page load. Never Playwright's own 30s default
 
 # --- Memory (app/memory/) ---
 memory:

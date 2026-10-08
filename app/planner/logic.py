@@ -35,7 +35,7 @@ A correction happens only because a person asked for one, at most once per reque
 from uuid import uuid4
 
 from app.brain.models import (ARGS_FOR_KIND, SCROLL_DIRECTIONS, WINDOW_OPERATIONS, ClickArgs, CloseBrowserArgs, OpenBrowserArgs, ClickTargetArgs,
-                              CloseAppArgs, Intent, NeedsClarification, OpenAppArgs, RefreshArgs,
+                              CloseAppArgs, Intent, NavigateArgs, NeedsClarification, OpenAppArgs, RefreshArgs,
                               ScrollArgs, ShortcutArgs, TypeTextArgs, Understood, WindowControlArgs,
                               previous_action_context)
 from app.executor.models import (CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
@@ -53,11 +53,16 @@ from app.planner.models import (CLARIFICATION_SPENT, MAX_PLAN_STEPS, NO_CLARIFIC
                                 PendingClarification, ReplanRequest, TurnContext)
 
 
-def build_plan(understood: Understood, frontend, resolve) -> PlannerOutcome:
+def build_plan(understood: Understood, frontend, resolve, user_text: str = "") -> PlannerOutcome:
     """Turn an Understood interpretation into a numbered Plan, or refuse with a safe message.
 
     Pure: no safety gate, no Executor, no Verifier, no window, no device. `resolve` is
     app/executor/logic.resolve - see the module docstring.
+
+    `user_text` is what the USER typed for this exchange, and it exists for one check: a
+    navigation address must have come from them. See _url_provenance(). It defaults to empty so
+    that a caller which cannot supply it gets the SAFE behaviour - no navigation - rather than an
+    unchecked one.
     """
     intents = tuple(understood.intents)
     if not intents:
@@ -68,14 +73,15 @@ def build_plan(understood: Understood, frontend, resolve) -> PlannerOutcome:
                            f"at a time. Ask for part of it.")
     steps = []
     for number, intent in enumerate(intents, start=1):
-        step = _step(number, intent, frontend, resolve)
+        step = _step(number, intent, frontend, resolve, user_text)
         if isinstance(step, PlanRefusal):
             return step
         steps.append(step)
     return Plan(steps=tuple(steps))
 
 
-def _step(number: int, intent: Intent, frontend, resolve) -> PlanStep | PlanRefusal:
+def _step(number: int, intent: Intent, frontend, resolve,
+          user_text: str = "") -> PlanStep | PlanRefusal:
     """One validated, numbered step - or the reason there isn't one."""
     expected = ARGS_FOR_KIND.get(intent.kind)
     if expected is None:
@@ -90,11 +96,60 @@ def _step(number: int, intent: Intent, frontend, resolve) -> PlanStep | PlanRefu
     # WE build it; the model never does. `control` is the one field a named click adds, and it carries
     # the user's own words through unchanged - the model chose them, from what the user typed.
     control = intent.args.control if isinstance(intent.args, ClickTargetArgs) else ""
-    action = ExecutorAction(intent.kind, target, control.strip() if isinstance(control, str) else "")
+    url = ""
+    if isinstance(intent.args, NavigateArgs):
+        refusal = _url_provenance(intent.args.url, user_text)
+        if refusal is not None:
+            return refusal
+        url = intent.args.url.strip()
+    action = ExecutorAction(intent.kind, target, control.strip() if isinstance(control, str) else "",
+                            url)
     resolution = resolve(action)
     if isinstance(resolution, Unresolved):
         return PlanRefusal(PLAN_UNRESOLVED, resolution.message)   # the Executor's own wording
     return PlanStep(number=number, action=action, why=intent.why, risk_floor=intent.risk_floor)
+
+
+# Schemes a URL may be stripped of before the provenance comparison. Only these: the user writing
+# "example.com" and the model adding "https://" is COMPLETING a scheme for a host the user supplied,
+# which is not the same as inventing one. Anything else is compared whole.
+_SCHEME_PREFIXES = ("https://", "http://")
+
+
+def _url_provenance(url, user_text: str) -> "PlanRefusal | None":
+    """None when `url` demonstrably came from the user, otherwise the refusal.
+
+    WHY THIS EXISTS. The model is asked to copy an address the user typed. If it instead invents a
+    domain, infers one from a business name, or substitutes a different site, the Executor would
+    faithfully navigate somewhere the user never asked for - and the next click would act on that
+    page. So the address is checked against the user's own words BEFORE a plan exists.
+
+    THE RULE: the address, minus an http(s) scheme the model may have completed, must appear in what
+    the user typed, ignoring case.
+
+    WHAT THIS PROVES: the host came from the user. A domain the model composed, a site inferred from a
+    name, and a substituted address all fail, because none of them appears in the user's text.
+
+    WHAT IT DOES NOT PROVE: that the model preserved the whole address. A reply that shortened
+    "example.com/a/b" to "example.com" still passes, because the shorter string is present. That is a
+    different and much smaller hazard than navigating to another site, and stating the limit is better
+    than implying a guarantee the substring rule does not give.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return PlanRefusal(PLAN_WRONG_ARGS, "I need a web address to open.")
+    typed = user_text.lower() if isinstance(user_text, str) else ""
+    candidate = url.strip().lower()
+    for scheme in _SCHEME_PREFIXES:
+        if candidate.startswith(scheme):
+            candidate = candidate[len(scheme):]
+            break
+    if not candidate or candidate not in typed:
+        # Deliberately does NOT echo the address that failed: it is the one thing here that did not
+        # come from the user, so repeating it back as though it had would be misleading.
+        return PlanRefusal(PLAN_UNRESOLVED,
+                           "I only open a web address you've given me yourself. Say the address and "
+                           "I'll open that.")
+    return None
 
 
 def _target(args) -> str | PlanRefusal:
@@ -126,6 +181,8 @@ def _target(args) -> str | PlanRefusal:
         if isinstance(args.notches, bool) or not isinstance(args.notches, int):
             return PlanRefusal(PLAN_WRONG_ARGS, "I need a whole number of notches to scroll.")
         return f"{args.direction} {args.notches}"
+    if isinstance(args, NavigateArgs):
+        return ""        # the URL is NOT the target: it must stay out of log_label
     if isinstance(args, RefreshArgs):
         return ""
     if isinstance(args, WindowControlArgs):

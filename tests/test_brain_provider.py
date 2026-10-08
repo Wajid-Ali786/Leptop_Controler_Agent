@@ -27,7 +27,7 @@ import pytest
 
 from app.brain import cost_controls
 from app.brain import logic as brain
-from app.brain.models import (ARGS_FIELDS, ARGS_FOR_KIND, INTERPRETATION_KINDS, MAX_APP, MAX_BECAUSE,
+from app.brain.models import (ARGS_FIELDS, ARGS_FOR_KIND, NavigateArgs, INTERPRETATION_KINDS, MAX_APP, MAX_BECAUSE,
                               ClickTargetArgs, CloseBrowserArgs, OpenBrowserArgs,
                               MAX_INTENTS, MAX_KEYS, MAX_MESSAGE, MAX_MISSING, MAX_QUESTION,
                               MAX_RESTATED, MAX_WHAT, MAX_WHY, RISK_FLOOR_NAMES,
@@ -39,7 +39,7 @@ from app.brain.models import (ARGS_FIELDS, ARGS_FOR_KIND, INTERPRETATION_KINDS, 
                               PreviousActionContext, RefreshArgs, ScrollArgs, ShortcutArgs,
                               TypeTextArgs, Understood, WindowControlArgs, interpretation_schema,
                               previous_action_context, schema_complexity)
-from app.executor.models import (CLOSE_BROWSER, OPEN_BROWSER, CLICK_TARGET, CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
+from app.executor.models import (CLOSE_BROWSER, NAVIGATE, OPEN_BROWSER, CLICK_TARGET, CLICK, CLOSE_APP, OPEN_APP, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT,
                                  WINDOW_CONTROL)
 from app.planner.models import (MAX_PLAN_STEPS, ClarificationContinuation, FailureContext,
                                 PlanStepSummary, ReplanRequest)
@@ -178,10 +178,11 @@ def test_the_schema_stays_inside_anthropics_documented_complexity_limits():
     counts = schema_complexity(schema())
     assert counts["optional"] <= DOCUMENTED_OPTIONAL_LIMIT, counts
     assert counts["unions"] <= DOCUMENTED_UNION_LIMIT, counts
-    # 20 since Phase 5 Slice 3 added `control` for click_target. What matters is unchanged and is
-    # asserted above: still zero optional parameters and zero unions, so the documented limits of 24
-    # and 16 are not approached by adding a field - only the flat property count moves.
-    assert counts == {"optional": 0, "unions": 0, "properties": 20}, "flat by construction"
+    # 21 since usability Slice 5 added `url` for navigate (20 before it, when Slice 3 added
+    # `control`). What matters is unchanged and is asserted above: still zero optional parameters
+    # and zero unions, so the documented limits of 24 and 16 are not approached by adding a field -
+    # only the flat property count moves.
+    assert counts == {"optional": 0, "unions": 0, "properties": 21}, "flat by construction"
 
 
 def test_every_property_is_required_and_nothing_else_is_allowed():
@@ -598,8 +599,14 @@ def test_the_brain_checks_the_type_and_the_executor_checks_the_range():
                                           notches="3")])).reason == brain.BAD_ARGS
     assert isinstance(validate(reply(intents=[intent(kind=SCROLL, direction="down", notches=0)])),
                       Understood)
+    # Checked on the CODE with comments stripped. A bare "20" anywhere above SYSTEM_PROMPT used to be
+    # the proxy, and usability Slice 5 broke it with a COMMENT reading "$0.0020" while the rule it
+    # guards stayed perfectly true - the eleventh time in this project a substring has matched prose
+    # rather than code. A comment cannot duplicate a limit; only an expression can.
     source = Path("app/brain/logic.py").read_text(encoding="utf-8")
-    assert "max_scroll" not in source and "20" not in source.split("SYSTEM_PROMPT")[0]
+    code = " ".join(line.split("#")[0] for line in source.split("SYSTEM_PROMPT")[0].splitlines())
+    assert "max_scroll" not in source
+    assert "20" not in code, code
 
 
 # --- §7 Every free-text field the model writes is bounded ---------------------------------------------
@@ -980,7 +987,10 @@ def test_the_system_prompt_states_the_rules_this_phase_depends_on():
 def test_the_system_prompt_contains_no_private_or_historical_data():
     assert SECRET not in brain.SYSTEM_PROMPT
     assert "hunter2" not in brain.SYSTEM_PROMPT
-    assert len(brain.SYSTEM_PROMPT) < 4000, "a prompt this phase can afford on every request"
+    # 4400 since 2026-10-07, raised once and deliberately: the limit is a DISCIPLINE limit, and
+    # app/brain/logic.py records the measurement that showed the cost of 400 more characters is
+    # about $0.0004 accounted per request against a $1.00 daily budget.
+    assert len(brain.SYSTEM_PROMPT) < 4400, "a prompt this phase can afford on every request"
 
 
 # --- §4/§15 The three request shapes, and what may not get into them ----------------------------------
@@ -1089,6 +1099,7 @@ def test_a_good_reply_becomes_the_typed_contracts():
      ClickTargetArgs(control="Seven", app="calculator")),
     (OPEN_BROWSER, {}, OpenBrowserArgs()),
     (CLOSE_BROWSER, {}, CloseBrowserArgs()),
+    (NAVIGATE, {"url": "https://example.com"}, NavigateArgs("https://example.com")),
 ])
 def test_every_kind_builds_its_own_typed_args_shape(kind, fields, expected):
     outcome = validate(reply(intents=[intent(kind=kind, **fields)]))

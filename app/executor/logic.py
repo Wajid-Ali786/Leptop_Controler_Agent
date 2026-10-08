@@ -132,6 +132,7 @@ Measured real-desktop behavior and known open decisions: docs/step4 Section 4, i
 import logging
 import re
 import threading
+import urllib.parse
 import time
 import unicodedata
 from dataclasses import dataclass, field, replace
@@ -140,6 +141,7 @@ from typing import Callable
 from app.executor import adapter, emergency_stop, shortcuts
 from app.executor.emergency_stop import ActionInterruptedError, EmergencyStopError, TypingInterruptedError
 from app.executor.models import (ASSISTANT_BROWSER, CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER,
+                                 NAVIGATE,
                                  OPEN_APP, OPEN_BROWSER, REFRESH, RESOLVE_BAD_FORMAT,
                                  RESOLVE_NO_TARGET, RESOLVE_OUT_OF_RANGE, RESOLVE_SETTINGS,
                                  RESOLVE_UNKNOWN_APP, RESOLVE_UNKNOWN_KIND, RESOLVE_UNWANTED_TARGET,
@@ -1089,6 +1091,13 @@ def _resolve_close_browser(action: ExecutorAction) -> Resolved | Unresolved:
     return _no_target(action, "close_browser")
 
 
+def _resolve_navigate(action: ExecutorAction) -> Resolved | Unresolved:
+    """The address lives in `url`, not in `target`, so `target` must be empty like the other
+    browser kinds. The scheme is judged in the preparer, not here: resolve() is side-effect free
+    and is also asked by the Phase 3 router, which must not need an opinion about a URL."""
+    return _no_target(action, "navigate")
+
+
 def _no_target(action: ExecutorAction, kind: str) -> Resolved | Unresolved:
     """These kinds take nothing: there is one assistant browser, or there is none."""
     if isinstance(action.target, str) and action.target.strip():
@@ -1121,6 +1130,115 @@ def _prepare_open_browser(action: ExecutorAction):
                                      "me what to click.")
 
     return _Prepared(run)
+
+
+# --- navigate the assistant's own browser (usability Slice 5) -----------------------------------------
+# WHAT IS NEW HERE IS EGRESS. The provider path has used the network since Phase 3; this is the first
+# way for the assistant to load an ARBITRARY website the user asked for. So the address is checked
+# twice before anything can reach it, by two different owners:
+#
+#   app/planner/logic._url_provenance  - did this address come from the USER, or did the model make it
+#                                        up? Checked against what the user typed, before a plan exists.
+#   _navigable_url (below)             - is the scheme one we will touch at all? Checked HERE, in the
+#                                        preparer, so an unacceptable address never reaches the
+#                                        adapter function that can open a socket.
+#
+# WHAT A PAGE NEVER GAINS. Loading it grants it no authority: no page text, title, address or cookie is
+# read back, none of it reaches the Brain, and the DOM click path still resolves only the control name
+# the user themselves gave.
+
+# http and https only, and the refusals are named rather than lumped together: a user who typed a
+# file:// path deserves to know that is why, not "bad URL".
+_ALLOWED_SCHEMES = ("http", "https")
+_NAVIGATE_RISK = RiskLevel.MEDIUM
+# Equally true of any address, including one the user typed perfectly. It is NOT about the URL being
+# suspect - it is about what has not been seen yet, and about what the next action would act on.
+_NAVIGATE_RISK_REASON = ("opening a web page - the page hasn't been seen yet, it may make further "
+                         "requests of its own, and the next click would act on whatever loaded")
+
+
+def _navigable_url(url) -> str | None:
+    """The address if this assistant may open it, otherwise None. PURE: no network, no browser.
+
+    Rejects anything that is not http or https - file:// reads the disk, javascript: and data: execute
+    in the page, about: and the rest are browser-internal. A URL is parsed rather than string-matched
+    so that "HTTPS://x" and "  https://x  " are the same answer, and so a scheme cannot be smuggled
+    past a prefix check."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    candidate = url.strip()
+    try:
+        parts = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in _ALLOWED_SCHEMES:
+        return None
+    if not parts.netloc:                     # "https:///x" or "http://" - no host to go to
+        return None
+    return candidate
+
+
+def _prepare_navigate(action: ExecutorAction):
+    resolution = resolve(action)
+    if isinstance(resolution, Unresolved):
+        return _result(action, False, resolution.message)
+    url = _navigable_url(action.url)
+    if url is None:
+        # Checked BEFORE the session lookup and before any adapter call, so a refused address never
+        # reaches a function that could touch the network.
+        return _result(action, False,
+                       "I only open http and https web addresses, so I didn't open that one.",
+                       log_message="navigate: refused the address's scheme")
+    sessions = adapter.browser_sessions()
+    if not sessions:
+        return _result(action, False, "The assistant browser isn't open, so there's nothing to "
+                                      "navigate. Say 'open assistant browser' first.")
+    if len(sessions) > 1:
+        return _result(action, False, "I have more than one assistant browser page open, so I don't "
+                                      "know which to navigate.")
+    session_id, page_id = sessions[0]
+    try:
+        timeout = _navigate_timeout()
+    except SettingsError as exc:
+        return _result(action, False, str(exc))
+    # The URL IS shown, in full, because reading the address before it loads is the whole point of
+    # asking. It is not logged: log_message below carries no address, and action.target is empty.
+    safety_action = Action(f"navigate the assistant browser to {url}", minimum_level=_NAVIGATE_RISK,
+                           minimum_reason=_NAVIGATE_RISK_REASON)
+
+    def run() -> ActionResult:
+        emergency_stop.check()
+        try:
+            outcome = adapter.browser_navigate(session_id, page_id, url, timeout)
+        except adapter.BrowserError as exc:
+            return _result(action, False, f"I couldn't navigate the assistant browser ({exc}).",
+                           log_message="navigate: the browser refused")
+        emergency_stop.check()
+        if outcome == adapter.NAVIGATE_TIMEOUT:
+            # NEVER "the page loaded". goto() may have navigated and then run out of time waiting for
+            # the load event, so the page may be partly there - and the next click would act on it.
+            # Outcome.UNVERIFIED is the existing way to say "it was sent, nothing confirms what it
+            # achieved"; the session is left open because it is still usable.
+            return _result(action, True,
+                           f"I sent the assistant browser to that address, but it didn't finish "
+                           f"loading within {timeout:g} seconds. Part of the page may be there and "
+                           f"part may not, so I can't tell you it loaded. Look at the browser before "
+                           f"clicking in it.", outcome=Outcome.UNVERIFIED,
+                           log_message="navigate: timed out; the load was not confirmed")
+        return _result(action, True,
+                       "Sent the assistant browser to that address. I can't check what the page "
+                       "contains, so look at it before clicking in it.", outcome=Outcome.UNVERIFIED,
+                       log_message="navigate: the browser reported the navigation complete")
+
+    return _Prepared(run, safety_action)
+
+
+def _navigate_timeout() -> float:
+    value = get_setting("browser.navigate_timeout_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise SettingsError(f"Setting 'browser.navigate_timeout_seconds' must be a positive number of "
+                            f"seconds, got {value!r}.")
+    return float(value)
 
 
 def _prepare_close_browser(action: ExecutorAction):
@@ -2375,13 +2493,15 @@ _RESOLVERS = {OPEN_APP: _resolve_open_app, CLOSE_APP: _resolve_close_app, CLICK:
               CLICK_TARGET: _resolve_click_target,
               OPEN_BROWSER: _resolve_open_browser, CLOSE_BROWSER: _resolve_close_browser,
               SCROLL: _resolve_scroll, SHORTCUT: _resolve_shortcut, REFRESH: _resolve_refresh,
-              WINDOW_CONTROL: _resolve_window_control, TYPE_TEXT: _resolve_type_text}
+              WINDOW_CONTROL: _resolve_window_control, TYPE_TEXT: _resolve_type_text,
+              NAVIGATE: _resolve_navigate}
 
 _PREPARERS = {OPEN_APP: _prepare_open_app, CLOSE_APP: _prepare_close_app, CLICK: _prepare_click,
               CLICK_TARGET: _prepare_named_click,
               OPEN_BROWSER: _prepare_open_browser, CLOSE_BROWSER: _prepare_close_browser,
               TYPE_TEXT: _prepare_type_text, SHORTCUT: _prepare_shortcut, SCROLL: _prepare_scroll,
-              REFRESH: _prepare_refresh, WINDOW_CONTROL: _prepare_window_control}
+              REFRESH: _prepare_refresh, WINDOW_CONTROL: _prepare_window_control,
+              NAVIGATE: _prepare_navigate}
 
 
 def _max_attempts() -> int:

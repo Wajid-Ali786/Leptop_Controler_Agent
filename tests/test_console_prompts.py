@@ -1512,8 +1512,14 @@ def test_an_ownership_refusal_is_reported_before_any_correction_prompt(monkeypat
     reason = script.index_of_say(refusal)
     prompt = script.index_of_ask(console.CORRECTION_PROMPT)
     assert reason is not None, script.events
-    if prompt is not None:
-        assert reason < prompt, script.events
+    # Unconditional: an ownership refusal is Status.RAN with a failed result, so it IS
+    # correction-eligible and the prompt must be there. A conditional assertion here would skip
+    # silently if the prompt ever stopped being offered, which is exactly the kind of pin that
+    # holds the right strings and proves nothing.
+    assert prompt is not None, f"the premise: this refusal is correction-eligible {script.events}"
+    assert reason < prompt, (
+        "the ownership reason was reported AFTER the correction prompt: "
+        + " | ".join(f"{kind}: {text}" for kind, text in script.events))
     assert len([t for k, t in script.events if k == "say" and refusal in t]) == 1
 
 

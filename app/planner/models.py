@@ -12,7 +12,7 @@ own and cannot be confused with a run of it.
 from dataclasses import dataclass, field
 
 from app.brain.models import Interpretation, PreviousActionContext
-from app.executor.models import (CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, OPEN_APP,
+from app.executor.models import (NAVIGATE, CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, OPEN_APP,
                                  OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, TYPE_TEXT, WINDOW_CONTROL,
                                  ExecutorAction)
 from app.safety.models import RiskLevel
@@ -90,9 +90,11 @@ class FrontEnd:
 
 
 ALL_KINDS = frozenset({OPEN_APP, CLOSE_APP, CLICK, CLICK_TARGET, TYPE_TEXT, SHORTCUT, SCROLL, REFRESH,
-                       WINDOW_CONTROL, OPEN_BROWSER, CLOSE_BROWSER})
+                       WINDOW_CONTROL, OPEN_BROWSER, CLOSE_BROWSER, NAVIGATE})
 # click_target is deliberately NOT here: like a coordinate click it needs the target window in front,
 # so in voice mode it would act on the console the user is talking to. Phase 3's limitation, unchanged.
+# navigate is deliberately NOT here either: it stays out of voice this slice, so a spoken address
+# cannot become a page load. The typed console supplies the text the provenance check reads.
 NO_HANDOVER_KINDS = frozenset({OPEN_APP, CLOSE_APP})
 
 TYPED_CONSOLE = FrontEnd(name="typed console", may_plan=ALL_KINDS)

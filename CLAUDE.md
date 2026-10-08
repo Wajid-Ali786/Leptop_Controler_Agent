@@ -59,6 +59,16 @@ git log, git show) are fine. Stage files (git add) only when the owner explicitl
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
+OWNER TESTING BACKLOG (2026-10-08): everything learned from the owner's real-machine testing of
+  Slices 1-5 is recorded in /docs/owner-testing-improvement-backlog.md - what now WORKS (so a later
+  session does not re-prove it), observed defects, missing capabilities, known limits that are working
+  as designed, deferred decisions, and the future acceptance tests. It also holds the development
+  checkpoint and the exact tree state.
+  THAT FILE AUTHORIZES NOTHING. Its findings are DEFERRED and MUST NOT trigger automatic
+  implementation. Improvement work on any of them resumes only when the owner explicitly authorizes
+  it; naming an item there is not that authorization. Read it for context before proposing work, not
+  as a work queue.
+
 Current work: USABILITY PLAN (started 2026-10-06). Phase 5 and Phase 6 work is STOPPED by the owner
   after the first real day of use. The whole-project weakness audit of 2026-10-06 produced a ranked
   five-slice plan; build from that, not from the Phase 5 slice list below.
@@ -112,8 +122,63 @@ Current work: USABILITY PLAN (started 2026-10-06). Phase 5 and Phase 6 work is S
     behind a confirmation and may never be closed. An unreadable executable fails closed.
     `_ours_now` is unchanged and still requires both of its clauses. The DOM path, type_text,
     shortcut, scroll and refresh are untouched (Slice 4).
-  Slices 4-5 (named targets for type/refresh/scroll/shortcut, assistant browser navigation):
-    NOT STARTED.
+  Slice 4 — named targets: PARKED (2026-10-07), not cancelled. When it resumes it is `type_text`
+    ONLY - the owner decided refresh/scroll/shortcut named targets are a smaller want. Three findings
+    were measured before parking, so a later session resumes from them rather than re-deriving:
+    (a) PROMPT BUDGET. SYSTEM_PROMPT was 3953 characters. Teaching `app` on four kinds fits at 3973
+        by RESTRUCTURING, not by cutting: move the `app` explanation out of click_target's paragraph
+        (-115 chars) into one shared line naming the kinds that accept it, and change type_text's and
+        refresh's "the window in front" wording. A verbose first draft came to 4002 and did not fit.
+        That variant is parked WITH the four kinds, since it exists to teach them.
+    (b) WIRE COST IS ZERO. `app` is already a wire property: the intent schema is flat, all 12
+        properties required on every intent, so adding `app` to the four Python arg dataclasses adds
+        nothing to the wire. Counts stay {optional: 0, unions: 0, properties: 20}.
+    (c) THE REAL COST, and why it is one kind per turn. `_focus_identity` is
+        (window.handle, control_handle) - the focused CONTROL is half of it - and each of the four
+        preparers snapshots verifier.active_target() at PREPARE time to build it. On a named path the
+        window is deliberately not in front when the confirmation is shown, so control_handle cannot
+        be known until after activation. Each kind therefore needs its prepare->run seam restructured
+        so the "approved" snapshot is taken AFTER activation, and type_text must REFUSE when the
+        post-activation focused control is not a safe typing destination. That is surgery on four
+        seams, not a shared helper.
+    Named window_control is recorded as a remaining usability gap and was never in Slice 4's scope.
+  Slice 5 — assistant-browser navigation: DONE (2026-10-08). One new kind, `navigate`, which sends the
+    LIVE assistant browser session to a web address the user typed. Assistant browser ONLY - personal
+    Chrome needs the address bar, which is parked Slice 4.
+    THE PROMPT BUDGET WAS RAISED ONCE, DELIBERATELY, from 4000 to 4400, with the measurement recorded
+    in app/brain/logic.py: the limit is a DISCIPLINE limit, and 400 more characters cost about $0.0004
+    accounted per request against a $1.00 daily budget. The prompt is 4239 (161 headroom).
+    WIRE COST: one new required property, `url`. Counts go {optional: 0, unions: 0, properties: 20} ->
+    {0, 0, 21}, well inside the documented 24-optional / 16-union limits, which do not move at all.
+    `url` is its own property because `text` means "what to type" and `app` means "a configured
+    application name" (40 chars) - carrying an address in either would make the schema lie.
+    THE ADDRESS IS CHECKED TWICE, by two owners. app/planner/logic._url_provenance asks whether it came
+    from the USER: the address, minus an http(s) scheme the model may have completed, must appear in
+    what the user typed. That stops an invented domain, a site inferred from a business name, and a
+    substituted URL; it does NOT prove the model preserved the whole path, which is stated in the
+    function. build_plan's user_text defaults to "" so a caller that cannot supply it gets no
+    navigation rather than an unchecked one. Then app/executor/logic._navigable_url checks the scheme
+    is http or https BEFORE the session lookup and before any adapter call, so a refused address never
+    reaches a function that can open a socket.
+    RISK: MEDIUM, and the confirmation shows the FULL address. Reason: the page has not been seen, it
+    may make further requests of its own, and the next click would act on whatever loaded. That is
+    equally true of a perfectly typed address, and refresh-on-a-browser is already MEDIUM, so LOW would
+    have made navigation less careful than reloading.
+    TIMEOUT: its own setting, browser.navigate_timeout_seconds (20.0). query_timeout_seconds (2.0) is a
+    per-query bound and far too short for a page load; launch_timeout_seconds has the right magnitude
+    but means "how long starting a browser may take". A timeout NEVER claims the page loaded - it is
+    Outcome.UNVERIFIED and says part of the page may be there - because goto() can navigate and then
+    run out of time waiting for the load event, and the next click would act on that.
+    LOGGED: metadata only - four fixed strings, none interpolating anything. The URL is in
+    ExecutorAction.url and never in `target`, so log_label and plan_summary() cannot see it.
+    browser_navigate joined safety_guards.BROWSER_BOUNDARIES, so the central guard refuses it offline.
+    CONTEXT AUDIT RESULT, pinned not designed around: after navigating, an unqualified `click Login`
+    reaches the assistant browser ONLY while it is the single candidate. With personal Chrome also
+    available (owned or found in this session) it is TWO candidates and the existing ambiguity rule
+    refuses, naming `in assistant browser` as the way out. The three-command workflow therefore reads
+    as advertised only in a session where Chrome was not opened; otherwise the third command must
+    qualify. The rule was NOT weakened.
+    Voice cannot plan navigation this slice.
 
 Phase 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE; PAUSED (see Current work above).
   The privacy and test-isolation boundaries required before expanding observation capability

@@ -324,9 +324,16 @@ def test_the_two_kinds_exist_with_empty_args_shapes():
 
 
 def test_the_schema_cost_is_two_enum_members_and_nothing_else():
-    """2. Args-free, so no wire field: the flat property count must not move."""
+    """2. Args-free, so no wire field.
+
+    Asserted on what these two kinds CONTRIBUTE rather than on the schema's absolute property count.
+    The count was pinned at 20 originally, and usability Slice 5 moved it to 21 by adding `url` for a
+    DIFFERENT kind - which would have failed this test while its own claim stayed perfectly true. The
+    claim is that open_browser and close_browser add no field, so that is what it checks."""
+    from app.brain.models import ARGS_FIELDS
+    assert ARGS_FIELDS[OPEN_BROWSER] == () and ARGS_FIELDS[CLOSE_BROWSER] == ()
     counts = schema_complexity(interpretation_schema(400))
-    assert counts == {"optional": 0, "unions": 0, "properties": 20}, counts
+    assert counts["optional"] == 0 and counts["unions"] == 0, counts
     intent = interpretation_schema(400)["properties"]["intents"]["items"]
     assert OPEN_BROWSER in intent["properties"]["kind"]["enum"]
     assert CLOSE_BROWSER in intent["properties"]["kind"]["enum"]
@@ -361,7 +368,10 @@ def test_voice_planning_capability_is_unchanged():
 
 def test_the_prompt_teaches_the_distinction_within_its_cost_budget():
     """3 of the brief + the existing cost control."""
-    assert len(brain.SYSTEM_PROMPT) < 4000, "the prompt is paid for on every request"
+    # 4400 since 2026-10-07, raised once and deliberately: the limit is a DISCIPLINE limit, and
+    # app/brain/logic.py records the measurement that showed the cost of 400 more characters is
+    # about $0.0004 accounted per request against a $1.00 daily budget.
+    assert len(brain.SYSTEM_PROMPT) < 4400, "the prompt is paid for on every request"
     assert "open_browser, close_browser" in brain.SYSTEM_PROMPT
     assert ASSISTANT_BROWSER in brain.SYSTEM_PROMPT
     assert "open_app" in brain.SYSTEM_PROMPT

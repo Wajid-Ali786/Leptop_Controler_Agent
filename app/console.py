@@ -84,7 +84,8 @@ from app.executor.logic import configured_app_names, execute_with_recovery, reso
 from app.planner import logic as session
 from app.planner.models import (TYPED_CONSOLE, FrontEnd, LifecycleRefusal, Plan, PlanRefusal,
                                 PlanStepSummary, TurnContext)
-from app.executor.models import CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, OPEN_APP, \
+from app.executor.models import CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, NAVIGATE, \
+    OPEN_APP, \
     OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, \
     TYPE_TEXT, WINDOW_CONTROL, \
     ActionResult, ExecutorAction, RESOLVE_UNKNOWN_APP, Resolved, Unresolved
@@ -155,7 +156,8 @@ HANDS_OVER = frozenset({CLICK, TYPE_TEXT, SHORTCUT, SCROLL, REFRESH, WINDOW_CONT
 # putting it in front. It brings that window forward itself, after the confirmation, and refuses if
 # Windows will not allow it. Every other clicking or typing action still lands wherever focus is, so
 # those keep the hand-over: without it they would act on the console being typed into.
-NO_HANDOVER = frozenset({OPEN_APP, CLOSE_APP, CLICK_TARGET, OPEN_BROWSER, CLOSE_BROWSER})
+NO_HANDOVER = frozenset({OPEN_APP, CLOSE_APP, CLICK_TARGET, OPEN_BROWSER, CLOSE_BROWSER,
+                         NAVIGATE})
 
 WELCOME = ("AI Desktop Companion - typed commands (Phase 1). Type help for the commands, exit to leave.\n"
            f"Anything Medium risk or above asks first, and only {YES} runs it.")
@@ -866,7 +868,7 @@ def _plan_it(understood, text, context, prompts, focus, interpret, frontend):
     """Understood -> the pure Planner -> a proposal nobody has accepted yet.
 
     PLANNING SITE 1 of 2. `frontend` decides which kinds may become steps at all."""
-    plan = session.build_plan(understood, frontend, resolve)
+    plan = session.build_plan(understood, frontend, resolve, text)
     if isinstance(plan, PlanRefusal):
         return CommandReply(Status.NO_PLAN, plan.message), context
     proposed = session.propose_plan(context, plan, text)
@@ -999,7 +1001,10 @@ def _offer_correction(context, prompts, focus, interpret, outcome: CommandReply,
     if isinstance(outcome, NotACommand):
         return CommandReply(Status.EXPLAINED, outcome.message or NOTHING_TO_DO), context
     # PLANNING SITE 2 of 2 - the same front end, so a correction cannot widen what voice may do.
-    plan = session.build_plan(outcome, frontend, resolve)
+    # The correction is the user's words for THIS exchange; the root text is what they said
+    # before it. A navigation address must appear in one of them.
+    plan = session.build_plan(outcome, frontend, resolve,
+                              f"{request.original_text} {correction}")
     if isinstance(plan, PlanRefusal):
         return CommandReply(Status.NO_PLAN, plan.message), context
     installed = session.install_replacement(context, plan)
@@ -1017,12 +1022,14 @@ def _preview(context: TurnContext) -> list[str]:
     so nothing here can print the user's own words. No repr of a model object is ever shown."""
     lines = [PLAN_HEADER]
     controls = {step.number: step.action.control for step in context.pending_plan.plan.steps}
+    urls = {step.number: step.action.url for step in context.pending_plan.plan.steps}
     for summary in session.plan_summary(context.pending_plan):
-        lines.append(f"  {summary.number}. {_describe(summary, controls.get(summary.number, ''))}")
+        lines.append(f"  {summary.number}. "
+                     f"{_describe(summary, controls.get(summary.number, ''), urls.get(summary.number, ''))}")
     return lines
 
 
-def _describe(summary: PlanStepSummary, control: str = "") -> str:
+def _describe(summary: PlanStepSummary, control: str = "", url: str = "") -> str:
     """One step in plain English. `summary.target` is already the Executor's log-safe label.
 
     `control` is passed in separately rather than read from the summary, because a PlanStepSummary
@@ -1040,6 +1047,10 @@ def _describe(summary: PlanStepSummary, control: str = "") -> str:
         return "Open the assistant's own browser"
     if kind == CLOSE_BROWSER:
         return "Close the assistant's own browser"
+    if kind == NAVIGATE:
+        # The URL comes from the STEP, not from the summary, for the same reason `control`
+        # does: a PlanStepSummary may travel to the model, and log_label must stay empty.
+        return f"Open {url} in the assistant's own browser" if url else "Open a web page"
     if kind == CLICK_TARGET:
         # The user's own words for the control, which is the point of a named click: the plan they
         # check says what they asked for, not a coordinate nobody can verify by reading it.
