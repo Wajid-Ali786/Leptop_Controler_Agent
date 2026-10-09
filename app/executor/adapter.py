@@ -760,6 +760,12 @@ def browser_navigate(session_id: str, page_id: str, url: str,
     follows, and the result reports only what the browser said. Bounded by the caller's timeout, never
     Playwright's own 30-second default.
 
+    A 404 IS A PAGE THAT LOADED, and it comes back as NAVIGATED. Playwright's own docstring says
+    goto "will not throw an error when any valid HTTP status code is returned by the remote server,
+    including 404 and 500" - it throws only for an SSL error, an invalid URL, the timeout, an
+    unreachable server, or the main resource failing. So an error page and a timeout arrive by
+    different routes here and must never be reported as the same thing.
+
     The URL is not logged here. The page's own address is still never read back, returned or logged:
     _page_identity stays the only thing taken from a page, and it is a fingerprint, not an address."""
     with _browser_lock:
@@ -771,8 +777,35 @@ def browser_navigate(session_id: str, page_id: str, url: str,
         raise BrowserError("that page is not part of this browser session")
 
     timeout = max(1.0, float(navigate_timeout_seconds)) * 1000
+    # WHY `commit`. The four milestones, verified against the installed Playwright 1.62.0 docstring:
+    # `commit` - the network response is received and the document started loading; `domcontentloaded`
+    # - the DOMContentLoaded event fired; `load` - the load event fired; `networkidle` - DISCOURAGED by
+    # Playwright itself ("Don't use this method for testing, rely on web assertions to assess readiness
+    # instead"), so never an option here.
+    #
+    # THIS REVERSES AN EARLIER DECISION IN THIS FILE, and the measurements are why. The first attempt
+    # moved `load` -> `domcontentloaded` and argued AGAINST `commit` on the grounds that the DOM may
+    # still be empty at that instant. That argument is still true as far as it goes, but it assumed
+    # DOMContentLoaded was cheap. The owner then measured, on their machine:
+    #
+    #   main document only (PowerShell):   herokuapp 1.23s   smebluepages 12.27s   wikipedia 1.15s
+    #   DOMContentLoaded (warm Chrome):    herokuapp 30.94s  smebluepages 15.35s
+    #
+    # A document that arrives in 1.2 seconds whose DOMContentLoaded lands at 31 is not a page that is
+    # slow to reach - it is a page with something blocking the parse. DOMContentLoaded is therefore not
+    # a usable readiness signal here at any budget worth waiting: `domcontentloaded` still timed out on
+    # both pages, which is the measured fact that killed the previous choice.
+    #
+    # `commit` is bounded by the thing that was actually fast: the document request. It also matches
+    # Playwright's own guidance quoted above - do not rely on a page-level event, wait for the element -
+    # and waiting for the element is what the DOM click's own bounded readiness wait already does.
+    #
+    # WHAT THIS DELIBERATELY DOES NOT CLAIM. At commit the DOM may be empty, so navigation returning is
+    # NOT a statement that any control exists. It never was: the result is Outcome.UNVERIFIED and says
+    # to look at the page. If the target is still not there when the click is attempted, the click
+    # refuses and nothing is clicked - which is tested, not assumed.
     try:
-        page.goto(url, timeout=timeout, wait_until="load")
+        page.goto(url, timeout=timeout, wait_until="commit")
     except Exception as exc:                      # Playwright raises its own error types
         # A timeout is NOT a failure to start: goto may have navigated and then run out of time
         # waiting for the load event, so the page may be partly there. Only the caller can decide

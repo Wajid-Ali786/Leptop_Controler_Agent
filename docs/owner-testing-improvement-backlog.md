@@ -78,31 +78,28 @@ capability and a future session must not treat W-2 as evidence for BL-10.
 
 ## Section 2 — OBSERVED DEFECTS
 
-### BL-1 — Navigation reports a 20-second timeout on a page that is reachable
+### BL-1 — A slow website may exceed the navigation bound (KNOWN LIMITATION, closed 2026-10-09)
 
-- **Evidence:** `OWNER-OBSERVED` — the Herokuapp *Add/Remove Elements* demo reported a 20-second
-  navigation timeout on **separate, repeated attempts**. `https://example.com` navigated with no
-  timeout at all (W-6).
-- **Expected:** navigation of a reachable page completes and reports completion.
-- **Actual:** the navigation deadline elapses and the result says the load was not confirmed.
-- **User impact:** the workflow stalls on real-world pages. The result is *honest* (it never claims
-  the page loaded — see BL-2) but the user is left to judge the browser by eye.
-- **Suspected cause, UNCONFIRMED:** `app/executor/adapter.browser_navigate` passes
-  `wait_until="load"`, which waits for **every subresource** — images, fonts, analytics, trackers —
-  so a page that is interactive long before it is "loaded" can still exhaust the deadline. This is
-  the leading hypothesis and it has **not** been confirmed. Alternatives not ruled out: a slow or
-  blocked third-party request on that specific page; `browser.navigate_timeout_seconds` (20.0) simply
-  being too short for it; a Playwright-channel difference.
-- **Proposed direction (not implementation):** investigate navigation *readiness* and *completion*
-  criteria as a question in its own right, including what Playwright's `wait_until` states actually
-  guarantee. **Do not conflate a usable page with a verified successful navigation** — that
-  distinction is the honest part of the current behaviour and must survive any change.
-- **Priority:** HIGH — it blocks the workflow W-1 proves on exactly the kind of page the owner wants
-  to use.
-- **Status:** `UNDER INVESTIGATION`
-- **Future real-machine acceptance test:** navigate to the Herokuapp Add/Remove Elements demo and to
-  two other third-party pages; each reports a confirmed completion, within the configured bound, and
-  a subsequent named click in each succeeds without a manual refresh.
+**RECLASSIFIED BY THE OWNER from a defect to a KNOWN LIMITATION. No further rounds.**
+
+- **The limitation:** a slow website may exceed the navigation bound. The assistant then says
+  honestly that it cannot confirm the page loaded, and **the page is still usable** — the owner
+  verified this by clicking successfully on both failing sites. **The cost is a wait, not a
+  failure.**
+- **Evidence:** `OWNER-OBSERVED`. Measured DOMContentLoaded, in a **warm** browser:
+  **herokuapp 30.9 s, smebluepages 15.4 s.** Main document only, via PowerShell: herokuapp 1.23 s,
+  smebluepages 12.27 s, Wikipedia 1.15 s. In the assistant browser, Wikipedia and example.com
+  navigated normally while herokuapp and smebluepages reported the 20-second bound.
+- **User impact:** a wait on slow sites, followed by an honest "I can't confirm it loaded" and a
+  page that can still be clicked in.
+- **Status:** `KNOWN LIMITATION` — not a defect, not under investigation, and **not** to be reopened
+  as another milestone, bound or measurement round.
+- **What was changed while it was investigated:** the navigation milestone is `commit` in
+  `app/executor/adapter.browser_navigate` (it was `load`, briefly `domcontentloaded`), bounded by
+  `browser.navigate_timeout_seconds`, which is unchanged at 20.0. The honest timeout message is
+  unchanged, and `networkidle` remains excluded — Playwright's own docstring marks it DISCOURAGED.
+- **The one rule that must survive:** **do not conflate a usable page with a verified successful
+  navigation.** The result stays `Outcome.UNVERIFIED` and tells the owner to look at the page.
 
 ### BL-2 — A page is sometimes unusable immediately and usable later
 

@@ -599,3 +599,252 @@ def test_the_single_session_rule_is_unchanged(world):
     result = run(world)
     assert not result.ok and "more than one" in result.message
     assert world.navigations == []
+
+
+
+# ======================================================================================================
+# BL-1, SECOND ROUND: the milestone moves to `commit`, on the owner's measurements
+#
+# MEASURED on the owner's machine (facts):
+#     main document only (PowerShell):  herokuapp 1.23s   smebluepages 12.27s   wikipedia 1.15s
+#     DOMContentLoaded (warm Chrome):   herokuapp 30.94s  smebluepages 15.35s
+#     assistant browser:                herokuapp and smebluepages both timed out at 20s,
+#                                       wikipedia and example.com fine
+#
+# So `domcontentloaded` did NOT fix it, and a document that arrives in 1.2s whose DOMContentLoaded
+# lands at 31s is a page with a blocked parse, not a page that is slow to reach.
+#
+# THE FAKE BELOW MODELS THAT MEASURED SHAPE, and the point of these tests is the pair the brief
+# requires: a control that IS available soon after commit must be clickable, and a control that is NOT
+# must be refused rather than claimed. The second is the safety case for choosing commit at all.
+# ======================================================================================================
+
+from tests.test_dom_observation import FakeLocator, FakePage, control as dom_control  # noqa: E402
+
+
+class ClickingLocator(FakeLocator):
+    """FakeLocator plus click(). The DOM Slice 1 fake is deliberately READ-ONLY - it has no click, so
+    an observation test cannot act by accident - and these two tests need the whole commit -> query ->
+    click path. Subclassed rather than changing the shared fake."""
+
+    def click(self, timeout=None, **kwargs):
+        assert timeout is not None, "the click must be bounded"
+        self._page.clicks.append(self._one["name"])
+
+    def nth(self, index):
+        return ClickingLocator([self._controls[index]], self._page)
+
+    def or_(self, other):
+        return ClickingLocator(self._controls + other._controls, self._page)
+
+    @property
+    def first(self):
+        return ClickingLocator(self._controls[:1], self._page)
+
+
+class Response:
+    """What goto() returns: the main resource response. Playwright does NOT throw for a 404."""
+
+    def __init__(self, status=200):
+        self.status = status
+
+
+class MeasuredPage(FakePage):
+    """A page with BOTH halves: Playwright's navigation milestones and role scanning.
+
+    `goto` behaves like the real one - a milestone beyond the budget raises with "Timeout" in the
+    message - so a test can ask what each milestone would have done to the SAME page. The inherited
+    `ready_after_waits` is how a control that has not been parsed yet is modelled: at commit the DOM
+    may legitimately be empty, which is the risk commit carries and the thing that must be tested.
+    """
+
+    MILESTONES = ("commit", "domcontentloaded", "load", "networkidle")
+
+    def __init__(self, controls, *, commit_ms=1_230, dcl_ms=30_940, load_ms=120_000,
+                 status=200, unreachable=False, ready_after_waits=0, frames=1):
+        super().__init__(controls, frames=frames)
+        # inherited from FakePage and set after construction, as that class expects
+        self.ready_after_waits = ready_after_waits
+        self.clicks = []
+        self.when = {"commit": commit_ms, "domcontentloaded": dcl_ms, "load": load_ms,
+                     "networkidle": load_ms + 500}
+        self.status = status
+        self.unreachable = unreachable
+        self.gotos = []
+
+    def get_by_role(self, role, name=None, exact=None):
+        found = super().get_by_role(role, name=name, exact=exact)
+        return ClickingLocator(found._controls, self)
+
+    def goto(self, url, timeout=None, wait_until=None):
+        self.gotos.append((url, timeout, wait_until))
+        if self.unreachable:
+            raise RuntimeError("net::ERR_NAME_NOT_RESOLVED at " + url)
+        assert wait_until in self.MILESTONES, f"unknown milestone {wait_until!r}"
+        if self.when[wait_until] > (timeout or 0):
+            raise RuntimeError(f"Timeout {timeout:.0f}ms exceeded.")
+        return Response(self.status)
+
+
+@pytest.fixture
+def measured(monkeypatch):
+    """Install a MeasuredPage in the real registry, with the genuine navigate/query/click reinstalled.
+
+    This file is ABOUT those three functions, so they are read from the adapter's source the way the
+    DOM slices' tests do. The page is pure Python: no Playwright, no socket, nothing real."""
+    from tests.test_dom_observation import EXECUTOR_ADAPTER, code_of_named
+    import textwrap
+
+    def genuine(name):
+        namespace = {}
+        source = textwrap.dedent(code_of_named(EXECUTOR_ADAPTER, name))
+        exec(compile(source, "<adapter>", "exec"), vars(executor_adapter), namespace)
+        return namespace[name]
+
+    for name in ("browser_navigate", "dom_query", "dom_click", "dom_page_has_frames"):
+        monkeypatch.setattr(executor_adapter, name, genuine(name))
+
+    def install(page):
+        state = executor_adapter._BrowserSession(
+            runtime=SimpleNamespace(stop=lambda: None),
+            browser=SimpleNamespace(close=lambda: None),
+            context=SimpleNamespace(close=lambda: None),
+            pages={PAGE: page}, tokens={})
+        with executor_adapter._browser_lock:
+            executor_adapter._browser_sessions[SESSION] = state
+        return page
+
+    yield install
+    with executor_adapter._browser_lock:
+        executor_adapter._browser_sessions.pop(SESSION, None)
+
+
+HEROKUAPP = "https://the-internet.herokuapp.com/add_remove_elements/"
+SMEBLUEPAGES = "https://www.smebluepages.com/"
+
+
+def test_the_measured_shape_is_modelled_and_the_old_milestones_would_still_fail(measured):
+    """The fake's premise, asserted before it is used as evidence. The SAME page, the SAME 20-second
+    budget, and the answer differs by milestone exactly as the owner's numbers say it should."""
+    page = MeasuredPage([dom_control("Add Element")], commit_ms=1_230, dcl_ms=30_940)
+    for milestone in ("domcontentloaded", "load"):
+        with pytest.raises(RuntimeError, match="Timeout"):
+            page.goto(HEROKUAPP, timeout=20_000, wait_until=milestone)
+    assert page.goto(HEROKUAPP, timeout=20_000, wait_until="commit").status == 200
+
+
+def test_herokuapp_navigates_at_commit(measured):
+    """BL-1's first failing URL, at its measured shape: document 1.23s, DOMContentLoaded 30.94s."""
+    page = measured(MeasuredPage([dom_control("Add Element")], commit_ms=1_230, dcl_ms=30_940))
+    assert executor_adapter.browser_navigate(SESSION, PAGE, HEROKUAPP, 20.0) \
+        == executor_adapter.NAVIGATED
+    assert page.gotos[0][2] == "commit"
+
+
+def test_smebluepages_navigates_at_commit(measured):
+    """BL-1's second failing URL: a slow SERVER (12.27s for the document) rather than a blocked parse.
+    Commit is bounded by the document, so it fits inside the existing 20-second budget."""
+    page = measured(MeasuredPage([dom_control("Login")], commit_ms=12_270, dcl_ms=15_350))
+    assert executor_adapter.browser_navigate(SESSION, PAGE, SMEBLUEPAGES, 20.0) \
+        == executor_adapter.NAVIGATED
+    assert page.gotos[0][2] == "commit"
+
+
+# --- THE PAIR THE BRIEF REQUIRES -------------------------------------------------------------------
+
+def test_commit_then_a_control_that_is_there_navigates_and_clicks(measured):
+    """CASE 1. The document commits quickly, the target becomes available quickly, and
+    DOMContentLoaded is delayed by blocking resources -> navigation AND the click both work."""
+    page = measured(MeasuredPage([dom_control("Add Element")], commit_ms=1_230, dcl_ms=30_940,
+                                 ready_after_waits=0))
+    assert executor_adapter.browser_navigate(SESSION, PAGE, HEROKUAPP, 20.0) \
+        == executor_adapter.NAVIGATED
+    found = executor_adapter.dom_query(SESSION, PAGE, "add element", 2.0)
+    assert len(found) == 1, found
+    assert executor_adapter.dom_click(SESSION, PAGE, found[0].element_token, 2.0) \
+        == executor_adapter.DOM_CLICKED
+    assert page.clicks == ["Add Element"]
+
+
+def test_commit_then_a_control_that_is_not_there_yet_refuses_and_clicks_nothing(measured):
+    """CASE 2, AND THE SAFETY CASE FOR CHOOSING COMMIT AT ALL. The document commits quickly, but
+    parsing delays the target beyond the click's readiness bound.
+
+    The assistant must NOT claim the control is available and must NOT click a stale target. It
+    refuses: dom_query returns nothing, so there is no token to click and nothing is clicked."""
+    page = measured(MeasuredPage([dom_control("Add Element")], commit_ms=1_230, dcl_ms=30_940,
+                                 ready_after_waits=99))   # never parsed inside one bounded wait
+    assert executor_adapter.browser_navigate(SESSION, PAGE, HEROKUAPP, 20.0) \
+        == executor_adapter.NAVIGATED
+    found = executor_adapter.dom_query(SESSION, PAGE, "add element", 2.0)
+    assert found == [], "a control that has not parsed was reported as available"
+    assert page.clicks == [], "nothing may be clicked"
+    assert page.waits == 1, "it did wait once, within its own bound, before refusing"
+
+
+def test_the_click_readiness_deadline_starts_at_the_click_not_at_commit(measured):
+    """The brief's correction, pinned: the click's bound is spent when the CLICK is attempted. Two
+    separate attempts each get their own bounded wait, which is why a page that keeps parsing can
+    succeed on a later attempt rather than being lost by the navigation."""
+    page = measured(MeasuredPage([dom_control("Add Element")], commit_ms=1_230, ready_after_waits=2))
+    assert executor_adapter.browser_navigate(SESSION, PAGE, HEROKUAPP, 20.0) \
+        == executor_adapter.NAVIGATED
+    assert executor_adapter.dom_query(SESSION, PAGE, "add element", 2.0) == []   # wait 1
+    found = executor_adapter.dom_query(SESSION, PAGE, "add element", 2.0)        # wait 2 -> ready
+    assert len(found) == 1, "a second attempt gets its own deadline against a further-parsed page"
+
+
+# --- the guarantees that must survive the change ---------------------------------------------------
+
+def test_an_unreachable_address_still_fails_honestly_at_commit(measured):
+    """Playwright throws for an unreachable server whatever the milestone, and the message is not a
+    timeout message - so it is a BrowserError, not NAVIGATED and not a timeout."""
+    measured(MeasuredPage([], unreachable=True))
+    with pytest.raises(executor_adapter.BrowserError):
+        executor_adapter.browser_navigate(SESSION, PAGE, "https://no-such-host.invalid", 20.0)
+
+
+@pytest.mark.parametrize("status", [404, 500, 403])
+def test_an_http_error_page_is_still_a_navigation_at_commit(measured, status):
+    """commit means "the network response is received", so the response - and its status - exists.
+    Playwright does not throw for a valid status, so a 404 is still a page that loaded."""
+    measured(MeasuredPage([], commit_ms=500, status=status))
+    assert executor_adapter.browser_navigate(SESSION, PAGE, URL, 20.0) \
+        == executor_adapter.NAVIGATED
+
+
+def test_a_document_that_never_arrives_is_still_a_timeout_within_the_bound(measured):
+    """The budget is untouched and still bites: a server that accepts the connection and never
+    responds exhausts it, and is reported as a timeout rather than as a load."""
+    page = measured(MeasuredPage([], commit_ms=60_000))
+    assert executor_adapter.browser_navigate(SESSION, PAGE, URL, 20.0) \
+        == executor_adapter.NAVIGATE_TIMEOUT
+    assert page.gotos[0][1] == 20_000, "the configured bound reached Playwright, in milliseconds"
+
+
+def test_the_navigation_budget_was_not_raised():
+    """The brief's constraint, and the measurements' own conclusion: commit is bounded by the document
+    request, so no bigger number is needed. 20.0 is unchanged."""
+    text = (settings.PROJECT_ROOT / "config" / "config.yaml").read_text(encoding="utf-8")
+    assert "navigate_timeout_seconds: 20.0" in text
+
+
+def test_the_click_readiness_bound_was_not_raised():
+    """EXPLICITLY NOT CHANGED, and the report says why: no measurement exists of how long a control
+    takes to parse AFTER commit, and 2.0 -> some number chosen from DOMContentLoaded timings would be
+    a guess wearing a number. The owner's smoke produces the evidence a new value would need."""
+    text = (settings.PROJECT_ROOT / "config" / "config.yaml").read_text(encoding="utf-8")
+    assert "query_timeout_seconds: 2.0" in text
+    from tests.test_dom_observation import EXECUTOR_ADAPTER, code_of_named
+    matches = code_of_named(EXECUTOR_ADAPTER, "_dom_matches")
+    assert "deadline = time.monotonic() + max(0.0, float(timeout_ms)) / 1000.0" in matches
+    assert "_wait_for_any_role(page, wanted, remaining_ms)" in matches
+
+
+def test_exactly_one_milestone_is_chosen_and_it_is_commit():
+    source = (settings.PROJECT_ROOT / "app" / "executor" / "adapter.py").read_text(encoding="utf-8")
+    code = " ".join(line.split("#")[0] for line in source.splitlines())
+    assert code.count("wait_until=") == 1
+    assert 'wait_until="commit"' in code
+    for rejected in ('wait_until="load"', 'wait_until="domcontentloaded"', "networkidle"):
+        assert rejected not in code, rejected
