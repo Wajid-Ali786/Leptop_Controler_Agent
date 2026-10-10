@@ -43,6 +43,13 @@ _clock = time.time  # replaced in tests to control the exported timestamp
 RECOVERY_HINT = ("You can start a fresh memory, or restore a memory export once that is available. "
                  "Nothing was changed or deleted.")
 
+# The MISSING case gets its own way forward, because it is the only one where starting fresh actually
+# works: for a damaged or incomplete database the command below refuses on purpose, so offering it there
+# as the fix would be an offer that cannot be accepted. The command is named verbatim, so the sentence
+# the user reads and the words they can type are the same words.
+MISSING_RECOVERY = ("Type \"start fresh memory\" to create an empty one, or restore a memory export "
+                    "once that is available. Nothing was changed or deleted.")
+
 _MISSING_REASON = "I have no memory database yet, so I don't remember anything."
 _NEWER_REASON = ("This memory database was written by a newer version of the assistant "
                  "(schema {found}; this build understands {understood}), so I won't read it.")
@@ -82,6 +89,114 @@ def initialize() -> MemoryDatabase | MemoryUnavailable:
     return MemoryDatabase(path=str(path), schema_version=version)
 
 
+# --- Accepting the offer: explicit first-time creation ------------------------------------------------
+# WHY THIS EXISTS. initialize() has existed since Slice 1 and had NO production caller, so the database
+# the assistant kept offering to start could never come into existence and nothing could ever be
+# remembered. This is the one function a front end calls to accept that offer.
+#
+# IT IS NOT initialize(), AND THE DIFFERENCE IS THE POINT. initialize() is idempotent by design - run on
+# an existing current database it returns success and changes nothing - which is right for a caller that
+# wants a database to exist. It is wrong for a caller answering "shall I make you a new one?", because
+# "you already have one" is a different answer from "here is a new one", and because a database that
+# OPENS is not necessarily a database that is COMPLETE. So the three states are told apart here, and
+# initialize() itself is untouched.
+#
+# NOTHING IS EVER REPLACED, RECREATED, TRUNCATED OR REPAIRED. Every refusing branch below returns before
+# any write is attempted, and the only branch that writes is the one where the configured path holds
+# nothing at all.
+
+ALREADY_HAVE = ("I already have a memory database, so I've left it exactly as it is. Nothing was "
+                "created, changed or deleted.")
+INCOMPLETE_DATABASE = ("There is already a memory database at the configured path, but it is missing "
+                       "{missing} of the {total} structures it should hold, so it is not a working "
+                       "memory and it is NOT a missing one either - I won't replace it or try to repair "
+                       "it.")
+DID_NOT_FINISH = ("I started creating the memory database but it didn't finish - {missing} of the "
+                  "{total} structures aren't there - so I'm not going to tell you it worked.")
+MOVE_IT_ASIDE = ("Move that file somewhere else and ask again, or restore a memory export once that is "
+                 "available. I won't delete or overwrite it for you.")
+
+
+def start_fresh_memory() -> MemoryDatabase | NotFound | MemoryUnavailable:
+    """Create the memory database because the USER asked for it, and only when there is nothing there.
+
+    Three states, told apart deliberately rather than two:
+
+      * NOTHING at the configured path -> create it, then CONFIRM all fifteen structures are really
+        there before reporting success
+      * a sound, complete database     -> NotFound(ALREADY_HAVE). Refused, untouched
+      * something that cannot be opened, or that opens but is INCOMPLETE -> MemoryUnavailable. Refused,
+        untouched. A damaged database is not a missing one: frozen docs/phase4-closeout.md Section 8
+        says a missing database is "never silently replaced by an empty one", and replacing a damaged
+        one would destroy the very data an export is meant to recover
+
+    WHAT THIS DELIBERATELY WILL NOT DO, and the cost of it: if creation fails part-way it leaves the
+    partial file where it is and says so. That file will then be refused as incomplete every time, so
+    the user has to move it aside themselves. Deleting it automatically would be this function
+    overwriting a database it did not make, which is the one thing the frozen requirement forbids."""
+    absent = database_is_absent()
+    if isinstance(absent, MemoryUnavailable):
+        return absent
+    if not absent:
+        return _existing_database()
+    created = initialize()
+    if not isinstance(created, MemoryDatabase):
+        return created
+    missing = _missing_structures(Path(created.path))
+    if isinstance(missing, MemoryUnavailable):
+        return missing
+    if missing:
+        return _unavailable(DID_NOT_FINISH.format(missing=len(missing), total=len(TABLE_NAMES)),
+                            created.path, MOVE_IT_ASIDE)
+    log.info("Memory: created a new database with %d structures", len(TABLE_NAMES))
+    return created
+
+
+def database_is_absent() -> bool | MemoryUnavailable:
+    """Is there NOTHING at the configured path? As distinct from something that cannot be opened.
+
+    Deliberately asks whether anything EXISTS rather than whether a file exists: a directory, a socket
+    or a symlink at that path is still something, and the answer "absent" is what authorises a write.
+    Fails closed - an unreadable setting or an OS error answers "not absent", so a path this function
+    cannot inspect is never created over."""
+    try:
+        path = database_path()
+    except SettingsError as exc:
+        return _unavailable(str(exc), "")
+    try:
+        return not path.exists()
+    except OSError as exc:
+        return _unavailable(f"I can't tell whether a memory database is there ({exc}).", path)
+
+
+def _existing_database():
+    """The answer for a path that already holds something: refused either way, and never written to."""
+    opened = open_memory()
+    if isinstance(opened, MemoryUnavailable):
+        return opened                      # damaged, or a schema version this build will not touch
+    missing = _missing_structures(Path(opened.path))
+    if isinstance(missing, MemoryUnavailable):
+        return missing
+    if missing:
+        # OPENS BUT IS INCOMPLETE - the third state. open_memory() cannot see this: its integrity check
+        # and version read both pass on a database whose tables were never finished being created.
+        return _unavailable(INCOMPLETE_DATABASE.format(missing=len(missing), total=len(TABLE_NAMES)),
+                            opened.path, MOVE_IT_ASIDE)
+    return NotFound(ALREADY_HAVE)
+
+
+def _missing_structures(path: Path):
+    """Which of the fifteen frozen structures are NOT in the database at `path`.
+
+    The success report depends on this rather than on a schema version number: the version says which
+    build wrote the file, not that the writing finished."""
+    try:
+        present = set(adapter.table_names(path))
+    except adapter.MemoryAdapterError as exc:
+        return _unavailable(str(exc), path)
+    return tuple(name for name in TABLE_NAMES if name not in present)
+
+
 def open_memory() -> MemoryDatabase | MemoryUnavailable:
     """Open the memory database that should already exist.
 
@@ -96,7 +211,7 @@ def open_memory() -> MemoryDatabase | MemoryUnavailable:
         version = adapter.open_existing(path)
     except FileNotFoundError:
         log.info("Memory: no database at the configured path; nothing is remembered yet")
-        return _unavailable(_MISSING_REASON, path)
+        return _unavailable(_MISSING_REASON, path, MISSING_RECOVERY)
     except adapter.MemoryAdapterError as exc:
         log.warning("Memory: the database could not be opened (%s)", type(exc).__name__)
         return _unavailable(str(exc), path)
@@ -125,7 +240,7 @@ def wipe() -> MemoryDatabase | MemoryUnavailable:
     try:
         adapter.wipe(path)
     except FileNotFoundError:
-        return _unavailable(_MISSING_REASON, path)
+        return _unavailable(_MISSING_REASON, path, MISSING_RECOVERY)
     except adapter.MemoryAdapterError as exc:
         return _unavailable(str(exc), path)
     log.info("Memory: wiped; %d structures remain, all empty", len(TABLE_NAMES))
@@ -136,8 +251,8 @@ def _newer_schema(found: int, path) -> MemoryUnavailable:
     return _unavailable(_NEWER_REASON.format(found=found, understood=SCHEMA_VERSION), path)
 
 
-def _unavailable(reason: str, path) -> MemoryUnavailable:
-    return MemoryUnavailable(reason=reason, recovery=RECOVERY_HINT, path=str(path))
+def _unavailable(reason: str, path, recovery: str = RECOVERY_HINT) -> MemoryUnavailable:
+    return MemoryUnavailable(reason=reason, recovery=recovery, path=str(path))
 
 
 # --- Slice 2: local update and retrieval -------------------------------------------------------------
@@ -232,6 +347,128 @@ def find_contact(person_id: int, channel: str | None = None, *, context: str):
         return Redacted(contacts[0], "contacts.address", context,
                         "I'm not allowed to share that contact's address here.")
     return Found(contacts[0])
+
+
+# --- Phase 4 wiring: the one gated write a typed "remember" reaches ----------------------------------
+# STRUCTURED ARGUMENTS ONLY. The sentence was parsed in app/brain/personal_memory.py, which is where
+# language belongs; what arrives here is name, channel and address, exactly as the rest of this file
+# expects. Nothing here is sent anywhere - the write is local, and a remembered value has no path from
+# this function to an action, a plan step or a provider request.
+#
+# IT COMPOSES TWO WRITES, AND THAT IS WHY IT IS A FUNCTION RATHER THAN TWO CALLS FROM A FRONT END: a
+# front end that got the first write and lost the second would leave a person behind with no contact and
+# no way to know it had happened. See _undone() for exactly how far that is fixable here.
+
+ALREADY_DIFFERENT = ("I already have a different {channel} for {name}, so I haven't stored this one. I "
+                     "won't overwrite what you told me before, and I won't keep two.")
+PARTIAL_WRITE = ("I added {name} but couldn't store the {channel}, and then couldn't undo the first "
+                 "part - so {name} may be in my memory with no contact. Nothing else was changed.")
+NEED_THE_THREE = "I need a name, a channel and an address to remember how to reach someone."
+
+_SAME, _DIFFERENT, _CLEAR = "same", "different", "clear"
+
+
+def remember_contact(name: str, channel: str, address: str, decision: PersistenceDecision):
+    """Remember how to reach one person: find or add them, then store the address on that channel.
+
+    `decision` is required and has no default, for the same reason remember_explicitly() requires one:
+    Memory cannot look at an arbitrary string and tell a phone number from a password, so the CALLER has
+    to say the value is safe to keep. DENY stores nothing.
+
+    What it will NOT do:
+      * pick between two people who share the name. find_person() reports Ambiguous and that is returned
+        unchanged - choosing one would attach a contact to the wrong person silently.
+      * overwrite or duplicate a channel that already has a different address. That is refused, and the
+        refusal names the channel but NOT the stored address: this is the write path, it applies no
+        disclosure rule, so it is not a place that may disclose.
+      * say "remembered" for a half-finished write. Found() is returned only when the complete intended
+        state is in the database.
+
+    An exact repeat is idempotent: the same name, channel and address again stores nothing and reports
+    the row that is already there. contacts has UNIQUE (person_id, channel, address), so re-inserting it
+    would be an error rather than a duplicate - but people has NO unique constraint and add_person()
+    deliberately never merges, so a second call must not be allowed to reach it either.
+
+    IT IS NOT ATOMIC, AND THE EXISTING APIS CANNOT MAKE IT SO. _write() opens its own connection per
+    call, so the person and the contact are two separate transactions with no outer one around them. A
+    failure of the second is COMPENSATED by removing the person this call added - not rolled back. The
+    window that leaves is named in _undone()."""
+    if decision is not PersistenceDecision.ALLOW:
+        return NotFound(NOT_APPROVED)
+    if not all(_given(value) for value in (name, channel, address)):
+        return NotFound(NEED_THE_THREE)
+    known = find_person(name)
+    if isinstance(known, (MemoryUnavailable, Ambiguous)):
+        return known
+    created = None
+    if isinstance(known, NotFound):
+        added = add_person(name)
+        if not isinstance(added, Found):
+            return added
+        created = added.value.id
+    person_id = created if created is not None else known.value.id
+    state = _channel_state(person_id, channel, address)
+    if isinstance(state, MemoryUnavailable):
+        return _undone(state, created, name, channel)
+    kind, row_id = state
+    if kind == _SAME:
+        # Already exactly this, so nothing is written. The address in the result is the one the user just
+        # typed; it equals the stored one under normalize(), which is the only sense in which this
+        # project compares two addresses at all.
+        return Found(Contact(row_id, person_id, channel.strip(), address.strip()))
+    if kind == _DIFFERENT:
+        return _undone(NotFound(ALREADY_DIFFERENT.format(channel=channel.strip(), name=name.strip())),
+                       created, name, channel)
+    stored = add_contact(person_id, channel, address)
+    if not isinstance(stored, Found):
+        return _undone(stored, created, name, channel)
+    # Metadata only: a channel is a vocabulary word, and the name and the address are never logged.
+    log.info("Memory: remembered one %s contact", channel.strip().lower())
+    return stored
+
+
+def _channel_state(person_id: int, channel: str, address: str):
+    """Whether this person's channel already holds this address, a different one, or nothing.
+
+    IT READS THE ROWS WITHOUT THE DISCLOSURE RULES, DELIBERATELY. find_contact() is the disclosure
+    boundary and may leave the address out, which is right for a caller that wants to SHOW it and wrong
+    for one that has to COMPARE it: a withheld address would read as "nothing stored", and the
+    comparison would wave a second row through. So the rows are read directly here - and no address
+    leaves this function. What comes back is one of three words and a row id."""
+    opened = open_memory()
+    if isinstance(opened, MemoryUnavailable):
+        return opened
+    try:
+        rows = adapter.select_contacts(Path(opened.path), person_id, channel.strip())
+    except adapter.MemoryAdapterError as exc:
+        return _unavailable(str(exc), opened.path)
+    wanted = normalize(address)
+    for row in rows:
+        if normalize(row[3]) == wanted:
+            return _SAME, row[0]
+    return (_DIFFERENT, rows[0][0]) if rows else (_CLEAR, None)
+
+
+def _undone(failure, created, name: str, channel: str):
+    """Return `failure`, having removed a person THIS CALL had just added.
+
+    COMPENSATION, NOT A TRANSACTION, and the difference is worth being exact about. The person row was
+    committed by its own connection before the second write was attempted, so there is nothing to roll
+    back; the only thing available is a second write that deletes it. A person who already existed is
+    never touched - `created` is None for them - because the user did not ask for them to be forgotten.
+
+    THE WINDOW THIS LEAVES: the delete can itself fail (an unavailable database is the likely way, since
+    that is what broke the contact write in the first place). Then the person IS in memory with no
+    contact, and PARTIAL_WRITE says so rather than reporting a clean failure. It is never reported as a
+    success either way."""
+    if created is None:
+        return failure
+    removed = delete_entry("people", created)
+    if isinstance(removed, Deleted):
+        log.info("Memory: undid a half-finished contact write")
+        return failure
+    log.warning("Memory: could not undo a half-finished contact write; a person may have no contact")
+    return NotFound(PARTIAL_WRITE.format(name=name.strip(), channel=channel.strip()))
 
 
 def remember_application_alias(alias: str, app_key: str, configured_app_keys):

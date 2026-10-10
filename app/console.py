@@ -89,8 +89,11 @@ from app.executor.models import CLICK, CLICK_TARGET, CLOSE_APP, CLOSE_BROWSER, N
     OPEN_BROWSER, REFRESH, SCROLL, SHORTCUT, \
     TYPE_TEXT, WINDOW_CONTROL, \
     ActionResult, ExecutorAction, RESOLVE_UNKNOWN_APP, Resolved, Unresolved
+from app.brain import personal_memory
+from app.memory import logic as memory_logic
 from app.memory import queries as memory_queries
-from app.memory.models import Found as MemoryFound
+from app.memory.models import (Found as MemoryFound, MemoryDatabase, PersistenceDecision,
+                               TABLE_NAMES as MEMORY_STRUCTURES, normalize)
 from app.safety.logic import ActionDeniedError
 from app.safety.models import RiskLevel
 from app.verifier import logic as verifier
@@ -105,6 +108,13 @@ YES = "yes"  # the only answer that confirms anything
 # by every nested prompt, is what makes the console predictable: see classify_answer().
 EXIT_WORD = "exit"
 HELP_WORD = "help"
+# The console's own administrative command, in the console's own vocabulary beside exit and help - it is
+# not a desktop action, it never becomes an ExecutorAction, and it asks the Brain nothing.
+#
+# THE WORDING IS NOT A FREE CHOICE. app/memory/logic.MISSING_RECOVERY tells the user to type
+# "start fresh memory", so that exact phrase has to be the one that works; the longer form is accepted
+# because it is how the sentence reads. A test pins the offer and the command to each other.
+START_MEMORY_WORDS = frozenset({"start fresh memory", "start a fresh memory"})
 # "abandon this question" - said in the three ways a person actually says it. At a yes-or-no prompt
 # these already meant "not yes"; what changes is that the console now SAYS what it abandoned instead of
 # falling silently through a "not yes" branch.
@@ -185,6 +195,10 @@ class Status(str, Enum):
     UNAVAILABLE = "unavailable"            # the reasoning service couldn't be reached
     NO_PLAN = "no_plan"                    # no plan could be built, or the reply couldn't be believed
     CANCELLED = "cancelled"                # a plan was shown and the user said no
+    # Phase 4 wiring. Handled from local memory: nothing reached the Executor, nothing was planned, and
+    # nothing left this machine - the line never reached the Brain at all. It covers both a recall
+    # answer and the explicit "start fresh memory", which writes a database and no action.
+    ANSWERED = "answered"
 
 
 class Answer(str, Enum):
@@ -212,7 +226,12 @@ HANDED_BACK = (Answer.EXIT, Answer.HELP, Answer.COMMAND)
 
 @dataclass(frozen=True)
 class CommandReply:
-    """The outcome of one typed line. `message` is always safe to show: it never contains typed text."""
+    """The outcome of one typed line. `message` is safe to SHOW the user, and never contains typed text.
+
+    ONE EXCEPTION, AND IT IS THE POINT OF IT: a Status.ANSWERED reply to a recall question carries the
+    value the user asked for, because showing it back is the whole answer. That message is built at the
+    seam in handle_typed_line() - ahead of every provider call - and the reply is returned from there,
+    so it is not a plan step, not an ActionResult, not an action target and not logged."""
     status: Status
     message: str
     action: ExecutorAction | None = None
@@ -526,6 +545,17 @@ PLAN_DONE_UNVERIFIED = ("All {count} step{plural} finished, but I couldn't check
                         "them actually did - so this isn't confirmation that it worked.")
 NOTHING_TO_DO = "There was nothing to do in that."
 
+# Phase 4 wiring. REMEMBERED deliberately does NOT echo the address: the write path applies no
+# disclosure rule, so it is not a place that may disclose. RECALLED is the one message in this module
+# that carries a stored value, because showing it back IS the answer the user asked for.
+REMEMBERED = "Remembered: {name}'s {channel}. It stays on this machine - I didn't send it anywhere."
+RECALLED = "{name}'s {channel}: {address}"
+KEYBOARD_ONLY = ("I only store things like that when you type them - a misheard digit stored quietly is "
+                 "worse than typing it again. So I haven't stored that, and I haven't sent it anywhere "
+                 "either.")
+MEMORY_STARTED = ("Memory is ready: a new, empty database with all {count} structures, at {path}. It "
+                  "lives on this machine, and nothing in it is ever sent to the reasoning service.")
+
 
 def is_fresh_command(line: str) -> bool:
     """Is this line a NEW top-level command rather than an answer to the question just asked?
@@ -547,6 +577,20 @@ def is_fresh_command(line: str) -> bool:
     if not isinstance(line, str) or not line.strip():
         return False
     if line.strip().lower() in ("exit", "help"):
+        return True
+    if _is_start_memory(line):
+        # The console's own command, so it behaves like exit and help do: handed back to the loop rather
+        # than consumed as correction or clarification text. Without it, typing the one command the
+        # missing-database message names, at the prompt that message was printed above, would send it to
+        # the provider as prose and create nothing.
+        return True
+    if personal_memory.is_covered(line):
+        # A "remember this" is a new command wherever it is typed, and here that is not a convenience.
+        # Consuming it as a correction is what sent it: the correction text goes into replan_request(),
+        # and a clarification answer goes into clarification_request(), both of which are provider
+        # calls. Handing it back instead means the loop runs it through handle_typed_line(), where the
+        # local guard answers or refuses it. One addition closes the correction, clarification and
+        # retry prompts at once, because all three ask this question.
         return True
     route = brain.route(line, resolve)
     if isinstance(route, brain.LocalAction):
@@ -599,6 +643,14 @@ def classify_answer(line, shape: str = CLOSED_QUESTION, *, handoff: bool = True)
         # not an approval at the other two prompts: at a correction it is prose, and at a clarification
         # it is the unusable answer that cost the owner their one round.
         return Answer.YES
+    if not handoff and personal_memory.is_covered(line):
+        # THE ONE THING THAT IS NOT AN ANSWER EVEN WITHOUT A LOOP. Everywhere else, no loop means the
+        # answer space collapses to "yes, or not" and a line is consumed as free text - which for a
+        # "remember this" would put it in replan_request() or clarification_request(). There is nowhere
+        # to hand it back to here (app/voice_console.py owns no loop), so the prompt is abandoned: the
+        # user is told the question was dropped, and nothing is sent. Fail closed, at the cost of a
+        # retype.
+        return Answer.ABANDON
     if not handoff:
         return Answer.ANSWER
     if word == EXIT_WORD:
@@ -703,10 +755,118 @@ def handle_typed_line(text: str, context: TurnContext, prompts: Prompts, focus=N
     context = session.begin_root_command(context)          # a new line is a new root command
     if isinstance(route, brain.LocalAction):
         return _run_local(route.action, context, prompts, focus)
+    if _is_start_memory(text):
+        return _start_memory(), context
+    personal = _personal_memory(text, frontend)
+    if personal is not None:
+        return personal, context
     remembered = _remembered_app(route)
     if remembered is not None:
         return _run_local(remembered, context, prompts, focus)
     return _ask_the_brain(route, context, prompts, focus, interpret, frontend)
+
+
+def _is_start_memory(text) -> bool:
+    """Is this line the explicit request to create a memory database? An EXACT phrase, nothing fuzzy.
+
+    Exact on purpose: this is the only command in the project that brings a database into existence, and
+    a loose match is how "don't start a fresh memory" would create one. normalize() is the project's one
+    comparison form, so capitals and extra spaces are all that is forgiven."""
+    return normalize(text) in START_MEMORY_WORDS
+
+
+def _start_memory() -> CommandReply:
+    """Accept the offer the missing-database message makes, and report precisely what happened.
+
+    THE USER TYPED IT: nothing here runs on anyone's behalf, nothing creates a database during a
+    remember, a recall or application start-up, and there is no path from the Brain to this function -
+    it is reached only by the exact phrase above, before any provider call. It costs nothing.
+
+    Memory decides whether creating is allowed; this function only turns the three answers into words.
+    A refusal is reported with Memory's own message, which says what is there and that it was left
+    alone - so "I won't replace it" is said by the layer that did not replace it."""
+    started = memory_logic.start_fresh_memory()
+    if isinstance(started, MemoryDatabase):
+        return CommandReply(Status.ANSWERED, MEMORY_STARTED.format(count=len(MEMORY_STRUCTURES),
+                                                                   path=started.path))
+    return CommandReply(Status.REFUSED, started.message)
+
+
+def _personal_memory(text: str, frontend: FrontEnd) -> CommandReply | None:
+    """Answer a "remember this" or a "what is their number" from LOCAL memory, or None to carry on.
+
+    WHERE THIS SITS IS THE WHOLE PRIVACY GUARANTEE. It is called from handle_typed_line() before
+    _ask_the_brain(), so a line it answers reaches no provider request of any kind: not the
+    interpretation, not a clarification, not a replan. There is no second place in this module where the
+    same line could be handled, and a None from here is the only way past it.
+
+    Spending nothing is the other half: a line answered here costs no model call, no Brain allowance and
+    no money, exactly like the remembered-alias path below.
+
+    VOICE CANNOT STORE THIS SLICE. A spoken "remember Ali ka whatsapp ..." is refused rather than sent:
+    Whisper is not reliable enough to be trusted with a phone number (Phase 2's closeout records that
+    unclear speech can come back as other words entirely), and a wrong digit stored silently is worse
+    than a retype. A spoken QUESTION falls through to the Brain unchanged, because the words the user
+    said are all it contains - nothing stored is in it. Answering it aloud would be a new disclosure
+    surface, a room instead of a screen, and that decision is not in this slice."""
+    request = personal_memory.recognise(text)
+    if request is None:
+        return None
+    if isinstance(request, personal_memory.KeepLocal):
+        # The fail-closed case: a keep marker this grammar could not parse. REFUSED, never forwarded.
+        return CommandReply(Status.REFUSED, request.message)
+    if isinstance(request, personal_memory.RememberContact):
+        if frontend != TYPED_CONSOLE:
+            return CommandReply(Status.REFUSED, KEYBOARD_ONLY)
+        return _remember_contact(request)
+    if frontend != TYPED_CONSOLE:
+        return None
+    return _recall_contact(request)
+
+
+def _remember_contact(request) -> CommandReply:
+    """Store one contact, and say so only if the whole write succeeded.
+
+    WHY THE PERSISTENCE DECISION IS ALLOW HERE, STATED RATHER THAN ASSUMED. PersistenceDecision exists
+    because Memory cannot tell a phone number from a password by looking at it, so the caller has to
+    decide. This caller can: the line reached this function only by matching a grammar whose pivot is a
+    channel word from a closed vocabulary, so "remember my password is ..." has no channel in it, is
+    never parsed as a contact and never gets here - it is refused upstream as KeepLocal. The user also
+    asked for exactly this, in the same sentence. That is the decision, and it is why it is made at the
+    call site instead of inside Memory.
+
+    The reply NAMES NOTHING STORED. "Remembered: Ali's whatsapp" says what happened without echoing the
+    number, so the write path - which applies no disclosure rule - never discloses."""
+    stored = memory_logic.remember_contact(request.name, request.channel, request.address,
+                                           PersistenceDecision.ALLOW)
+    if isinstance(stored, MemoryFound):
+        return CommandReply(Status.ANSWERED,
+                            REMEMBERED.format(name=request.name, channel=request.channel))
+    # Ambiguous, NotFound, Redacted and MemoryUnavailable all carry their own safe message, and every
+    # one of them means nothing was stored. None of them is ever reported as "remembered".
+    return CommandReply(Status.REFUSED, stored.message)
+
+
+def _recall_contact(request) -> CommandReply:
+    """Answer "what is their number" from local memory.
+
+    Two lookups, both through app/memory/queries.py, which is the module that guarantees a lookup cannot
+    produce an action. The read is made under the USER disclosure context: a rule written against BRAIN
+    withholds a value from the model without blinding the person who stored it, which is the whole
+    reason the two contexts are separate names.
+
+    Every failure is an ANSWER rather than a refusal - "I don't know who that is." is what the user
+    asked for, truthfully - and a Redacted result keeps its own message, so a withheld address stays
+    withheld here instead of being recovered."""
+    who = memory_queries.person(request.name)
+    if not isinstance(who, MemoryFound):
+        return CommandReply(Status.ANSWERED, who.message)
+    found = memory_queries.contact_for_user(who.value.id, request.channel)
+    if not isinstance(found, MemoryFound):
+        return CommandReply(Status.ANSWERED, found.message)
+    return CommandReply(Status.ANSWERED, RECALLED.format(name=who.value.name,
+                                                         channel=found.value.channel,
+                                                         address=found.value.address))
 
 
 def _remembered_app(route) -> ExecutorAction | None:

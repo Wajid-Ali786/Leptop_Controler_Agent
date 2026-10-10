@@ -702,8 +702,12 @@ def test_classify_answer_is_pure():
     source = inspect.getsource(classify_answer)
     tree = ast.parse(source.strip())
     called = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    # personal_memory.is_covered joined this list with the Phase 4 wiring slice. The list is still
+    # CLOSED, and what it admits is still pure: that module imports nothing but dataclasses and
+    # normalize, which tests/test_memory_brain_wiring.py checks on its AST.
     assert called <= {"isinstance", "line.strip", "line.strip().lower", "is_fresh_command",
-                      "_is_near_miss", "_is_short_slip", "set", "len"}, called
+                      "_is_near_miss", "_is_short_slip", "set", "len",
+                      "personal_memory.is_covered"}, called
     for forbidden in ("interpret", "run_action", "execute_with_recovery", "authorize", "verifier",
                       "adapter", "put", "abandon", "session"):
         assert forbidden not in called, f"classify_answer calls {forbidden}"

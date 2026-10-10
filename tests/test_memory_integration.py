@@ -27,6 +27,7 @@ from app.brain.models import Intent, OpenAppArgs, Understood
 from app.console import Status
 from app.executor.logic import configured_app_names, resolve
 from app.executor.models import CLOSE_APP, OPEN_APP, ExecutorAction, Resolved, Unresolved
+from app.brain import personal_memory
 from app.memory import logic as memory
 from app.memory import queries
 from app.memory.models import (Ambiguous, Correction, CorrectionLearner, CorrectionTask, Found,
@@ -446,11 +447,40 @@ def test_the_boundary_always_supplies_a_disclosure_context(remembered):
 
 
 def test_nothing_in_the_integration_unwraps_a_redacted_result():
-    """Item 18's structural half: no caller reaches into a Redacted to recover the field."""
-    for module in ("memory/queries.py", "console.py"):
-        source = (settings.PROJECT_ROOT / "app" / module).read_text(encoding="utf-8")
-        assert ".value.address" not in source, module
-        assert "disclosed" not in source or module != "console.py", module
+    """Item 18's structural half: no caller reaches into a Redacted to recover the field.
+
+    REWRITTEN FOR THE PHASE 4 WIRING SLICE, which added the one legitimate place an address is read -
+    the recall answer, which exists to show the user their own value. A substring ban on ".value.address"
+    can no longer tell that read from a Redacted one (FOURTEENTH time a text search in this project has
+    matched something it was not written for), so the rule is checked where it actually lives: the only
+    function that touches the field returns early for everything that is not Found, and the guard comes
+    BEFORE the access in the body.
+
+    The behavioural half - a deny rule on the user context really does withhold the recall answer - is
+    tests/test_memory_brain_wiring.py::test_a_deny_rule_for_the_user_withholds_the_recall_answer."""
+    assert ".value.address" not in (settings.PROJECT_ROOT / "app" / "memory" / "queries.py").read_text(
+        encoding="utf-8"), "the query boundary must not unwrap a result at all"
+
+    tree = ast.parse((settings.PROJECT_ROOT / "app" / "console.py").read_text(encoding="utf-8"))
+
+    def unwraps(node):
+        """Reading the address OUT OF A RESULT - `<result>.value.address` - which is the thing Redacted
+        exists to prevent. `request.address` is the value the user just typed on their way IN, which is
+        a different direction and not what this rule is about."""
+        return (isinstance(node, ast.Attribute) and node.attr == "address"
+                and isinstance(node.value, ast.Attribute) and node.value.attr == "value")
+
+    readers = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+               and any(unwraps(inner) for inner in ast.walk(node))}
+    assert readers == {"_recall_contact"}, f"something else now unwraps an address: {readers}"
+
+    recall = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef) and node.name == "_recall_contact")
+    guards = [statement.lineno for statement in ast.walk(recall)
+              if isinstance(statement, ast.Call) and ast.unparse(statement.func) == "isinstance"
+              and "MemoryFound" in ast.unparse(statement)]
+    access = min(node.lineno for node in ast.walk(recall) if unwraps(node))
+    assert guards and max(guards) < access, "the Found check no longer precedes the read"
 
 
 # =======================================================================================================
@@ -531,12 +561,24 @@ def test_the_decision_carries_no_value_of_its_own():
         assert not hasattr(decision, "payload") and not hasattr(decision, "text")
 
 
-def test_no_natural_language_remember_parser_was_added():
-    """§9. D3 is demonstrated at the structured API; the console learned no new phrase."""
+def test_the_console_still_holds_no_phrase_vocabulary_of_its_own():
+    """§9, REWRITTEN for the Phase 4 wiring slice, which was approved to recognise a typed "remember".
+
+    The original form of this test asserted that no remember phrase appeared in app/console.py at all.
+    That is no longer true by design, so what is pinned instead is the part that still is, and still
+    matters: the WORDS live in app/brain/personal_memory.py, and the console holds none of them. A
+    second vocabulary in a second place is how two parsers drift apart and one of them stops being
+    fail-closed.
+
+    The correction-level writes are still not wired to the console, which is unchanged and still
+    checked: remember_explicitly() and observe_correction() belong to app/memory's own API."""
     source = (settings.PROJECT_ROOT / "app" / "console.py").read_text(encoding="utf-8")
-    for phrase in ("remember this", "remember that", "forget this"):
-        assert phrase not in source.lower(), phrase
-    assert "remember_explicitly" not in source, "a write path was wired into the console"
+    literals = {node.value.lower() for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+    vocabulary = set(personal_memory.KEEP_MARKERS) | set(personal_memory.ASK_MARKERS) \
+        | set(personal_memory.CHANNELS)
+    assert not (literals & vocabulary), f"the console grew its own phrases: {literals & vocabulary}"
+    assert "remember_explicitly" not in source, "a correction write path was wired into the console"
     assert "observe_correction" not in source
 
 
@@ -691,13 +733,26 @@ def test_previous_action_context_is_unchanged(remembered):
     assert "app.memory" not in source
 
 
-def test_the_memory_integration_is_one_branch_in_one_place():
-    """The whole production surface of this slice in the console: one helper, called from one place."""
-    source = (settings.PROJECT_ROOT / "app" / "console.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    calls = [node for node in ast.walk(tree)
-             if isinstance(node, ast.Call) and ast.unparse(node.func) == "_remembered_app"]
-    assert len(calls) == 1, "the alias branch is reachable from more than one place"
-    memory_calls = [ast.unparse(node.func) for node in ast.walk(tree)
-                    if isinstance(node, ast.Call) and "memory" in ast.unparse(node.func).lower()]
-    assert memory_calls == ["memory_queries.application"], memory_calls
+def test_the_consoles_whole_memory_surface_is_enumerated():
+    """Each memory branch is reachable from exactly ONE place, and the set of memory calls is CLOSED.
+
+    The alias branch was the only one when this was written; the Phase 4 wiring slice added the local
+    remember and recall. The value of the test is unchanged and is the reason it is kept rather than
+    relaxed: a fifth way into Memory from the console cannot be added without this failing, so no
+    branch can appear that nobody audited."""
+    tree = ast.parse((settings.PROJECT_ROOT / "app" / "console.py").read_text(encoding="utf-8"))
+    calls = [ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    # Every function that DOES something: reachable from exactly one place.
+    for once in ("_remembered_app", "_personal_memory", "_remember_contact", "_recall_contact",
+                 "_start_memory"):
+        assert calls.count(once) == 1, f"{once} is reachable from more than one place"
+    # _is_start_memory is deliberately NOT in that list: it is a pure predicate with no side effect,
+    # and it is asked at both routing points on purpose - once by handle_typed_line and once by
+    # is_fresh_command, which is what makes the command work at a nested prompt as well as at ">".
+    assert calls.count("_is_start_memory") == 2, "the command lost one of its two routing points"
+    reached = sorted({name for name in calls if "memory" in name.lower()})
+    assert reached == ["MEMORY_STARTED.format", "_is_start_memory", "_personal_memory",
+                       "_start_memory", "memory_logic.remember_contact",
+                       "memory_logic.start_fresh_memory", "memory_queries.application",
+                       "memory_queries.contact_for_user", "memory_queries.person",
+                       "personal_memory.is_covered", "personal_memory.recognise"], reached

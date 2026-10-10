@@ -59,6 +59,12 @@ git log, git show) are fine. Stage files (git add) only when the owner explicitl
 See /docs/build-plan.md Section 6 for the phase table. Check which phase is active
 before starting new work — don't build ahead of the current phase.
 
+PROJECT RECONCILIATION (2026-10-10): /docs/project-reconciliation.md is the CURRENT reconciliation of
+  what the frozen plan assumed against what is actually true in the code, plus a defensible order for
+  what remains. The FROZEN documents (/docs/build-plan.md, /docs/step1-4) and the phase closeouts remain
+  authoritative for what was originally agreed; the reconciliation never overrides them. Like the backlog
+  below, it AUTHORIZES NOTHING - read it for current state and sequencing context before proposing work.
+
 OWNER TESTING BACKLOG (2026-10-08): everything learned from the owner's real-machine testing of
   Slices 1-5 is recorded in /docs/owner-testing-improvement-backlog.md - what now WORKS (so a later
   session does not re-prove it), observed defects, missing capabilities, known limits that are working
@@ -179,6 +185,58 @@ Current work: USABILITY PLAN (started 2026-10-06). Phase 5 and Phase 6 work is S
     as advertised only in a session where Chrome was not opened; otherwise the third command must
     qualify. The rule was NOT weakened.
     Voice cannot plan navigation this slice.
+  Phase 4 wiring — local `remember` and `recall` for people and contacts, plus the explicit
+    `start fresh memory` command: WRITTEN AND PROVED, NOT COMMITTED (as of 2026-10-10). Corrected from
+    "DONE" on 2026-10-10 (reconciliation D-12): the work exists only as uncommitted changes in the
+    working tree, so a fresh clone does not have it.
+    WHAT IS PROVED: the full offline suite, and a six-mutant foreground proof - the fail-closed
+    both-ends marker guard, the PersistenceDecision gate, the compensating delete, silent replacement of
+    an existing database, `remember` auto-creating one, and (as a coverage check only) the navigation
+    milestone. All six were caught by named tests and every file was restored byte-for-byte by sha256.
+    WHAT REMAINS: (1) the OWNER'S GIT COMMIT - the assistant never commits; (2) the real-machine smoke,
+    which has NOT been run for the stored-and-recalled path: the owner's only smoke of this slice hit
+    the "no memory database yet" refusal, which is what led to the `start fresh memory` command. So
+    remember/recall are TESTED ONLY, not real-machine verified. The smoke commands are in
+    /docs/project-reconciliation.md Section 8.
+    The owner
+    approved category 3 (never transmitted) for anything they ask to be remembered. The line is
+    recognised in app/brain/personal_memory.py and answered at the `_remembered_app` seam in
+    handle_typed_line, BEFORE _ask_the_brain, so it costs no model call and reaches no provider request.
+    WRITES FAIL CLOSED, READS FALL THROUGH. A line carrying a keep marker (`remember`, `note that`,
+    `save that`, `yaad rakho`, `yad rakho` - the owner's small set, option (a)) is stored or REFUSED
+    locally; it never continues to the Brain. A question (`recall`, `what is ...`) that does not parse
+    returns None and goes to the Brain unchanged, because it carries only the words the user typed.
+    `remember to call Ali tomorrow` is a reminder, not a fact, and is refused - accepted openly: a
+    refusal costs a retype, a leak cannot be undone. There is NO outbound redaction pass, by decision.
+    ROMAN URDU IS SOV, AND THAT DECIDED THE GUARD'S SHAPE. `Ali ka whatsapp +92-... yaad rakho` puts the
+    marker at the END; a leading-only guard would have sent that number to the provider. Markers are
+    tested at BOTH ends. A natural Roman Urdu remember PARSES and is stored, not merely refused.
+    THE NESTED PROMPTS WERE A REAL LEAK, AND ARE CLOSED. At the correction prompt a covered form used to
+    be consumed as correction TEXT and travel into replan_request(); at the clarification prompt into
+    clarification_request(). One addition to is_fresh_command() hands it back instead, covering
+    correction, clarification and retry at once. Without a console loop (app/voice_console.py) there is
+    nowhere to hand it, so classify_answer returns ABANDON - the ONE documented exception to "no loop
+    means a line is consumed as the answer", because consuming it is what sends it.
+    IT IS NOT ATOMIC, AND THE EXISTING APIS CANNOT MAKE IT SO: _write() opens a connection per call, so
+    the person and the contact are two transactions. A failed contact write is COMPENSATED by deleting
+    the person this call added, and the window that leaves (the delete can fail too) is reported as
+    "may be in my memory with no contact" - never as success. An exact repeat is idempotent; a DIFFERENT
+    address on the same channel is REFUSED and the refusal names the channel but NOT the stored address,
+    because the write path applies no disclosure rule and so may not disclose. Two people sharing a name
+    refuse rather than pick.
+    DISCLOSURE CONTEXT SPLIT (the owner overruled "not required"): queries.USER joins queries.BRAIN, so
+    "never let my numbers reach the reasoning service, but do show them to me" is now sayable. No default
+    moved - there is still no rule for either context out of the box. _channel_state() deliberately reads
+    rows WITHOUT the disclosure rules, because a withheld address would read as "nothing stored" and the
+    comparison would wave a duplicate through (that mutant survived until a test was added for it).
+    VOICE CANNOT STORE a contact this slice: refused locally, never forwarded. Whisper mis-hearing a
+    digit and storing it silently is worse than a retype, and answering aloud is a new disclosure
+    surface (a room, not a screen) that was not in scope.
+    OUT OF SCOPE AND STILL UNDECIDED: the work folder (`remember that my work folder is ...` is REFUSED
+    and the path is not transmitted), websites, preferences, any new table, any new Brain kind, any new
+    wire field. KNOWN GAPS: the Urdu QUESTION form (`Ali ka number kya hai`) is not recognised and falls
+    through to the Brain, which leaks nothing stored; an address must be one word or several that are all
+    digits and phone punctuation, so a multi-word address refuses rather than guessing.
 
 Phase 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE; PAUSED (see Current work above).
   The privacy and test-isolation boundaries required before expanding observation capability
@@ -194,9 +252,11 @@ Phase 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE; PAUSED (see Current
     never an escalation, a minimized window is refused rather than restored, and every other action
     keeps the manual focus hand-over.
   DOM Slice 1 — assistant-owned ephemeral browser session + read-only DOM resolution: DONE
-    (2026-10-04). NOT yet validated against a real browser: everything offline is faked, including
-    Playwright, so channel="chrome" launching, the role allowlist matching real page semantics and
-    get_by_role's behaviour are all UNPROVEN until a gated real_browser run. Playwright lives only in
+    (2026-10-04). VALIDATED AGAINST A REAL BROWSER by backlog W-1 (corrected 2026-10-10; this entry
+    previously said "NOT yet validated", which W-1 superseded): channel="chrome" launching, the role
+    allowlist matching real page semantics and get_by_role's behaviour all worked on the real machine
+    for the four-command workflow. STILL UNPROVEN, stated narrowly: every other role in the allowlist,
+    frames, and pages other than the ones W-1 used. Playwright lives only in
     app/executor/adapter.py (it can click, unlike UIA); the decision is a pure function in
     app/verifier/observation.py. The owner's own Chrome profile is unreachable: non-persistent
     context, no user-data-dir, no storage state, no cookie import. Real browser access needs the
@@ -208,7 +268,8 @@ Phase 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE; PAUSED (see Current
     now maps (inside the adapter only) to the semantic description that found it, so the target is
     re-resolved AFTER the confirmation; a changed page, a vanished control, a duplicate or a changed
     role all click nothing. The page's URL is fingerprinted inside the adapter and never returned or
-    logged. NOT yet validated against a real browser. The click cannot be interrupted mid-call: the
+    logged. VALIDATED AGAINST A REAL BROWSER by backlog W-1 (corrected 2026-10-10): a real DOM click
+    landed on a real page. The click cannot be interrupted mid-call: the
     emergency stop is checked immediately before and immediately after, which is the honest guarantee.
   Assistant-browser wiring — the DOM primitive reachable from the typed console: DONE (2026-10-05).
     Two args-free kinds (open_browser / close_browser), parsed deterministically from "open/close
@@ -217,7 +278,9 @@ Phase 5 — Screen Understanding. IN PROGRESS; NOT COMPLETE; PAUSED (see Current
     the owner's configured personal Chrome and routes to UIA. One assistant browser at a time, headed
     (the user navigates it themselves — there is no navigation command). A named click chooses its
     context: one candidate is used, and an owned app window beside a live browser page REFUSES and
-    names both rather than preferring either. NOT yet validated end to end from the real console.
+    names both rather than preferring either. VALIDATED END TO END FROM THE REAL CONSOLE by backlog W-1
+    (corrected 2026-10-10): all four commands succeeded in one session. Note that W-1 ran in a session
+    where the assistant browser was the ONLY context; BL-9 is the mixed-session case, unchanged.
   DOM readiness fix: DONE (2026-10-05), after the owner's console smoke hit a transient false
     NotFound (one attempt missed 'Login'; the identical target succeeded seconds later). Cause was
     NOT case - production normalises, so both attempts passed the same string - but that

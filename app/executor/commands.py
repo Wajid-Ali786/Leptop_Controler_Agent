@@ -55,6 +55,7 @@ HELP = """Commands (one per line; the command word is not case-sensitive):
   open assistant browser        the assistant's OWN browser (not your Chrome)
   close assistant browser       close it again
   minimize [window]             the active window; also maximize, restore
+  start fresh memory            create the memory database (only when there isn't one)
   help                          this list
   exit                          leave the console"""
 
